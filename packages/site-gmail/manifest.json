@@ -1,10 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Another Gmail Assistant",
+  "name": "Gmail Assistant",
   "version": "0.1.0",
-  "description": "A Chrome extension for Gmail",
+  "description": "A Chrome extension for Gmail, part of Another Chrome Assistant project",
   "permissions": [
-    "activeTab"
+    "activeTab",
+    "sidePanel",
+    "tabs"
   ],
   "host_permissions": [
     "https://mail.google.com/*"
@@ -13,10 +15,29 @@
     "service_worker": "dist/background.js",
     "type": "module"
   },
+  "side_panel": {
+    "default_path": "dist/sidepanel.html"
+  },
+  "action": {
+    "default_icon": {
+      "16": "dist/icons/icon-16.png",
+      "48": "dist/icons/icon-48.png",
+      "128": "dist/icons/icon-128.png"
+    },
+    "default_title": "Toggle side panel"
+  },
   "icons": {
-    "16": "assets/extension/gmail/icon-16.png",
-    "48": "assets/extension/gmail/icon-48.png",
-    "128": "assets/extension/gmail/icon-128.png"
+    "16": "dist/icons/icon-16.png",
+    "48": "dist/icons/icon-48.png",
+    "128": "dist/icons/icon-128.png"
+  },
+  "commands": {
+    "toggle-sidepanel": {
+      "suggested_key": {
+        "default": "Alt+G"
+      },
+      "description": "Toggle side panel"
+    }
   },
   "minimum_chrome_version": "120"
 }
