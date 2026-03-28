@@ -4,11 +4,11 @@ import { resolve } from "path";
 export default defineConfig({
   base: "./",
   build: {
-    outDir: "dist",
+    outDir: "packages/site-gmail/dist",
     emptyOutDir: true,
     rollupOptions: {
       input: {
-        background: resolve(__dirname, "src/background.ts"),
+        background: resolve(__dirname, "packages/site-gmail/src/background.ts"),
       },
       output: {
         entryFileNames: "[name].js",
@@ -22,15 +22,16 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      "@": resolve(__dirname, "src"),
+      "@core": resolve(__dirname, "packages/core"),
+      "@gmail": resolve(__dirname, "packages/site-gmail/src"),
     },
   },
   test: {
     globals: true,
     environment: "node",
     coverage: {
-      include: ["src/**/*.ts"],
-      exclude: ["src/__tests__/**"],
+      include: ["packages/**/*.ts"],
+      exclude: ["**/__tests__/**"],
     },
   },
 });

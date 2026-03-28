@@ -15,8 +15,13 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@core/*": ["packages/core/*"],
+      "@gmail/*": ["packages/site-gmail/src/*"]
+    }
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["packages/**/*.ts"],
+  "exclude": ["node_modules", "dist", "**/dist"]
 }
