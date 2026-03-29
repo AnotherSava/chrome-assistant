@@ -34,7 +34,6 @@ function addDir(dirPath: string, zipPrefix?: string, exclude?: (name: string) =>
 
 addFile("packages/site-gmail/manifest.json", "manifest.json");
 addDir("packages/site-gmail/dist", "dist", (name) => name.endsWith(".map"));
-addDir("assets/extension/gmail", "assets/extension/gmail");
 
 const outName = `gmail-assistant-${version}.zip`;
 const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 9 } });

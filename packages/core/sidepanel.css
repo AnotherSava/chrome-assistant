@@ -3,7 +3,7 @@ body {
   color: #d4d4d4;
   font-family: Consolas, 'Courier New', monospace;
   font-size: 14px;
-  padding: 20px;
+  padding: 42px 20px 20px;
   margin: 0;
 }
 
@@ -13,15 +13,68 @@ body {
   padding: 20px;
 }
 
-/* Top buttons bar */
-.top-buttons {
+/* Tab bar — fills space left of toolbar */
+.tab-bar {
+  display: flex;
+  flex: 1;
+}
+.tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #777;
+  font-size: 13px;
+  font-family: inherit;
+  padding: 6px 12px;
+  cursor: pointer;
+  text-align: center;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tab:hover { color: #bbb; }
+.tab.active { color: #ddd; border-bottom-color: #7db8f0; }
+
+/* Content sections */
+.section { margin-bottom: 12px; }
+.section-title { font-size: 13px; margin-bottom: 4px; font-weight: bold; color: #eee; }
+
+/* Email list */
+.email-list { margin: 0; padding-left: 22px; }
+.email-subject { color: #ccc; margin: 6px 0; line-height: 1.4; }
+.email-link { color: #7db8f0; text-decoration: none; cursor: pointer; }
+.email-link:hover { text-decoration: underline; color: #9dcaff; }
+
+/* Label tree */
+.label-tree { list-style: none; margin: 0; padding: 0; }
+.label-columns { display: flex; gap: 12px; }
+.label-column { flex: 1; min-width: 0; }
+.label-tree .label-tree { padding-left: 16px; }
+.label-node { padding: 4px 0; }
+.label-link { color: #7db8f0; text-decoration: none; cursor: pointer; font-size: 13px; }
+.label-link:hover { color: #9dcaff; }
+.label-link.active { color: #fff; font-weight: bold; }
+.label-toggle { color: #666; cursor: pointer; margin-right: 4px; font-size: 11px; user-select: none; }
+.label-toggle:hover { color: #aaa; }
+
+/* Top row — tabs left, buttons right */
+.top-row {
   position: fixed;
-  top: 8px;
-  right: 8px;
+  top: 0;
+  left: 0;
+  right: 0;
   z-index: 20;
   display: flex;
   align-items: center;
+  padding: 8px 8px 0;
+  background: #1e1e1e;
+}
+
+/* Top buttons bar */
+.top-buttons {
+  display: flex;
+  align-items: center;
   gap: 4px;
+  margin-left: auto;
 }
 .top-buttons button {
   width: 24px;
@@ -40,6 +93,67 @@ body {
 .top-buttons button.disabled { opacity: 0.3; pointer-events: none; }
 #btn-help { font-size: 14px; font-weight: bold; }
 #btn-pin svg { width: 16px; height: 16px; }
+
+/* Display settings panel */
+#display-panel {
+  position: fixed;
+  top: 38px;
+  right: 8px;
+  z-index: 20;
+  background: #2a2a2a;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 8px 12px;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+.display-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #bbb;
+}
+.display-row label { white-space: nowrap; }
+.display-row select {
+  background: #333;
+  color: #ddd;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+/* Filter bar (inline above labels) */
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  font-size: 12px;
+  color: #bbb;
+  padding-top: 8px;
+  margin-bottom: 6px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #333;
+}
+.filter-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.filter-break { flex-basis: 100%; height: 0; }
+.filter-item label { white-space: nowrap; min-width: 75px; }
+.filter-item select {
+  background: #333;
+  color: #ddd;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-family: inherit;
+}
 
 /* Auto-hide dropdown */
 .dropdown-header {
@@ -126,6 +240,8 @@ body {
 
 .help-steps { margin: 0; padding-left: 22px; }
 .help-steps li { color: #ccc; margin: 4px 0; }
+.help-sublist { list-style: disc; margin: 4px 0; padding-left: 18px; }
+.help-sublist li { margin: 2px 0; }
 
 .help-sections-grid {
   display: grid;

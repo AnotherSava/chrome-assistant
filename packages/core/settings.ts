@@ -1,7 +1,7 @@
 export function loadSetting<T>(key: string, defaults: T): T {
   try {
     const stored = localStorage.getItem(key);
-    if (stored) {
+    if (stored !== null) {
       const parsed = JSON.parse(stored) as T;
       if (typeof defaults === "object" && defaults !== null && !Array.isArray(defaults)) {
         return { ...defaults, ...parsed };

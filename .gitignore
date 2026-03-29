@@ -16,3 +16,6 @@ coverage/
 docs/plans/*
 !docs/plans/completed/
 !docs/plans/draft/
+
+# ralphex progress logs
+.ralphex/progress/

@@ -62,12 +62,24 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 
 ## Project Structure
 
+- `vite.config.ts` — root Vite/vitest config (test environment, `@core` alias for tests, coverage settings)
+- `vite.config.base.ts` — shared Vite build config (output naming, `@core` alias, icon copy plugin)
+- `scripts/package.ts` — Chrome Web Store ZIP packaging script
+- `packages/core/__tests__/` — unit tests for core modules (icons, settings)
 - `packages/core/settings.ts` — shared localStorage persistence (loadSetting/saveSetting with typed defaults)
 - `packages/core/icons.ts` — shared SVG icon constants and escapeHtml utility
-- `packages/core/toggle.ts` — shared tooltip positioning and visibility toggle helpers
+- `packages/core/types.ts` — shared TypeScript types (PinMode, GmailLabel)
+- `packages/core/sidepanel.css` — shared side panel styles (dark theme, top bar, labels, help, zoom)
 - `packages/site-gmail/` — Gmail extension package
-- `packages/site-gmail/src/background.ts` — service worker
 - `packages/site-gmail/manifest.json` — Gmail extension manifest
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
+- `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
+- `packages/site-gmail/src/background.ts` — service worker
+- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings)
+- `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch)
+- `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons
-- `docs/` — GitHub Pages documentation site
+
+### Path Aliases
+
+`@core` resolves to `packages/core/` and is configured in both `vite.config.base.ts` (for builds) and `vite.config.ts` (for tests). Site packages import shared code via `@core/settings.js`, `@core/icons.js`, etc.

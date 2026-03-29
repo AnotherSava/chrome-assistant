@@ -5,12 +5,20 @@
   "description": "A Chrome extension for Gmail, part of Another Chrome Assistant project",
   "permissions": [
     "activeTab",
+    "identity",
     "sidePanel",
+    "storage",
     "tabs"
   ],
   "host_permissions": [
     "https://mail.google.com/*"
   ],
+  "oauth2": {
+    "client_id": "726365485537-g0otc0f1bti0ekjo8bikm4h1ka67j6bp.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly"
+    ]
+  },
   "background": {
     "service_worker": "dist/background.js",
     "type": "module"
@@ -39,5 +47,5 @@
       "description": "Toggle side panel"
     }
   },
-  "minimum_chrome_version": "120"
+  "minimum_chrome_version": "129"
 }

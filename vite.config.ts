@@ -4,7 +4,7 @@ import { resolve } from "path";
 export default defineConfig({
   resolve: {
     alias: {
-      "@core": resolve(__dirname, "packages/core"),
+      "@core": resolve(import.meta.dirname, "packages/core"),
     },
   },
   test: {

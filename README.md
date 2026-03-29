@@ -2,14 +2,36 @@
 
 A family of Chrome extensions sharing a common side panel framework. Each site is built as an independent extension. Currently supports Gmail.
 
+## Gmail Assistant
+
+A side panel extension for Gmail that provides quick label-based filtering and navigation.
+
+**Features:**
+- Browse all your Gmail labels in a multi-column layout
+- Click a label to filter the Gmail page by that label
+- Filter by location (Inbox, Sent, All Mail) and time scope
+- Auto-hide side panel when leaving Gmail
+- Zoom controls with per-context persistence
+- Keyboard shortcut (Alt+G) to toggle the side panel
+
+**Requires:** Google account authorization (Gmail read-only access via OAuth2).
+
 ## Development
 
 ```bash
 npm install
-npm run dev       # watch mode
-npm run build     # production build
-npm run test      # run tests
-npm run lint      # type check
+npm run dev        # watch mode (Gmail)
+npm run build      # production build (Gmail)
+npm run test       # run tests
+npm run lint       # type check
+npm run package    # build + create Chrome Web Store ZIP
+```
+
+### Per-site builds
+
+```bash
+npm run build:gmail   # build Gmail extension
+npm run dev:gmail     # watch mode for Gmail
 ```
 
 ## Installation
