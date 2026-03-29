@@ -2,11 +2,15 @@ import { renderHelp } from "./help.js";
 import { escapeHtml, ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSetting, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
-interface LabelTreeNode { name: string; fullName: string; id: string | null; children: LabelTreeNode[] }
+interface LabelTreeNode { name: string; fullName: string; id: string; children: LabelTreeNode[] }
 
-let currentTab: "summary" | "labels" = "labels";
-let activeLabelId: string | null = null;
+let currentTab: "summary" | "filters" = "filters";
+const KEY_ACTIVE_LABEL = "ca_active_label";
+const KEY_ACTIVE_LABEL_NAME = "ca_active_label_name";
+let activeLabelId: string | null = loadSetting(KEY_ACTIVE_LABEL, null as string | null);
+let activeLabelName: string | null = loadSetting(KEY_ACTIVE_LABEL_NAME, null as string | null);
 let onGmailPage = false;
+let pendingFilterApply = false;
 
 // ---------------------------------------------------------------------------
 // Zoom (Ctrl+/- and Ctrl+0)
@@ -102,7 +106,7 @@ function selectPinMode(mode: PinMode): void {
   saveSetting(KEY_PIN_MODE, mode);
   updatePinButtonIcon();
   closePinDropdown();
-  chrome.runtime.sendMessage({ type: "setPinMode", mode }).catch(() => {});
+  if (activePort) activePort.postMessage({ type: "setPinMode", mode });
 }
 
 function buildPinDropdown(): void {
@@ -131,7 +135,7 @@ function buildPinDropdown(): void {
   link.className = "pin-shortcut-link";
   link.textContent = "Set hide/show shortcut";
   chrome.commands.getAll((commands: chrome.commands.Command[]) => { const cmd = commands.find((c) => c.name === "toggle-sidepanel"); if (cmd?.shortcut) link.textContent = `Change hide/show shortcut (${cmd.shortcut})`; });
-  link.addEventListener("mouseup", (e: MouseEvent) => { e.stopPropagation(); navigator.clipboard.writeText("chrome://extensions/shortcuts").catch(() => {}); link.textContent = "Copied URL — paste in address bar"; closePinDropdown(); });
+  link.addEventListener("mouseup", (e: MouseEvent) => { openShortcutsPage(e); closePinDropdown(); });
   dropdown.appendChild(link);
 }
 
@@ -165,9 +169,11 @@ document.addEventListener("mouseup", (e: MouseEvent) => {
 const KEY_LABEL_COLUMNS = "ca_label_columns";
 const KEY_SCOPE_VALUE = "ca_scope_value";
 const KEY_LOCATION = "ca_location";
+const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
 let locationValue: string = loadSetting(KEY_LOCATION, "inbox");
+let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
 
 const LOCATION_OPTIONS: { value: string; label: string }[] = [
   { value: "inbox", label: "Inbox" },
@@ -199,12 +205,18 @@ function buildDisplayPanel(): void {
   const panel = document.getElementById("display-panel");
   if (!panel) return;
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === labelColumns ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     labelColumns = parseInt(colSelect.value, 10);
     saveSetting(KEY_LABEL_COLUMNS, labelColumns);
-    if (currentTab === "labels") loadLabels();
+    if (currentTab === "filters") loadLabels();
+  });
+  const returnCheck = document.getElementById("return-inbox-check") as HTMLInputElement;
+  returnCheck.addEventListener("change", () => {
+    returnToInbox = returnCheck.checked;
+    saveSetting(KEY_RETURN_TO_INBOX, returnToInbox);
+    syncState();
   });
 }
 
@@ -241,18 +253,33 @@ function showTabBar(visible: boolean): void {
   if (tabBar) tabBar.style.display = visible ? "" : "none";
 }
 
-function switchTab(tab: "summary" | "labels"): void {
+function showSummary(): void {
+  switchZoomContext("gmail");
+  showContent('<div class="status">Summary is coming soon...</div>');
+}
+
+function switchTab(tab: "summary" | "filters"): void {
   currentTab = tab;
+  syncState();
   document.querySelectorAll<HTMLElement>(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   if (tab === "summary") {
-    showContent('<div class="status">Summary is coming soon...</div>');
+    if (returnToInbox && onGmailPage) resetGmailToInbox();
+    showSummary();
   } else {
-    loadLabels();
+    if (onGmailPage) {
+      pendingFilterApply = true;
+      if (cachedLabels) {
+        pendingFilterApply = false;
+        applyFilters();
+        renderLabels(cachedLabels);
+      }
+    }
+    loadLabels(true);
   }
 }
 
 document.querySelectorAll<HTMLElement>(".tab").forEach((t) => {
-  t.addEventListener("click", () => { switchTab(t.dataset.tab as "summary" | "labels"); });
+  t.addEventListener("click", () => { switchTab(t.dataset.tab as "summary" | "filters"); });
 });
 
 // ---------------------------------------------------------------------------
@@ -300,20 +327,12 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
       nodeMap.set(label.name, node);
       root.push(node);
     } else {
-      // Nested label — walk the tree
-      let parent = root;
-      let path = "";
-      for (let i = 0; i < parts.length; i++) {
-        path = path ? path + "/" + parts[i] : parts[i];
-        let node = nodeMap.get(path);
-        if (!node) {
-          node = { name: parts[i], fullName: path, id: i === parts.length - 1 ? label.id : null, children: [] };
-          nodeMap.set(path, node);
-          parent.push(node);
-        }
-        if (i === parts.length - 1) node.id = label.id;
-        parent = node.children;
-      }
+      const parentPath = parts.slice(0, -1).join("/");
+      const parentNode = nodeMap.get(parentPath);
+      if (!parentNode) throw new Error(`Parent label "${parentPath}" not found for "${label.name}"`);
+      const node: LabelTreeNode = { name: parts[parts.length - 1], fullName: label.name, id: label.id, children: [] };
+      nodeMap.set(label.name, node);
+      parentNode.children.push(node);
     }
   }
 
@@ -354,7 +373,7 @@ function renderLabelTree(nodes: LabelTreeNode[]): string {
   const items = nodes.map((node) => {
     const hasChildren = node.children.length > 0;
     const activeClass = node.id === activeLabelId ? " active" : "";
-    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id ?? node.fullName)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name)}</a>`;
+    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name)}</a>`;
     const children = hasChildren ? `<ul class="label-tree">${renderLabelTree(node.children)}</ul>` : "";
     return `<li class="label-node">${link}${children}</li>`;
   }).join("");
@@ -370,9 +389,15 @@ function setupLabelHandlers(): void {
       document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
       if (activeLabelId === labelId) {
         activeLabelId = null;
+        activeLabelName = null;
+        saveSetting(KEY_ACTIVE_LABEL, null);
+        saveSetting(KEY_ACTIVE_LABEL_NAME, null);
         applyFilters();
       } else {
         activeLabelId = labelId;
+        activeLabelName = link.dataset.labelName ?? null;
+        saveSetting(KEY_ACTIVE_LABEL, labelId);
+        saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
         link.classList.add("active");
         applyFilters();
       }
@@ -399,12 +424,18 @@ function scopeToDate(): string | null {
   return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
 }
 
+function syncState(): void {
+  if (activePort) activePort.postMessage({ type: "syncState", returnToInbox, onFiltersTab: currentTab === "filters" });
+}
+
+function resetGmailToInbox(): void {
+  if (!activePort) return;
+  activePort.postMessage({ type: "applyFilters", location: "inbox", labelName: null, scope: null });
+}
+
 function applyFilters(): void {
-  if (!chrome.runtime?.sendMessage) return;
-  const activeLink = activeLabelId ? Array.from(document.querySelectorAll<HTMLElement>(".label-link")).find((el) => el.dataset.labelId === activeLabelId) ?? null : null;
-  const labelName = activeLink?.dataset.labelName ?? null;
-  const scope = scopeToDate();
-  chrome.runtime.sendMessage({ type: "applyFilters", location: locationValue, labelName, scope }).catch(() => {});
+  if (!activePort) return;
+  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName: activeLabelName, scope: scopeToDate() });
 }
 
 function renderFilterBar(): string {
@@ -432,12 +463,16 @@ let cachedLabels: GmailLabel[] | null = null;
 
 function renderLabels(labels: GmailLabel[]): void {
   switchZoomContext("gmail");
-  const tree = buildLabelTree(labels);
-  const columns = splitIntoColumns(tree, labelColumns);
-  const columnsHtml = columns.map((col) => `<ul class="label-tree label-column">${renderLabelTree(col)}</ul>`).join("");
-  showContent(`${renderFilterBar()}<div class="label-columns">${columnsHtml}</div>`);
-  setupFilterBar();
-  setupLabelHandlers();
+  try {
+    const tree = buildLabelTree(labels);
+    const columns = splitIntoColumns(tree, labelColumns);
+    const columnsHtml = columns.map((col) => `<ul class="label-tree label-column">${renderLabelTree(col)}</ul>`).join("");
+    showContent(`${renderFilterBar()}<div class="label-columns">${columnsHtml}</div>`);
+    setupFilterBar();
+    setupLabelHandlers();
+  } catch (err) {
+    showContent(`<div class="status">Error: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`);
+  }
 }
 
 function loadLabels(forceRefresh: boolean = false): void {
@@ -445,37 +480,44 @@ function loadLabels(forceRefresh: boolean = false): void {
     renderLabels(cachedLabels);
     return;
   }
-  // Show loading only if we have nothing to display yet
   if (!cachedLabels) showContent('<div class="status">Loading labels...</div>');
-  (chrome.runtime.sendMessage({ type: "fetchLabels" }) as Promise<{ labels: GmailLabel[] }>).then((response) => {
-    cachedLabels = response?.labels ?? [];
-    renderLabels(cachedLabels);
-  }).catch(() => { showContent('<div class="status">Failed to load labels. Try refreshing.</div>'); });
+  if (activePort) {
+    activePort.postMessage({ type: "fetchLabels" });
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Help page
 // ---------------------------------------------------------------------------
 
-let showingHelp = false;
+
+function openShortcutsPage(e: Event): void {
+  e.preventDefault();
+  e.stopPropagation();
+  chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
+}
+
+function isShowingHelp(): boolean {
+  return document.getElementById("content")?.querySelector(".help") !== null;
+}
 
 function showHelp(): void {
   switchZoomContext("help");
   showTabBar(false);
-  showingHelp = true;
   showContent(renderHelp());
+  document.querySelector<HTMLAnchorElement>(".help-shortcuts-link")?.addEventListener("click", openShortcutsPage);
 }
 
 function returnFromHelp(): void {
-  showingHelp = false;
   if (onGmailPage) {
     showTabBar(true);
-    if (currentTab === "labels") loadLabels();
+    if (currentTab === "filters") loadLabels();
+    else if (currentTab === "summary") showSummary();
   }
 }
 
 document.getElementById("btn-help")?.addEventListener("click", () => {
-  if (showingHelp) {
+  if (isShowingHelp()) {
     returnFromHelp();
   } else {
     showHelp();
@@ -486,21 +528,53 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-function handleMessage(message: { type: string }): void {
+function handleMessage(message: { type: string; labels?: GmailLabel[] }): void {
   if (message.type === "resultsReady") {
+    const wasOffGmail = !onGmailPage;
     onGmailPage = true;
-    if (showingHelp) return;
+    if (wasOffGmail) pendingFilterApply = true;
+    // Auto-dismiss help if it was shown because user was on a non-Gmail page
+    if (isShowingHelp() && !wasOffGmail) return;
     showTabBar(true);
-    if (currentTab === "labels") loadLabels(true);
+    if (currentTab === "filters") {
+      loadLabels(true);
+    } else if (currentTab === "summary") {
+      showSummary();
+    }
+  } else if (message.type === "labelsReady" && message.labels) {
+    cachedLabels = message.labels;
+    // Validate and refresh saved label against the current account's labels
+    if (activeLabelId !== null) {
+      const matchedLabel = cachedLabels.find((l) => l.id === activeLabelId);
+      if (!matchedLabel) {
+        activeLabelId = null;
+        activeLabelName = null;
+        saveSetting(KEY_ACTIVE_LABEL, null);
+        saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+      } else if (matchedLabel.name !== activeLabelName) {
+        activeLabelName = matchedLabel.name;
+        saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
+      }
+    }
+    // Apply filters only on initial return to Gmail, not on every label refresh
+    if (pendingFilterApply && onGmailPage && currentTab === "filters") {
+      pendingFilterApply = false;
+      applyFilters();
+    }
+    if (currentTab === "filters" && onGmailPage) renderLabels(cachedLabels);
+  } else if (message.type === "labelsError") {
+    pendingFilterApply = false;
+    if (currentTab === "filters" && onGmailPage && !cachedLabels) showContent('<div class="status">Failed to load labels. Try refreshing the page.</div>');
   } else if (message.type === "notOnGmail") {
     onGmailPage = false;
-    activeLabelId = null;
     cachedLabels = null;
-    if (!showingHelp) showHelp();
+    if (!isShowingHelp()) showHelp();
   } else if (message.type === "fetchError") {
     showContent('<div class="status">Failed to fetch emails. Try refreshing the page.</div>');
   }
 }
+
+let activePort: chrome.runtime.Port | null = null;
 
 if (chrome.runtime?.connect) {
   let reconnectDelay = 1000;
@@ -509,10 +583,12 @@ if (chrome.runtime?.connect) {
     if (!chrome.runtime?.id) return;
     try {
       const port = chrome.runtime.connect(undefined, { name: "sidepanel" });
+      activePort = port;
       reconnectDelay = 1000;
       port.onMessage.addListener(handleMessage);
-      chrome.runtime.sendMessage({ type: "setPinMode", mode: currentPinMode }).catch(() => {});
+      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); syncState(); });
       port.onDisconnect.addListener(() => {
+        activePort = null;
         if (!chrome.runtime?.id) return;
         setTimeout(connectToBackground, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);

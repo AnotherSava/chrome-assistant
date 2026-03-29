@@ -1,4 +1,5 @@
 import type { GmailLabel } from "@core/types.js";
+export type { GmailLabel };
 
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 

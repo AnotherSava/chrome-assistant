@@ -74,8 +74,8 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `packages/site-gmail/manifest.json` — Gmail extension manifest
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
 - `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
-- `packages/site-gmail/src/background.ts` — service worker
-- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings)
+- `packages/site-gmail/src/background.ts` — service worker (port-based messaging via `chrome.runtime.Port`, per-port state tracking, label caching, return-to-inbox on disconnect)
+- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, persisted active label, return-to-inbox setting)
 - `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch)
 - `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons

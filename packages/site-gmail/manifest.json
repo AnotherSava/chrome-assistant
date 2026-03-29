@@ -41,9 +41,6 @@
   },
   "commands": {
     "toggle-sidepanel": {
-      "suggested_key": {
-        "default": "Alt+G"
-      },
       "description": "Toggle side panel"
     }
   },

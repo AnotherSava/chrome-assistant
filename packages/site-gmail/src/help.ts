@@ -46,7 +46,7 @@ export function renderHelp(): string {
   <div class="help-section">
     <div class="help-section-title">Keyboard shortcut</div>
     <div class="help-sections-grid">
-      <div class="help-grid-item"><span class="help-grid-label"><b>Alt+G</b></span><span> Close the side panel (customizable via <code>chrome://extensions/shortcuts</code>)</span></div>
+      <div class="help-grid-item">Set a keyboard shortcut to toggle the side panel via the auto-hide dropdown or <a href="#" class="help-shortcuts-link">Chrome's extension shortcuts page</a>.</div>
     </div>
   </div>
 </div>`;

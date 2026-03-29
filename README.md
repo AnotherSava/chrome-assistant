@@ -12,7 +12,7 @@ A side panel extension for Gmail that provides quick label-based filtering and n
 - Filter by location (Inbox, Sent, All Mail) and time scope
 - Auto-hide side panel when leaving Gmail
 - Zoom controls with per-context persistence
-- Keyboard shortcut (Alt+G) to toggle the side panel
+- Configurable keyboard shortcut to toggle the side panel
 
 **Requires:** Google account authorization (Gmail read-only access via OAuth2).
 
