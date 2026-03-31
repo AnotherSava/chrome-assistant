@@ -165,9 +165,9 @@ Object Store: "meta"
 - [x] Run linter — all issues must be fixed — clean, no errors
 
 ### Task 8: [Final] Update documentation
-- [ ] Update CLAUDE.md project structure section (new files, removed files)
-- [ ] Update chrome-extension learnings if new patterns discovered
-- [ ] Remove debug logging (`console.log("[cache]..."`) added during investigation
+- [x] Update CLAUDE.md project structure section (new files, removed files)
+- [x] Update chrome-extension learnings if new patterns discovered (permission denied for ~/.claude/learnings - skipped)
+- [x] Remove debug logging (`console.log("[cache]..."`) added during investigation (none found - already clean)
 
 ## Technical Details
 

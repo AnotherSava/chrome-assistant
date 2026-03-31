@@ -68,16 +68,17 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `packages/core/tests/` — unit tests for core modules (icons, settings)
 - `packages/core/src/settings.ts` — shared localStorage persistence (loadSetting/saveSetting with typed defaults)
 - `packages/core/src/icons.ts` — shared SVG icon constants and escapeHtml utility
-- `packages/core/src/types.ts` — shared TypeScript types (PinMode, GmailLabel, MessageMeta)
+- `packages/core/src/types.ts` — shared TypeScript types (PinMode, GmailLabel, MessageMeta, CacheMessage, CacheState)
 - `packages/core/src/sidepanel.css` — shared side panel styles (dark theme, top bar, labels, help, zoom)
 - `packages/site-gmail/` — Gmail extension package
 - `packages/site-gmail/manifest.json` — Gmail extension manifest
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
 - `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
-- `packages/site-gmail/src/background.ts` — service worker (port-based messaging via `chrome.runtime.Port`, per-port state tracking, label caching, message page fetch relay, return-to-inbox on disconnect)
-- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, persisted active label, return-to-inbox setting, message cache, dynamic label filtering)
-- `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch, message metadata fetch, search query builder)
-- `packages/site-gmail/src/msg-cache.ts` — message metadata cache (compact storage, local filtering, per-label coverage tracking, persistence via localStorage)
+- `packages/site-gmail/src/background.ts` — service worker (port-based messaging, CacheManager integration, queryLabel relay, cacheState push to sidepanel, return-to-inbox on disconnect)
+- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, cache-driven label filtering via queryLabel/cacheState messages)
+- `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch, label-query message ID fetch, Gmail batch API for date fetching, search query builder)
+- `packages/site-gmail/src/cache-db.ts` — IndexedDB storage layer (messages store with label cross-reference, meta store for fetch state and label coverage)
+- `packages/site-gmail/src/cache-manager.ts` — cache orchestrator (label-query-based fetch, batch date fetch, queryLabel API, progress reporting, incremental refresh)
 - `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons
 
