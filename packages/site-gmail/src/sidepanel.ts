@@ -16,7 +16,14 @@ let pendingFilterApply = false;
 let currentAccountPath: string | null = null;
 
 // ---------------------------------------------------------------------------
-// Scope helpers (moved from msg-cache.ts)
+// Migration: remove old localStorage cache keys (replaced by IndexedDB)
+// ---------------------------------------------------------------------------
+
+const OLD_CACHE_KEYS = ["ca_msg_cache_labels", "ca_msg_cache_messages", "ca_msg_cache_oldest", "ca_msg_cache_broad_oldest", "ca_msg_cache_complete", "ca_msg_cache_label_oldest", "ca_msg_cache_newest", "ca_msg_cache_ids", "ca_msg_cache_account"];
+for (const key of OLD_CACHE_KEYS) localStorage.removeItem(key);
+
+// ---------------------------------------------------------------------------
+// Scope helpers
 // ---------------------------------------------------------------------------
 
 export function scopeToTimestamp(scopeValue: string): number | null {

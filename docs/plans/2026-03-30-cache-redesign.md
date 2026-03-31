@@ -147,12 +147,12 @@ Object Store: "meta"
 - [x] Run tests — must pass before task 6
 
 ### Task 6: Remove old cache module
-- [ ] Delete `packages/site-gmail/src/msg-cache.ts`
-- [ ] Remove all imports of msg-cache from sidepanel.ts (verify none remain)
-- [ ] Remove old localStorage keys (`ca_msg_cache_*`) — add migration: on first run, detect old keys and delete them
-- [ ] Update `packages/core/src/types.ts` if MsgCache type is exported (remove or replace)
-- [ ] Delete old test files that test msg-cache (`tests/msg-cache.test.ts`, `tests/msg-cache-filtering.test.ts`, `tests/broad-build.test.ts`, `tests/targeted-fetch.test.ts`)
-- [ ] Run tests — must pass before task 7
+- [x] Delete `packages/site-gmail/src/msg-cache.ts`
+- [x] Remove all imports of msg-cache from sidepanel.ts (verify none remain)
+- [x] Remove old localStorage keys (`ca_msg_cache_*`) — add migration: on first run, detect old keys and delete them
+- [x] Update `packages/core/src/types.ts` if MsgCache type is exported (remove or replace)
+- [x] Delete old test files that test msg-cache (`tests/msg-cache.test.ts`, `tests/msg-cache-filtering.test.ts`, `tests/broad-build.test.ts`, `tests/targeted-fetch.test.ts`)
+- [x] Run tests — must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 - [ ] Verify label selection shows correct message count (matches Gmail UI)
