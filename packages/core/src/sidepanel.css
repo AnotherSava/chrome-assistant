@@ -53,6 +53,7 @@ body {
 .label-link { color: #7db8f0; text-decoration: none; cursor: pointer; font-size: 13px; }
 .label-link:hover { color: #9dcaff; }
 .label-link.active { color: #fff; font-weight: bold; }
+.label-link.dimmed { opacity: 0.3; }
 .label-toggle { color: #666; cursor: pointer; margin-right: 4px; font-size: 11px; user-select: none; }
 .label-toggle:hover { color: #aaa; }
 
@@ -147,6 +148,18 @@ body {
 }
 .filter-break { flex-basis: 100%; height: 0; }
 .filter-item label { white-space: nowrap; min-width: 75px; }
+.cache-progress {
+  font-size: 11px;
+  color: #888;
+  min-height: 14px;
+}
+.cache-spin {
+  display: inline-block;
+  color: #c90;
+  animation: cache-rotate 1s linear infinite;
+}
+.cache-done { color: #4a4; }
+@keyframes cache-rotate { to { transform: rotate(360deg); } }
 .filter-item select {
   background: #333;
   color: #ddd;

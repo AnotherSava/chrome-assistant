@@ -65,18 +65,19 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `vite.config.ts` — root Vite/vitest config (test environment, `@core` alias for tests, coverage settings)
 - `vite.config.base.ts` — shared Vite build config (output naming, `@core` alias, icon copy plugin)
 - `scripts/package.ts` — Chrome Web Store ZIP packaging script
-- `packages/core/__tests__/` — unit tests for core modules (icons, settings)
-- `packages/core/settings.ts` — shared localStorage persistence (loadSetting/saveSetting with typed defaults)
-- `packages/core/icons.ts` — shared SVG icon constants and escapeHtml utility
-- `packages/core/types.ts` — shared TypeScript types (PinMode, GmailLabel)
-- `packages/core/sidepanel.css` — shared side panel styles (dark theme, top bar, labels, help, zoom)
+- `packages/core/tests/` — unit tests for core modules (icons, settings)
+- `packages/core/src/settings.ts` — shared localStorage persistence (loadSetting/saveSetting with typed defaults)
+- `packages/core/src/icons.ts` — shared SVG icon constants and escapeHtml utility
+- `packages/core/src/types.ts` — shared TypeScript types (PinMode, GmailLabel, MessageMeta)
+- `packages/core/src/sidepanel.css` — shared side panel styles (dark theme, top bar, labels, help, zoom)
 - `packages/site-gmail/` — Gmail extension package
 - `packages/site-gmail/manifest.json` — Gmail extension manifest
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
 - `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
-- `packages/site-gmail/src/background.ts` — service worker (port-based messaging via `chrome.runtime.Port`, per-port state tracking, label caching, return-to-inbox on disconnect)
-- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, persisted active label, return-to-inbox setting)
-- `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch)
+- `packages/site-gmail/src/background.ts` — service worker (port-based messaging via `chrome.runtime.Port`, per-port state tracking, label caching, message page fetch relay, return-to-inbox on disconnect)
+- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, persisted active label, return-to-inbox setting, message cache, dynamic label filtering)
+- `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch, message metadata fetch, search query builder)
+- `packages/site-gmail/src/msg-cache.ts` — message metadata cache (compact storage, local filtering, per-label coverage tracking, persistence via localStorage)
 - `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons
 

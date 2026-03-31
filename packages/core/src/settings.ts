@@ -18,5 +18,5 @@ export function loadSetting<T>(key: string, defaults: T): T {
 export function saveSetting<T>(key: string, value: T): void {
   try {
     localStorage.setItem(key, JSON.stringify(value));
-  } catch { /* ignore */ }
+  } catch (e) { console.error("[settings] saveSetting failed for", key, e); }
 }

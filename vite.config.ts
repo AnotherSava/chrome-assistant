@@ -4,7 +4,7 @@ import { resolve } from "path";
 export default defineConfig({
   resolve: {
     alias: {
-      "@core": resolve(import.meta.dirname, "packages/core"),
+      "@core": resolve(import.meta.dirname, "packages/core/src"),
     },
   },
   test: {
@@ -12,7 +12,7 @@ export default defineConfig({
     environment: "node",
     coverage: {
       include: ["packages/**/*.ts"],
-      exclude: ["**/__tests__/**"],
+      exclude: ["**/tests/**"],
     },
   },
 });

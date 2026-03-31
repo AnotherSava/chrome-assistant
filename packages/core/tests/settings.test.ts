@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { loadSetting, saveSetting } from "../settings.js";
+import { loadSetting, saveSetting } from "../src/settings.js";
 
 const store = new Map<string, string>();
 

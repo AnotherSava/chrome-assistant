@@ -1,5 +1,5 @@
-import type { PinMode } from "@core/types.js";
-import { fetchLabels, type GmailLabel } from "./gmail-api.js";
+import type { PinMode, MessageMeta } from "@core/types.js";
+import { fetchLabels, type GmailLabel, fetchMessagePage, buildSearchQuery } from "./gmail-api.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
@@ -69,7 +69,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; scope?: string | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; scope?: string | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -81,7 +81,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           // Cancel any pending return-to-inbox for this tab (e.g. after service worker restart)
           const pending = pendingReturnToInbox.get(tab.id);
           if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tab.id); }
-          port.postMessage({ type: "resultsReady" });
+          port.postMessage({ type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
         } else {
           port.postMessage({ type: "notOnGmail" });
         }
@@ -100,6 +100,8 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       }
     } else if (message.type === "fetchLabels") {
       fetchLabels().then((labels) => { port.postMessage({ type: "labelsReady", labels }); }).catch(() => { port.postMessage({ type: "labelsError" }); });
+    } else if (message.type === "fetchMessagePage" && message.query !== undefined && message.fetchId) {
+      fetchMessagePage(message.query, message.pageToken).then((result) => { port.postMessage({ type: "messagePageReady", messages: result.messages, nextPageToken: result.nextPageToken, totalEstimate: result.totalEstimate, fetchId: message.fetchId }); }).catch(() => { port.postMessage({ type: "messagePageError", fetchId: message.fetchId }); });
     }
   });
 
@@ -135,7 +137,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (activeTab?.id === tabId) {
       if (isGmail(tab.url)) {
         updateGmailTab(tab.windowId, tabId, tab.url ?? null);
-        broadcastToWindow(tab.windowId, { type: "resultsReady" });
+        broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
       } else {
         updateGmailTab(tab.windowId, null, null);
         broadcastToWindow(tab.windowId, { type: "notOnGmail" });
@@ -155,7 +157,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (isGmail(tab.url)) {
       updateGmailTab(activeInfo.windowId, activeInfo.tabId, tab.url ?? null);
-      broadcastToWindow(activeInfo.windowId, { type: "resultsReady" });
+      broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
     } else {
       updateGmailTab(activeInfo.windowId, null, null);
       broadcastToWindow(activeInfo.windowId, { type: "notOnGmail" });
@@ -165,16 +167,14 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 // Handle messages from side panel
-function buildGmailUrl(base: string, location: string | undefined, labelName: string | null, scope: string | null): string {
-  const parts: string[] = [];
-  if (labelName) parts.push(`label:"${labelName.replace(/"/g, "").replace(/[/ ]/g, "-").toLowerCase()}"`);
+export function buildGmailUrl(base: string, location: string | undefined, labelName: string | null, scope: string | null): string {
   const loc = location ?? "inbox";
-  if (loc !== "all") parts.push(`in:${loc}`);
-  if (scope) parts.push(`after:${scope}`);
-  if (parts.length === 0) return `${base}#${loc}`;
-  // Single "in:inbox" with no other filters — use direct navigation instead of search
+  const query = buildSearchQuery(location, labelName, scope);
+  if (!query) return `${base}#${loc}`;
+  // Single "in:location" with no other filters — use direct navigation instead of search
+  const parts = query.split(" ");
   if (parts.length === 1 && parts[0].startsWith("in:")) return `${base}#${loc}`;
-  return `${base}#search/${encodeURIComponent(parts.join(" "))}`;
+  return `${base}#search/${encodeURIComponent(query)}`;
 }
 
 function hasPortForWindow(windowId: number): boolean {

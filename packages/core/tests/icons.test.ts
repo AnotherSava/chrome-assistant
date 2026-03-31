@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { escapeHtml } from "../icons.js";
+import { escapeHtml } from "../src/icons.js";
 
 describe("escapeHtml", () => {
   it("escapes ampersands", () => {

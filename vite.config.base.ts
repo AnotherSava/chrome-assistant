@@ -37,7 +37,7 @@ export function baseConfig(siteDir: string, iconDir: string): UserConfig {
     plugins: [copyIcons(iconDir, outDir)],
     resolve: {
       alias: {
-        "@core": resolve(root, "packages/core"),
+        "@core": resolve(root, "packages/core/src"),
       },
     },
   };

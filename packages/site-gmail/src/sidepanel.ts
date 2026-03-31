@@ -2,6 +2,11 @@ import { renderHelp } from "./help.js";
 import { escapeHtml, ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSetting, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
+import { getMsgCache, loadMsgCache, saveMsgCache, mergeMessages, filterMessages, deriveRelevantLabelIds, addParentChain, isCacheCovering, scopeToTimestamp, clearLabelOldest, resetMsgCache } from "./msg-cache.js";
+import { buildSearchQuery } from "./gmail-api.js";
+import type { MessageMeta } from "@core/types.js";
+(window as any).__cache = getMsgCache;
+(window as any).__filter = filterMessages;
 interface LabelTreeNode { name: string; fullName: string; id: string; children: LabelTreeNode[] }
 
 let currentTab: "summary" | "filters" = "filters";
@@ -11,6 +16,7 @@ let activeLabelId: string | null = loadSetting(KEY_ACTIVE_LABEL, null as string 
 let activeLabelName: string | null = loadSetting(KEY_ACTIVE_LABEL_NAME, null as string | null);
 let onGmailPage = false;
 let pendingFilterApply = false;
+let currentAccountPath: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Zoom (Ctrl+/- and Ctrl+0)
@@ -329,7 +335,13 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
     } else {
       const parentPath = parts.slice(0, -1).join("/");
       const parentNode = nodeMap.get(parentPath);
-      if (!parentNode) throw new Error(`Parent label "${parentPath}" not found for "${label.name}"`);
+      if (!parentNode) {
+        // Treat as root-level if parent is missing (e.g., hidden parent)
+        const node: LabelTreeNode = { name: label.name, fullName: label.name, id: label.id, children: [] };
+        nodeMap.set(label.name, node);
+        root.push(node);
+        continue;
+      }
       const node: LabelTreeNode = { name: parts[parts.length - 1], fullName: label.name, id: label.id, children: [] };
       nodeMap.set(label.name, node);
       parentNode.children.push(node);
@@ -387,11 +399,13 @@ function setupLabelHandlers(): void {
       const labelId = link.dataset.labelId;
       if (!labelId) return;
       document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
+      clearTargetedState();
       if (activeLabelId === labelId) {
         activeLabelId = null;
         activeLabelName = null;
         saveSetting(KEY_ACTIVE_LABEL, null);
         saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+        renderFilteredLabels();
         applyFilters();
       } else {
         activeLabelId = labelId;
@@ -399,6 +413,7 @@ function setupLabelHandlers(): void {
         saveSetting(KEY_ACTIVE_LABEL, labelId);
         saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
         link.classList.add("active");
+        renderFilteredLabels();
         applyFilters();
       }
     });
@@ -406,21 +421,9 @@ function setupLabelHandlers(): void {
 }
 
 function scopeToDate(): string | null {
-  if (scopeValue === "any") return null;
-  const now = new Date();
-  const map: Record<string, () => Date> = {
-    "1w": () => new Date(now.getTime() - 7 * 86400000),
-    "2w": () => new Date(now.getTime() - 14 * 86400000),
-    "1m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 1); return d; },
-    "2m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 2); return d; },
-    "6m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 6); return d; },
-    "1y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); return d; },
-    "3y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 3); return d; },
-    "5y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 5); return d; },
-  };
-  const fn = map[scopeValue];
-  if (!fn) return null;
-  const d = fn();
+  const ts = scopeToTimestamp(scopeValue);
+  if (ts === null) return null;
+  const d = new Date(ts);
   return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
 }
 
@@ -441,7 +444,7 @@ function applyFilters(): void {
 function renderFilterBar(): string {
   const locOptions = LOCATION_OPTIONS.map((o) => `<option value="${o.value}"${o.value === locationValue ? " selected" : ""}>${o.label}</option>`).join("");
   const scopeOptions = SCOPE_OPTIONS.map((o) => `<option value="${o.value}"${o.value === scopeValue ? " selected" : ""}>${o.label}</option>`).join("");
-  return `<div class="filter-bar"><span class="filter-item"><label>Location:</label><select id="location-select">${locOptions}</select></span><span class="filter-break"></span><span class="filter-item"><label>Scope from:</label><select id="scope-select">${scopeOptions}</select></span></div>`;
+  return `<div class="filter-bar"><span class="filter-item"><label>Location:</label><select id="location-select">${locOptions}</select></span><span class="filter-break"></span><span class="filter-item"><label>Scope from:</label><select id="scope-select">${scopeOptions}</select></span><span class="filter-break"></span><div id="cache-progress" class="cache-progress"></div></div>`;
 }
 
 function setupFilterBar(): void {
@@ -449,12 +452,18 @@ function setupFilterBar(): void {
   locSelect?.addEventListener("change", () => {
     locationValue = locSelect.value;
     saveSetting(KEY_LOCATION, locationValue);
+    clearTargetedState();
+    clearLabelOldest();
+    saveMsgCache();
+    renderFilteredLabels();
     applyFilters();
   });
   const scopeSelect = document.getElementById("scope-select") as HTMLSelectElement | null;
   scopeSelect?.addEventListener("change", () => {
     scopeValue = scopeSelect.value;
     saveSetting(KEY_SCOPE_VALUE, scopeValue);
+    clearTargetedState();
+    renderFilteredLabels();
     applyFilters();
   });
 }
@@ -470,14 +479,227 @@ function renderLabels(labels: GmailLabel[]): void {
     showContent(`${renderFilterBar()}<div class="label-columns">${columnsHtml}</div>`);
     setupFilterBar();
     setupLabelHandlers();
+    updateCacheProgress();
   } catch (err) {
     showContent(`<div class="status">Error: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic label filtering via message cache
+// ---------------------------------------------------------------------------
+
+let dimmedMode = false;
+let relevantLabelIds: Set<string> = new Set();
+
+// Targeted fetch state
+let targetedFetchId: string | null = null;
+let targetedInProgress = false;
+
+// Broad cache build state
+let broadFetchId: string | null = null;
+let broadQuery: string = "";
+let broadPaused = false;
+let broadPendingToken: string | null = null;
+
+// Targeted fetch query (stored so continuation pages can re-send it)
+let targetedQuery: string = "";
+let targetedOldest: number | null = null;
+let targetedDoneCount: number | null = null;
+
+function renderFilteredLabels(): void {
+  if (!cachedLabels) return;
+  const scopeTs = scopeToTimestamp(scopeValue);
+
+  if (dimmedMode) {
+    // During targeted fetch: render all labels, dim non-relevant ones
+    renderLabels(cachedLabels);
+    document.querySelectorAll<HTMLElement>(".label-link").forEach((link) => {
+      const labelId = link.dataset.labelId;
+      if (!labelId) return;
+      if (relevantLabelIds.has(labelId) || labelId === activeLabelId) {
+        link.classList.remove("dimmed");
+      } else {
+        link.classList.add("dimmed");
+      }
+    });
+    return;
+  }
+
+  const covering = isCacheCovering(activeLabelId, scopeTs);
+  if (!covering && activeLabelId === null) {
+    // Not covered, no label selected: show all labels
+    targetedDoneCount = null;
+    renderLabels(cachedLabels);
+    return;
+  }
+  if (!covering && activeLabelId !== null && activeLabelName !== null) {
+    // Not covered, label selected: trigger targeted fetch
+    if (!targetedInProgress) {
+      startTargetedFetch(activeLabelId, activeLabelName);
+    }
+    // If targeted fetch couldn't start (e.g. no activePort during reconnect), render all labels as fallback
+    if (!targetedInProgress) {
+      renderLabels(cachedLabels);
+    }
+    return;
+  }
+
+  // Cache covers the query — filter locally
+  const filtered = filterMessages(locationValue, scopeTs, activeLabelId);
+  targetedDoneCount = activeLabelId !== null ? filtered.length : null;
+  let ids = deriveRelevantLabelIds(filtered);
+  ids = addParentChain(ids, cachedLabels);
+
+  // Selected label + parent chain always visible
+  if (activeLabelId) {
+    ids.add(activeLabelId);
+    const activeLabel = cachedLabels.find((l) => l.id === activeLabelId);
+    if (activeLabel) {
+      const parts = activeLabel.name.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const parentName = parts.slice(0, i).join("/");
+        const parent = cachedLabels.find((l) => l.name === parentName);
+        if (parent) ids.add(parent.id);
+      }
+    }
+  }
+
+  const filteredLabels = cachedLabels.filter((l) => ids.has(l.id));
+  renderLabels(filteredLabels.length > 0 ? filteredLabels : cachedLabels);
+}
+
+function formatProgressDate(epochMs: number): string {
+  return new Date(epochMs).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function cacheStatusIcon(done: boolean): string {
+  return done ? '<span class="cache-done">&#x2714;</span>' : '<span class="cache-spin">&#x25E0;</span>';
+}
+
+function formatCacheStatus(label: string, done: boolean, date: number | null, count: number | null): string {
+  if (done) return `${label}: ${count ?? 0} emails ${cacheStatusIcon(true)}`;
+  const datePart = date !== null ? formatProgressDate(date) : null;
+  const countPart = count !== null ? `(${count})` : null;
+  const detail = datePart && countPart ? `${datePart} ${countPart}` : datePart ?? countPart ?? "starting...";
+  return `${label}: ${detail} ${cacheStatusIcon(false)}`;
+}
+
+function updateCacheProgress(): void {
+  const el = document.getElementById("cache-progress");
+  if (!el) return;
+  const cache = getMsgCache();
+  const parts: string[] = [];
+  if (cache.oldest !== null || cache.complete) {
+    const count = cache.messages.length > 0 ? cache.messages.length : null;
+    parts.push(formatCacheStatus("global", cache.complete, cache.complete ? null : cache.oldest, count));
+  } else if (broadFetchId) {
+    parts.push(formatCacheStatus("global", false, null, null));
+  }
+  if (targetedInProgress) {
+    parts.push(formatCacheStatus("current", false, targetedOldest, targetedDoneCount));
+  } else if (targetedDoneCount !== null) {
+    parts.push(formatCacheStatus("current", true, null, targetedDoneCount));
+  }
+  el.innerHTML = parts.length > 0 ? `Caching: ${parts.join(" | ")}` : "";
+}
+
+function generateFetchId(prefix: string = "broad"): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function refreshLabelsIfVisible(): void {
+  if (currentTab === "filters" && onGmailPage && cachedLabels) renderFilteredLabels();
+}
+
+function clearTargetedState(): void {
+  if (targetedInProgress) {
+    targetedFetchId = null;
+    targetedInProgress = false;
+    targetedOldest = null;
+    dimmedMode = false;
+    relevantLabelIds = new Set();
+    // Resume broad build if it was paused by this targeted fetch
+    broadPaused = false;
+    if (broadFetchId && broadPendingToken) {
+      const token = broadPendingToken;
+      broadPendingToken = null;
+      continueBroadBuild(token);
+    }
+  }
+}
+
+function startTargetedFetch(labelId: string, labelName: string): void {
+  if (!activePort) return;
+
+  // Pause broad build
+  broadPaused = true;
+
+  // Build gap query: fetch messages with this label, before the broad build's oldest
+  const cache = getMsgCache();
+  let beforeDate: string | null = null;
+  if (cache.broadOldest !== null) {
+    const d = new Date(cache.broadOldest);
+    d.setDate(d.getDate() + 1); // +1 day for overlap (Gmail before: is exclusive, day granularity); dedup handles duplicates
+    beforeDate = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  targetedQuery = buildSearchQuery(locationValue, labelName, scopeToDate(), beforeDate);
+  targetedFetchId = generateFetchId("targeted");
+  targetedInProgress = true;
+  targetedOldest = null;
+  targetedDoneCount = filterMessages(locationValue, scopeToTimestamp(scopeValue), labelId).length;
+  dimmedMode = true;
+
+  // Compute initial relevantLabelIds from whatever the cache already has
+  const scopeTs = scopeToTimestamp(scopeValue);
+  const filtered = filterMessages(locationValue, scopeTs, labelId);
+  relevantLabelIds = deriveRelevantLabelIds(filtered);
+  if (cachedLabels) relevantLabelIds = addParentChain(relevantLabelIds, cachedLabels);
+  relevantLabelIds.add(labelId);
+
+  // Render dimmed labels
+  renderFilteredLabels();
+
+  // Send first page request
+  activePort.postMessage({ type: "fetchMessagePage", query: targetedQuery, fetchId: targetedFetchId });
+}
+
+function startBroadBuild(): void {
+  if (!activePort) return;
+  if (targetedInProgress) return;
+  if (broadFetchId) return;
+  const cache = getMsgCache();
+  broadFetchId = generateFetchId();
+  broadPaused = false;
+  broadPendingToken = null;
+
+  // Incremental refresh: if we have cached messages, only fetch newer ones.
+  // Subtract one day because Gmail's after: operator has day granularity and is exclusive.
+  if (cache.newest !== null && cache.messages.length > 0) {
+    const d = new Date(cache.newest);
+    d.setDate(d.getDate() - 1);
+    const dateStr = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+    broadQuery = `after:${dateStr}`;
+  } else {
+    broadQuery = "";
+  }
+
+  activePort.postMessage({ type: "fetchMessagePage", query: broadQuery, fetchId: broadFetchId });
+}
+
+function continueBroadBuild(nextPageToken: string): void {
+  if (!activePort || !broadFetchId) return;
+  if (broadPaused) {
+    broadPendingToken = nextPageToken;
+    return;
+  }
+  activePort.postMessage({ type: "fetchMessagePage", query: broadQuery, pageToken: nextPageToken, fetchId: broadFetchId });
+}
+
 function loadLabels(forceRefresh: boolean = false): void {
   if (cachedLabels && !forceRefresh) {
-    renderLabels(cachedLabels);
+    renderFilteredLabels();
     return;
   }
   if (!cachedLabels) showContent('<div class="status">Loading labels...</div>');
@@ -528,19 +750,41 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-function handleMessage(message: { type: string; labels?: GmailLabel[] }): void {
+function handleMessage(message: { type: string; labels?: GmailLabel[]; messages?: MessageMeta[]; nextPageToken?: string | null; totalEstimate?: number; fetchId?: string; accountPath?: string }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
     if (wasOffGmail) pendingFilterApply = true;
+    // Detect Gmail account changes and reset cache to avoid cross-account contamination
+    const accountChanged = message.accountPath !== undefined && currentAccountPath !== null && message.accountPath !== currentAccountPath;
+    if (message.accountPath !== undefined) currentAccountPath = message.accountPath;
+    if (accountChanged) {
+      resetMsgCache();
+      saveMsgCache(currentAccountPath ?? undefined);
+      broadFetchId = null;
+      broadPaused = false;
+      broadPendingToken = null;
+      clearTargetedState();
+      // Clear stale label UI state from the previous account
+      cachedLabels = null;
+      activeLabelId = null;
+      activeLabelName = null;
+      saveSetting(KEY_ACTIVE_LABEL, null);
+      saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+      pendingFilterApply = true;
+    }
     // Auto-dismiss help if it was shown because user was on a non-Gmail page
-    if (isShowingHelp() && !wasOffGmail) return;
+    if (isShowingHelp() && !wasOffGmail && !accountChanged) return;
     showTabBar(true);
+    // Load persisted cache on arrival to Gmail or after account switch
+    if (wasOffGmail || accountChanged) loadMsgCache(currentAccountPath ?? undefined);
     if (currentTab === "filters") {
       loadLabels(true);
     } else if (currentTab === "summary") {
       showSummary();
     }
+    // Start or resume broad cache build in parallel with label fetch
+    startBroadBuild();
   } else if (message.type === "labelsReady" && message.labels) {
     cachedLabels = message.labels;
     // Validate and refresh saved label against the current account's labels
@@ -561,7 +805,7 @@ function handleMessage(message: { type: string; labels?: GmailLabel[] }): void {
       pendingFilterApply = false;
       applyFilters();
     }
-    if (currentTab === "filters" && onGmailPage) renderLabels(cachedLabels);
+    refreshLabelsIfVisible();
   } else if (message.type === "labelsError") {
     pendingFilterApply = false;
     if (currentTab === "filters" && onGmailPage && !cachedLabels) showContent('<div class="status">Failed to load labels. Try refreshing the page.</div>');
@@ -569,6 +813,104 @@ function handleMessage(message: { type: string; labels?: GmailLabel[] }): void {
     onGmailPage = false;
     cachedLabels = null;
     if (!isShowingHelp()) showHelp();
+  } else if (message.type === "messagePageReady" && message.fetchId && message.messages) {
+    if (message.fetchId === targetedFetchId) {
+      // Targeted fetch: merge into cache, expand relevantLabelIds, un-dim newly found labels
+      mergeMessages(message.messages, "targeted");
+      saveMsgCache();
+
+      // Track oldest message and update count for progress display
+      for (const msg of message.messages) {
+        if (targetedOldest === null || msg.internalDate < targetedOldest) targetedOldest = msg.internalDate;
+      }
+      targetedDoneCount = filterMessages(locationValue, scopeToTimestamp(scopeValue), activeLabelId).length;
+
+      // Expand relevant label IDs from newly fetched messages
+      for (const msg of message.messages) {
+        for (const lid of msg.labelIds) {
+          relevantLabelIds.add(lid);
+        }
+      }
+      if (cachedLabels) relevantLabelIds = addParentChain(relevantLabelIds, cachedLabels);
+
+      if (message.nextPageToken) {
+        // Show progress and request next page
+        updateCacheProgress();
+        refreshLabelsIfVisible();
+        if (activePort) activePort.postMessage({ type: "fetchMessagePage", query: targetedQuery, pageToken: message.nextPageToken, fetchId: targetedFetchId });
+      } else {
+        // Targeted fetch complete
+        const cache = getMsgCache();
+        if (activeLabelId) {
+          const scopeTs = scopeToTimestamp(scopeValue);
+          cache.labelOldest[activeLabelId] = scopeTs !== null ? scopeTs : 0;
+        }
+        saveMsgCache();
+        targetedDoneCount = filterMessages(locationValue, scopeToTimestamp(scopeValue), activeLabelId).length;
+        targetedFetchId = null;
+        targetedInProgress = false;
+        dimmedMode = false;
+        // Resume broad build with stored pending token
+        broadPaused = false;
+        if (broadFetchId && broadPendingToken) {
+          continueBroadBuild(broadPendingToken);
+          broadPendingToken = null;
+        }
+        refreshLabelsIfVisible();
+      }
+    } else if (message.fetchId === broadFetchId) {
+      // Broad build: merge messages, persist, update progress, re-render filtered labels
+      mergeMessages(message.messages);
+      saveMsgCache();
+      if (message.nextPageToken) {
+        continueBroadBuild(message.nextPageToken);
+      } else {
+        // Broad build complete (only mark complete for full builds, not incremental refreshes)
+        const cache = getMsgCache();
+        if (!broadQuery.startsWith("after:")) {
+          // Full build or backfill complete — all messages fetched
+          cache.complete = true;
+          saveMsgCache();
+          broadFetchId = null;
+        } else if (!cache.complete) {
+          // Incremental refresh done — backfill older messages only
+          saveMsgCache();
+          if (cache.broadOldest !== null) {
+            const d = new Date(cache.broadOldest);
+            d.setDate(d.getDate() + 1);
+            broadQuery = `before:${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+          } else {
+            broadQuery = "";
+          }
+          broadFetchId = generateFetchId();
+          if (activePort) activePort.postMessage({ type: "fetchMessagePage", query: broadQuery, fetchId: broadFetchId });
+        } else {
+          saveMsgCache();
+          broadFetchId = null;
+        }
+      }
+      refreshLabelsIfVisible();
+    }
+  } else if (message.type === "messagePageError" && message.fetchId) {
+    if (message.fetchId === targetedFetchId) {
+      // Stop targeted fetch, fall back to showing all labels
+      targetedFetchId = null;
+      targetedInProgress = false;
+      targetedOldest = null;
+      dimmedMode = false;
+      relevantLabelIds = new Set();
+      broadPaused = false;
+      // Resume broad build if it was paused
+      if (broadFetchId && broadPendingToken) {
+        const token = broadPendingToken;
+        broadPendingToken = null;
+        continueBroadBuild(token);
+      }
+      if (currentTab === "filters" && onGmailPage && cachedLabels) renderLabels(cachedLabels);
+    } else if (message.fetchId === broadFetchId) {
+      broadFetchId = null;
+      if (currentTab === "filters" && onGmailPage && cachedLabels) renderLabels(cachedLabels);
+    }
   } else if (message.type === "fetchError") {
     showContent('<div class="status">Failed to fetch emails. Try refreshing the page.</div>');
   }
@@ -589,6 +931,11 @@ if (chrome.runtime?.connect) {
       chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); syncState(); });
       port.onDisconnect.addListener(() => {
         activePort = null;
+        // Service worker may have restarted — old fetch IDs are invalid
+        broadFetchId = null;
+        broadPaused = false;
+        broadPendingToken = null;
+        clearTargetedState();
         if (!chrome.runtime?.id) return;
         setTimeout(connectToBackground, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
