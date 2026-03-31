@@ -135,16 +135,16 @@ Object Store: "meta"
 - [x] Run tests — must pass before task 5
 
 ### Task 5: Sidepanel refactor (`sidepanel.ts`)
-- [ ] Remove all broad build state (`broadFetchId`, `broadQuery`, `broadPaused`, `broadPendingToken`)
-- [ ] Remove all targeted fetch state (`targetedFetchId`, `targetedInProgress`, `targetedQuery`, `targetedOldest`)
-- [ ] Remove `mergeMessages`, `saveMsgCache`, `loadMsgCache`, `startBroadBuild`, `continueBroadBuild`, `startTargetedFetch`, `clearTargetedState` and all `messagePageReady` handling
-- [ ] Replace with: listen for `cacheState` pushed updates from background — update progress display (`formatCacheStatus`, `updateCacheProgress`)
-- [ ] On label click: send `queryLabel` to background, display result (count + filtered labels)
-- [ ] On scope/location change: re-send `queryLabel` with new parameters
-- [ ] Adapt `renderFilteredLabels` to use cache query results instead of local `filterMessages`
-- [ ] Keep UI rendering logic (label tree, columns, dimming, progress icons) largely intact
-- [ ] Write tests for new sidepanel message handling
-- [ ] Run tests — must pass before task 6
+- [x] Remove all broad build state (`broadFetchId`, `broadQuery`, `broadPaused`, `broadPendingToken`)
+- [x] Remove all targeted fetch state (`targetedFetchId`, `targetedInProgress`, `targetedQuery`, `targetedOldest`)
+- [x] Remove `mergeMessages`, `saveMsgCache`, `loadMsgCache`, `startBroadBuild`, `continueBroadBuild`, `startTargetedFetch`, `clearTargetedState` and all `messagePageReady` handling
+- [x] Replace with: listen for `cacheState` pushed updates from background — update progress display (`formatCacheStatus`, `updateCacheProgress`)
+- [x] On label click: send `queryLabel` to background, display result (count + filtered labels)
+- [x] On scope/location change: re-send `queryLabel` with new parameters
+- [x] Adapt `renderFilteredLabels` to use cache query results instead of local `filterMessages`
+- [x] Keep UI rendering logic (label tree, columns, dimming, progress icons) largely intact
+- [x] Write tests for new sidepanel message handling
+- [x] Run tests — must pass before task 6
 
 ### Task 6: Remove old cache module
 - [ ] Delete `packages/site-gmail/src/msg-cache.ts`
