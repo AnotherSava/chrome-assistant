@@ -1,5 +1,6 @@
 import type { PinMode, MessageMeta } from "@core/types.js";
 import { fetchLabels, type GmailLabel, fetchMessagePage, buildSearchQuery } from "./gmail-api.js";
+import { CacheManager, type CacheProgress } from "./cache-manager.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
@@ -7,6 +8,27 @@ interface PortState { returnToInbox: boolean; onFiltersTab: boolean; gmailTabId:
 const portState = new Map<chrome.runtime.Port, PortState>();
 const pendingReturnToInbox = new Map<number, ReturnType<typeof setTimeout>>();
 let pinMode: PinMode = "pinned";
+
+const cacheManager = new CacheManager();
+let cacheStarted = false;
+let currentAccountPath: string | null = null;
+const CACHE_ALARM_NAME = "cache-keepalive";
+
+cacheManager.setProgressCallback((progress: CacheProgress) => {
+  for (const [port] of portState) {
+    try { port.postMessage({ type: "cacheState", ...progress }); } catch { /* port may be dead */ }
+  }
+  if (progress.phase === "complete") {
+    chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+  }
+});
+
+// Keep service worker alive during active cache fetch
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === CACHE_ALARM_NAME) {
+    // No-op — alarm firing keeps the SW alive
+  }
+});
 
 // Restore pinMode from session storage (survives service worker restarts)
 chrome.storage.session.get("pinMode", (result) => {
@@ -25,6 +47,22 @@ chrome.commands.getAll((commands) => {
     chrome.action.setTitle({ title: `Gmail Assistant (${cmd.shortcut})` });
   }
 });
+
+export function startCacheIfNeeded(accountPath: string): void {
+  if (cacheStarted && currentAccountPath === accountPath) return;
+  if (currentAccountPath !== null && currentAccountPath !== accountPath) {
+    cacheManager.abort();
+    cacheStarted = false;
+  }
+  currentAccountPath = accountPath;
+  cacheStarted = true;
+  chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
+  cacheManager.startFetch(accountPath).catch((err) => {
+    console.warn("Cache fetch failed:", err);
+    cacheStarted = false;
+    chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+  });
+}
 
 function isGmail(url: string | undefined): boolean {
   return url !== undefined && GMAIL_PATTERN.test(url);
@@ -69,7 +107,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; scope?: string | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -81,11 +119,15 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           // Cancel any pending return-to-inbox for this tab (e.g. after service worker restart)
           const pending = pendingReturnToInbox.get(tab.id);
           if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tab.id); }
-          port.postMessage({ type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
+          const account = gmailAccountPath(tab.url);
+          port.postMessage({ type: "resultsReady", accountPath: account });
+          startCacheIfNeeded(account);
         } else {
           port.postMessage({ type: "notOnGmail" });
         }
       });
+    } else if (message.type === "queryLabel" && message.labelId) {
+      cacheManager.queryLabel(message.labelId, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: message.labelId, count: 0, coLabels: [] }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
@@ -136,8 +178,10 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
     if (activeTab?.id === tabId) {
       if (isGmail(tab.url)) {
+        const account = gmailAccountPath(tab.url);
         updateGmailTab(tab.windowId, tabId, tab.url ?? null);
-        broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
+        broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
+        startCacheIfNeeded(account);
       } else {
         updateGmailTab(tab.windowId, null, null);
         broadcastToWindow(tab.windowId, { type: "notOnGmail" });
@@ -156,8 +200,10 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (isGmail(tab.url)) {
+      const account = gmailAccountPath(tab.url);
       updateGmailTab(activeInfo.windowId, activeInfo.tabId, tab.url ?? null);
-      broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: gmailAccountPath(tab.url) });
+      broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: account });
+      startCacheIfNeeded(account);
     } else {
       updateGmailTab(activeInfo.windowId, null, null);
       broadcastToWindow(activeInfo.windowId, { type: "notOnGmail" });
@@ -201,3 +247,12 @@ chrome.commands.onCommand.addListener(async (command) => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab?.id) await closePanel(tab.id);
 });
+
+/** Exported for testing — reset cache state */
+export function _resetCacheState(): void {
+  cacheStarted = false;
+  currentAccountPath = null;
+}
+
+/** Exported for testing — access the cache manager instance */
+export { cacheManager };

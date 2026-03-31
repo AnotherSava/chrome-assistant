@@ -125,14 +125,14 @@ Object Store: "meta"
 - [x] Run tests — must pass before task 4
 
 ### Task 4: Background service worker integration (`background.ts`)
-- [ ] Import and instantiate `CacheManager` in background.ts
-- [ ] Auto-start cache population on first Gmail tab detection (from existing `resultsReady` flow). Once started, continue fetching even if user navigates away from Gmail (auth token persists). Use `chrome.alarms` to keep SW alive during active fetch.
-- [ ] Handle `queryLabel` message — call `cacheManager.queryLabel(labelId, location, scope)`, return result
-- [ ] Push `cacheState` updates to connected sidepanel ports during fetch progress
-- [ ] Handle account changes (from `resultsReady` accountPath) — reset cache manager
-- [ ] Ensure cache manager handles SW shutdown/restart gracefully (IndexedDB persists, re-check state on restart)
-- [ ] Write tests for background message handling
-- [ ] Run tests — must pass before task 5
+- [x] Import and instantiate `CacheManager` in background.ts
+- [x] Auto-start cache population on first Gmail tab detection (from existing `resultsReady` flow). Once started, continue fetching even if user navigates away from Gmail (auth token persists). Use `chrome.alarms` to keep SW alive during active fetch.
+- [x] Handle `queryLabel` message — call `cacheManager.queryLabel(labelId, location, scope)`, return result
+- [x] Push `cacheState` updates to connected sidepanel ports during fetch progress
+- [x] Handle account changes (from `resultsReady` accountPath) — reset cache manager
+- [x] Ensure cache manager handles SW shutdown/restart gracefully (IndexedDB persists, re-check state on restart)
+- [x] Write tests for background message handling
+- [x] Run tests — must pass before task 5
 
 ### Task 5: Sidepanel refactor (`sidepanel.ts`)
 - [ ] Remove all broad build state (`broadFetchId`, `broadQuery`, `broadPaused`, `broadPendingToken`)
