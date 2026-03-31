@@ -102,15 +102,15 @@ Object Store: "meta"
 - [x] Run tests — must pass before task 2
 
 ### Task 2: Gmail batch API support (`gmail-api.ts`)
-- [ ] Add `fetchLabelMessageIds(labelName: string, scopeDate?: string)` — paginated `messages.list q=label:X [after:DATE]`, returns all message IDs (no per-message fetch)
-- [ ] Add `batchFetchDates(messageIds: string[])` — single Gmail batch API call (`POST /batch/gmail/v1`), up to 100 messages per call, returns `{ id, internalDate }[]`. Caller iterates in pages for granular progress.
-- [ ] Add multipart MIME request builder for batch API (Content-Type: multipart/mixed)
-- [ ] Add batch response parser (multipart MIME response → individual JSON responses)
-- [ ] Update `buildSearchQuery` if needed for label-only queries
-- [ ] Write tests for `fetchLabelMessageIds` (mock `messages.list` pagination)
-- [ ] Write tests for `batchFetchDates` (mock batch API request/response)
-- [ ] Write tests for MIME builder and parser
-- [ ] Run tests — must pass before task 3
+- [x] Add `fetchLabelMessageIds(labelName: string, scopeDate?: string)` — paginated `messages.list q=label:X [after:DATE]`, returns all message IDs (no per-message fetch)
+- [x] Add `batchFetchDates(messageIds: string[])` — single Gmail batch API call (`POST /batch/gmail/v1`), up to 100 messages per call, returns `{ id, internalDate }[]`. Caller iterates in pages for granular progress.
+- [x] Add multipart MIME request builder for batch API (Content-Type: multipart/mixed)
+- [x] Add batch response parser (multipart MIME response → individual JSON responses)
+- [x] Update `buildSearchQuery` if needed for label-only queries
+- [x] Write tests for `fetchLabelMessageIds` (mock `messages.list` pagination)
+- [x] Write tests for `batchFetchDates` (mock batch API request/response)
+- [x] Write tests for MIME builder and parser
+- [x] Run tests — must pass before task 3
 
 ### Task 3: Cache manager module (`cache-manager.ts`)
 - [ ] Create `packages/site-gmail/src/cache-manager.ts` with `CacheManager` class
