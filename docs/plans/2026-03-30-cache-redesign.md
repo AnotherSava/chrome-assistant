@@ -113,16 +113,16 @@ Object Store: "meta"
 - [x] Run tests — must pass before task 3
 
 ### Task 3: Cache manager module (`cache-manager.ts`)
-- [ ] Create `packages/site-gmail/src/cache-manager.ts` with `CacheManager` class
-- [ ] Implement Phase 1: label query loop — fetch all labels, then `fetchLabelMessageIds` for each, cross-reference into `{ id, labelIds }`, store in IndexedDB via `cache-db.ts`
-- [ ] Implement Phase 2: batch date fetch — get messages without dates from IndexedDB in pages (e.g., 100 at a time), call `batchFetchDates` per page, update IndexedDB and report progress after each page
-- [ ] Implement progress reporting: `{ phase: "labels" | "dates" | "complete", labelsTotal, labelsDone, datesTotal, datesDone }`
-- [ ] Implement `queryLabel(labelId, location, scopeTimestamp)` — read from IndexedDB, filter by date and location if available, return count + co-occurring label IDs
-- [ ] Implement scope fallback: if dates not cached for queried messages, run `fetchLabelMessageIds(labelName, afterDate)` as substitute, cross-reference returned IDs against IndexedDB to derive co-occurring labels
-- [ ] Implement account change detection: compare stored account with current, clear IndexedDB on mismatch
-- [ ] Implement incremental refresh: on subsequent runs, only fetch new messages (compare with stored newest date)
-- [ ] Write tests for CacheManager (mock cache-db and gmail-api)
-- [ ] Run tests — must pass before task 4
+- [x] Create `packages/site-gmail/src/cache-manager.ts` with `CacheManager` class
+- [x] Implement Phase 1: label query loop — fetch all labels, then `fetchLabelMessageIds` for each, cross-reference into `{ id, labelIds }`, store in IndexedDB via `cache-db.ts`
+- [x] Implement Phase 2: batch date fetch — get messages without dates from IndexedDB in pages (e.g., 100 at a time), call `batchFetchDates` per page, update IndexedDB and report progress after each page
+- [x] Implement progress reporting: `{ phase: "labels" | "dates" | "complete", labelsTotal, labelsDone, datesTotal, datesDone }`
+- [x] Implement `queryLabel(labelId, location, scopeTimestamp)` — read from IndexedDB, filter by date and location if available, return count + co-occurring label IDs
+- [x] Implement scope fallback: if dates not cached for queried messages, run `fetchLabelMessageIds(labelName, afterDate)` as substitute, cross-reference returned IDs against IndexedDB to derive co-occurring labels
+- [x] Implement account change detection: compare stored account with current, clear IndexedDB on mismatch
+- [x] Implement incremental refresh: on subsequent runs, only fetch new messages (compare with stored newest date)
+- [x] Write tests for CacheManager (mock cache-db and gmail-api)
+- [x] Run tests — must pass before task 4
 
 ### Task 4: Background service worker integration (`background.ts`)
 - [ ] Import and instantiate `CacheManager` in background.ts

@@ -1,0 +1,308 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { CacheManager, type CacheProgress } from "../src/cache-manager.js";
+import type { CacheMessage, GmailLabel } from "@core/types.js";
+
+// Mock cache-db
+vi.mock("../src/cache-db.js", () => {
+  const store = new Map<string, CacheMessage>();
+  const meta = new Map<string, unknown>();
+  return {
+    openDatabase: vi.fn().mockResolvedValue({}),
+    closeDatabase: vi.fn().mockResolvedValue(undefined),
+    putMessages: vi.fn(async (messages: CacheMessage[]) => { for (const m of messages) store.set(m.id, m); }),
+    getMessage: vi.fn(async (id: string) => store.get(id)),
+    getMessagesByLabel: vi.fn(async (labelId: string) => [...store.values()].filter(m => m.labelIds.includes(labelId))),
+    getMeta: vi.fn(async (key: string) => meta.get(key)),
+    setMeta: vi.fn(async (key: string, value: unknown) => { meta.set(key, value); }),
+    getMessagesWithoutDates: vi.fn(async (batchSize: number = 100) => {
+      const results: CacheMessage[] = [];
+      for (const m of store.values()) {
+        if (m.internalDate === null) results.push(m);
+        if (results.length >= batchSize) break;
+      }
+      return results;
+    }),
+    clearAll: vi.fn(async () => { store.clear(); meta.clear(); }),
+    getMessageCount: vi.fn(async () => store.size),
+    _store: store,
+    _meta: meta,
+  };
+});
+
+// Mock gmail-api
+vi.mock("../src/gmail-api.js", () => ({
+  fetchLabels: vi.fn(),
+  fetchLabelMessageIds: vi.fn(),
+  batchFetchDates: vi.fn(),
+}));
+
+import * as dbMock from "../src/cache-db.js";
+import * as apiMock from "../src/gmail-api.js";
+
+const mockDb = dbMock as unknown as {
+  putMessages: ReturnType<typeof vi.fn>;
+  getMessage: ReturnType<typeof vi.fn>;
+  getMessagesByLabel: ReturnType<typeof vi.fn>;
+  getMeta: ReturnType<typeof vi.fn>;
+  setMeta: ReturnType<typeof vi.fn>;
+  getMessagesWithoutDates: ReturnType<typeof vi.fn>;
+  clearAll: ReturnType<typeof vi.fn>;
+  getMessageCount: ReturnType<typeof vi.fn>;
+  _store: Map<string, CacheMessage>;
+  _meta: Map<string, unknown>;
+};
+
+const mockApi = apiMock as unknown as {
+  fetchLabels: ReturnType<typeof vi.fn>;
+  fetchLabelMessageIds: ReturnType<typeof vi.fn>;
+  batchFetchDates: ReturnType<typeof vi.fn>;
+};
+
+const testLabels: GmailLabel[] = [
+  { id: "INBOX", name: "INBOX", type: "system" },
+  { id: "SENT", name: "SENT", type: "system" },
+  { id: "Label_1", name: "Work", type: "user" },
+  { id: "Label_2", name: "Personal", type: "user" },
+];
+
+describe("CacheManager", () => {
+  let manager: CacheManager;
+
+  beforeEach(() => {
+    manager = new CacheManager();
+    mockDb._store.clear();
+    mockDb._meta.clear();
+    vi.clearAllMocks();
+    // Re-setup the default mock implementations after clearAllMocks
+    mockDb.putMessages.mockImplementation(async (messages: CacheMessage[]) => { for (const m of messages) mockDb._store.set(m.id, m); });
+    mockDb.getMessage.mockImplementation(async (id: string) => mockDb._store.get(id));
+    mockDb.getMessagesByLabel.mockImplementation(async (labelId: string) => [...mockDb._store.values()].filter(m => m.labelIds.includes(labelId)));
+    mockDb.getMeta.mockImplementation(async (key: string) => mockDb._meta.get(key));
+    mockDb.setMeta.mockImplementation(async (key: string, value: unknown) => { mockDb._meta.set(key, value); });
+    mockDb.getMessagesWithoutDates.mockImplementation(async (batchSize: number = 100) => {
+      const results: CacheMessage[] = [];
+      for (const m of mockDb._store.values()) {
+        if (m.internalDate === null) results.push(m);
+        if (results.length >= batchSize) break;
+      }
+      return results;
+    });
+    mockDb.clearAll.mockImplementation(async () => { mockDb._store.clear(); mockDb._meta.clear(); });
+    mockDb.getMessageCount.mockImplementation(async () => mockDb._store.size);
+  });
+
+  describe("startFetch", () => {
+    it("runs Phase 1 (label queries) and Phase 2 (date fetch)", async () => {
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      // INBOX has messages m1, m2; SENT has m2, m3; Work has m1; Personal has m3
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelName: string) => {
+        if (labelName === "INBOX") return ["m1", "m2"];
+        if (labelName === "SENT") return ["m2", "m3"];
+        if (labelName === "Work") return ["m1"];
+        if (labelName === "Personal") return ["m3"];
+        return [];
+      });
+      mockApi.batchFetchDates.mockResolvedValue([
+        { id: "m1", internalDate: 1000 },
+        { id: "m2", internalDate: 2000 },
+        { id: "m3", internalDate: 3000 },
+      ]);
+
+      const progressUpdates: CacheProgress[] = [];
+      manager.setProgressCallback(p => progressUpdates.push({ ...p }));
+
+      await manager.startFetch("/mail/u/0/");
+
+      // Verify cross-referencing: m1 should have INBOX + Work, m2 should have INBOX + SENT, m3 should have SENT + Personal
+      const m1 = mockDb._store.get("m1")!;
+      const m2 = mockDb._store.get("m2")!;
+      const m3 = mockDb._store.get("m3")!;
+      expect(m1.labelIds).toContain("INBOX");
+      expect(m1.labelIds).toContain("Label_1");
+      expect(m2.labelIds).toContain("INBOX");
+      expect(m2.labelIds).toContain("SENT");
+      expect(m3.labelIds).toContain("SENT");
+      expect(m3.labelIds).toContain("Label_2");
+
+      // Verify dates were fetched
+      expect(m1.internalDate).toBe(1000);
+      expect(m2.internalDate).toBe(2000);
+      expect(m3.internalDate).toBe(3000);
+
+      // Verify progress includes label phase and date phase and complete
+      const phases = progressUpdates.map(p => p.phase);
+      expect(phases).toContain("labels");
+      expect(phases).toContain("dates");
+      expect(phases[phases.length - 1]).toBe("complete");
+
+      // Verify fetchState was saved
+      const fetchState = mockDb._meta.get("fetchState") as { phase: string; lastFetchTimestamp: number };
+      expect(fetchState.phase).toBe("complete");
+      expect(fetchState.lastFetchTimestamp).toBeGreaterThan(0);
+    });
+
+    it("clears cache on account change", async () => {
+      mockDb._meta.set("account", "/mail/u/1/");
+      mockDb._store.set("old", { id: "old", internalDate: 100, labelIds: ["INBOX"] });
+
+      mockApi.fetchLabels.mockResolvedValue([]);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+
+      await manager.startFetch("/mail/u/0/");
+
+      expect(mockDb.clearAll).toHaveBeenCalled();
+    });
+
+    it("does not clear cache when same account", async () => {
+      mockDb._meta.set("account", "/mail/u/0/");
+
+      mockApi.fetchLabels.mockResolvedValue([]);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+
+      await manager.startFetch("/mail/u/0/");
+
+      expect(mockDb.clearAll).not.toHaveBeenCalled();
+    });
+
+    it("supports incremental refresh with scope date", async () => {
+      // Simulate a previous completed fetch
+      mockDb._meta.set("fetchState", { phase: "complete", lastFetchTimestamp: 1700000000000 });
+      mockDb._meta.set("account", "/mail/u/0/");
+
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.batchFetchDates.mockResolvedValue([]);
+
+      await manager.startFetch("/mail/u/0/");
+
+      // fetchLabelMessageIds should have been called with a scopeDate derived from the timestamp
+      const calls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      // Each call should have a second argument (the scope date string)
+      for (const call of calls) {
+        expect(call[1]).toBeDefined();
+        expect(call[1]).toMatch(/^\d{4}\/\d{2}\/\d{2}$/);
+      }
+    });
+
+    it("can be aborted during label fetch", async () => {
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      let callCount = 0;
+      mockApi.fetchLabelMessageIds.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 2) manager.abort();
+        return [];
+      });
+
+      await manager.startFetch("/mail/u/0/");
+
+      // Should have stopped after 2 label fetches (aborted on second)
+      expect(callCount).toBe(2);
+    });
+  });
+
+  describe("queryLabel", () => {
+    beforeEach(() => {
+      // Populate cache with test data
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["INBOX", "Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["INBOX", "SENT", "Label_1"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["SENT", "Label_2"] });
+      mockDb._store.set("m4", { id: "m4", internalDate: 4000, labelIds: ["INBOX", "Label_2"] });
+    });
+
+    it("returns count and co-occurring labels for a label", async () => {
+      const result = await manager.queryLabel("INBOX", undefined, null);
+      expect(result.count).toBe(3); // m1, m2, m4
+      expect(result.coLabels).toContain("Label_1");
+      expect(result.coLabels).toContain("SENT");
+      expect(result.coLabels).toContain("Label_2");
+    });
+
+    it("filters by location (inbox)", async () => {
+      const result = await manager.queryLabel("Label_1", "inbox", null);
+      expect(result.count).toBe(2); // m1, m2 (both have INBOX)
+    });
+
+    it("filters by location (sent)", async () => {
+      const result = await manager.queryLabel("Label_1", "sent", null);
+      expect(result.count).toBe(1); // m2 (has SENT)
+    });
+
+    it("does not filter by location for 'all'", async () => {
+      const result = await manager.queryLabel("Label_1", "all", null);
+      expect(result.count).toBe(2); // m1, m2
+    });
+
+    it("filters by scope timestamp when all messages have dates", async () => {
+      const result = await manager.queryLabel("INBOX", undefined, 2500);
+      expect(result.count).toBe(1); // m4 (internalDate 4000 >= 2500)
+    });
+
+    it("uses scope fallback when some messages lack dates", async () => {
+      mockDb._store.set("m5", { id: "m5", internalDate: null, labelIds: ["INBOX", "Label_1"] });
+
+      // Setup labels for the fallback
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      await (manager as any).labels.push(...testLabels);
+
+      // The fallback calls fetchLabelMessageIds with a scope date
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m2", "m4"]);
+
+      const result = await manager.queryLabel("INBOX", undefined, 2000);
+      // Fallback returns count based on scoped API IDs cross-referenced with IndexedDB
+      expect(result.count).toBe(2);
+    });
+
+    it("returns empty result for unknown label", async () => {
+      const result = await manager.queryLabel("NONEXISTENT", undefined, null);
+      expect(result.count).toBe(0);
+      expect(result.coLabels).toEqual([]);
+    });
+  });
+
+  describe("cross-referencing", () => {
+    it("correctly merges labels from multiple queries", async () => {
+      mockApi.fetchLabels.mockResolvedValue([
+        { id: "INBOX", name: "INBOX", type: "system" },
+        { id: "Label_1", name: "Work", type: "user" },
+      ]);
+      // Both queries return message "m1"
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelName: string) => {
+        if (labelName === "INBOX") return ["m1"];
+        if (labelName === "Work") return ["m1"];
+        return [];
+      });
+      mockApi.batchFetchDates.mockResolvedValue([{ id: "m1", internalDate: 5000 }]);
+
+      await manager.startFetch("/mail/u/0/");
+
+      const m1 = mockDb._store.get("m1")!;
+      expect(m1.labelIds).toContain("INBOX");
+      expect(m1.labelIds).toContain("Label_1");
+      expect(m1.labelIds.length).toBe(2);
+    });
+  });
+
+  describe("progress reporting", () => {
+    it("emits progress for each label fetched", async () => {
+      mockApi.fetchLabels.mockResolvedValue([
+        { id: "INBOX", name: "INBOX", type: "system" },
+        { id: "Label_1", name: "Work", type: "user" },
+      ]);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.batchFetchDates.mockResolvedValue([]);
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      await manager.startFetch("/mail/u/0/");
+
+      const labelUpdates = updates.filter(p => p.phase === "labels");
+      // Initial + 2 labels = 3 updates in label phase
+      expect(labelUpdates.length).toBe(3);
+      expect(labelUpdates[0].labelsDone).toBe(0);
+      expect(labelUpdates[1].labelsDone).toBe(1);
+      expect(labelUpdates[2].labelsDone).toBe(2);
+    });
+  });
+});
