@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Minimal DOM setup for sidepanel.ts module-level code
 function setupDOM(): void {
@@ -341,6 +341,10 @@ describe("sendQueryLabel with include children", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    setIncludeChildren(true);
+  });
+
   it("sends array with descendants when setting is on", () => {
     // Default includeChildren is true (from loadSetting default)
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
@@ -360,6 +364,12 @@ describe("sendQueryLabel with include children", () => {
       type: "queryLabel",
       labelIds: expect.arrayContaining(["L1", "L2", "L3"]),
       labelId: "L1",
+    }));
+
+    // Also verify applyFilters message includes descendant label names
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "applyFilters",
+      labelName: expect.arrayContaining(["Games", "Games/18xx", "Games/Chess"]),
     }));
   });
 
@@ -388,7 +398,10 @@ describe("sendQueryLabel with include children", () => {
       labelId: "L1",
     }));
 
-    // Restore for subsequent tests
-    setIncludeChildren(true);
+    // Verify applyFilters sends single label name (not array) when children disabled
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "applyFilters",
+      labelName: "Games",
+    }));
   });
 });
