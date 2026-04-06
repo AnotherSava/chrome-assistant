@@ -98,5 +98,5 @@ When a user selects a parent label (e.g. "Games"), only messages directly tagged
 
 ### Task 5: Update documentation
 
-- [ ] Update CLAUDE.md if internal patterns changed
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md if internal patterns changed (reviewed — no update needed, existing descriptions cover the changes)
+- [x] Move this plan to `docs/plans/completed/`
