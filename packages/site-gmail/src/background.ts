@@ -1,6 +1,7 @@
 import type { PinMode } from "@core/types.js";
 import { fetchLabels, type GmailLabel, buildSearchQuery } from "./gmail-api.js";
 import { CacheManager, type CacheProgress } from "./cache-manager.js";
+import { getMeta } from "./cache-db.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
@@ -51,15 +52,18 @@ chrome.commands.getAll((commands) => {
   }
 });
 
-export function startCacheIfNeeded(accountPath: string): void {
+const CACHE_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes between incremental refreshes
+
+export async function startCacheIfNeeded(accountPath: string): Promise<void> {
   if (cacheStarted && currentAccountPath === accountPath) return;
   currentAccountPath = accountPath;
   cacheStarted = true;
+  // Check if cache was recently completed — skip if within refresh interval
+  const fetchState = await getMeta<{ phase: string; lastFetchTimestamp: number | null }>("fetchState");
+  if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) return;
   const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
-  cacheManager.startFetch(accountPath).then(() => {
-    if (gen === cacheGeneration) cacheStarted = false;
-  }).catch((err) => {
+  cacheManager.startFetch(accountPath).catch((err) => {
     console.warn("Cache fetch failed:", err);
     if (gen === cacheGeneration) {
       cacheStarted = false;
@@ -93,8 +97,11 @@ export function isGmailListView(url: string): boolean {
     const lastSegment = hash.split("/").pop() ?? "";
     return lastSegment.length < 16 || !/^[A-Za-z0-9_-]+$/.test(lastSegment);
   }
-  // Search views
-  if (hash.startsWith("search/")) return true;
+  // Search views — but not individual emails opened from search (search/.../MessageId)
+  if (hash.startsWith("search/")) {
+    const lastSegment = hash.split("/").pop() ?? "";
+    return lastSegment.length < 16 || !/^[A-Za-z0-9_-]+$/.test(lastSegment);
+  }
   // Settings sub-pages
   if (hash.startsWith("settings/")) return true;
   // Anything else with a long last segment is likely a message view
@@ -145,7 +152,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | string[] | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -164,9 +171,10 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           port.postMessage({ type: "notOnGmail" });
         }
       });
-    } else if (message.type === "queryLabel" && message.labelId) {
+    } else if (message.type === "queryLabel" && (message.labelIds || message.labelId)) {
       const seq = message.seq;
-      cacheManager.queryLabel(message.labelId, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: message.labelId, count: 0, coLabels: [], error: true, seq }); });
+      const labelIds = message.labelIds ?? [message.labelId!];
+      cacheManager.queryLabel(labelIds, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabels: [], error: true, seq }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
@@ -217,14 +225,15 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url !== undefined && isGmail(changeInfo.url) && portState.size > 0) {
     const lastHash = lastExtensionNavHash.get(tabId);
     const currentHash = urlHash(changeInfo.url);
-    if (lastHash && currentHash === lastHash) {
-      // Hash matches what the extension navigated to — not a user action
-    } else {
+    if (lastHash && (currentHash === lastHash || currentHash.startsWith(lastHash + "/"))) {
+      // Hash matches (or is a sub-path of) what the extension navigated to — not a user action
+    } else if (isGmailListView(changeInfo.url)) {
+      // User navigated to a different list view — clear stored hash and notify sidepanel
       lastExtensionNavHash.delete(tabId);
-      if (isGmailListView(changeInfo.url) && tab.windowId !== undefined) {
-        broadcastToWindow(tab.windowId, { type: "userNavigated" });
-      }
+      if (tab.windowId !== undefined) broadcastToWindow(tab.windowId, { type: "userNavigated" });
     }
+    // Non-list-view URLs (opening an email) don't clear lastExtensionNavHash,
+    // so "back" to the original search still matches and won't trigger userNavigated.
   }
   if (portState.size === 0) return;
   if (changeInfo.status === "complete") {
@@ -267,7 +276,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 // Handle messages from side panel
-export function buildGmailUrl(base: string, location: string | undefined, labelName: string | null, scope: string | null): string {
+export function buildGmailUrl(base: string, location: string | undefined, labelName: string | string[] | null, scope: string | null): string {
   const loc = location ?? "inbox";
   const query = buildSearchQuery(location, labelName, scope);
   if (!query) return `${base}#${loc}`;

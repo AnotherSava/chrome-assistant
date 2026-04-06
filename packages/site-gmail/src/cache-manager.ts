@@ -92,7 +92,10 @@ export class CacheManager {
       if (this.priorityBarrier) await this.priorityBarrier;
       if (this.isStale(generation)) return;
       if (this.processedLabels.has(label.id)) { labelsDone++; this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 }); continue; }
-      const messageIds = await fetchLabelMessageIds(label.id, scopeDate);
+      // Only use incremental scope if the label index already exists; otherwise do a full fetch to build it
+      const existingIndex = isIncremental ? await db.getMeta<string[]>(`labelIdx:${label.id}`) : undefined;
+      const labelScopeDate = existingIndex && existingIndex.length > 0 ? scopeDate : undefined;
+      const messageIds = await fetchLabelMessageIds(label.id, labelScopeDate);
       await this.crossReferenceLabel(label.id, messageIds);
       this.processedLabels.add(label.id);
       labelsDone++;
@@ -147,16 +150,30 @@ export class CacheManager {
   }
 
 
-  /** Query the cache for a label's message count and co-occurring labels. */
-  async queryLabel(labelId: string, location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
-    let messages = await db.getMessagesByLabel(labelId);
+  /** Query the cache for a label's message count and co-occurring labels. Accepts multiple label IDs and unions their messages. */
+  async queryLabel(labelIds: string[], location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
+    const primaryId = labelIds[0];
+    const seen = new Set<string>();
+    let messages: CacheMessage[] = [];
 
-    // If cache hasn't indexed this label yet, prioritize it now
-    if (messages.length === 0 && !this.processedLabels.has(labelId)) {
-      const fetchState = await db.getMeta<FetchState>("fetchState");
-      if (fetchState && fetchState.phase !== "complete") {
+    for (const labelId of labelIds) {
+      // Look up message IDs from label index (O(1) meta read) instead of scanning all messages
+      let msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+
+      // If no index entry, the label hasn't been cached yet — fetch it now
+      if (!msgIds) {
         await this.prioritizeLabel(labelId);
-        messages = await db.getMessagesByLabel(labelId);
+        msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+      }
+
+      if (msgIds) {
+        // Filter to IDs not yet seen, then batch-fetch their records
+        const newIds = msgIds.filter(id => !seen.has(id));
+        for (const id of newIds) seen.add(id);
+        if (newIds.length > 0) {
+          const batch = await db.getMessagesBatch(newIds);
+          for (const msg of batch.values()) messages.push(msg);
+        }
       }
     }
 
@@ -173,18 +190,18 @@ export class CacheManager {
       if (allHaveDates) {
         messages = messages.filter(m => m.internalDate !== null && m.internalDate >= scopeTimestamp);
       } else {
-        return this.scopeFallback(labelId, locationLabelId, scopeTimestamp);
+        return this.scopeFallback(labelIds, locationLabelId, scopeTimestamp);
       }
     }
 
     const coLabelSet = new Set<string>();
     for (const msg of messages) {
       for (const lid of msg.labelIds) {
-        if (lid !== labelId) coLabelSet.add(lid);
+        if (lid !== primaryId) coLabelSet.add(lid);
       }
     }
 
-    return { labelId, count: messages.length, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count: messages.length, coLabels: [...coLabelSet] };
   }
 
   /** Pause the main cache loop, process a single label, then resume. */
@@ -202,28 +219,41 @@ export class CacheManager {
     }
   }
 
-  /** Scope fallback: use API to get scoped message IDs, cross-reference with IndexedDB for co-labels. */
-  private async scopeFallback(labelId: string, locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
+  /** Scope fallback: use API to get scoped message IDs for all label IDs, cross-reference with IndexedDB for co-labels. */
+  private async scopeFallback(labelIds: string[], locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
+    const primaryId = labelIds[0];
     const dateStr = this.timestampToDateString(scopeTimestamp);
-    const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
-    const msgMap = await db.getMessagesBatch(scopedIds);
+    const seenIds = new Set<string>();
+    const allScopedIds: string[] = [];
+
+    for (const labelId of labelIds) {
+      const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
+      for (const id of scopedIds) {
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          allScopedIds.push(id);
+        }
+      }
+    }
+
+    const msgMap = await db.getMessagesBatch(allScopedIds);
     const coLabelSet = new Set<string>();
     let count = 0;
 
-    for (const msgId of scopedIds) {
+    for (const msgId of allScopedIds) {
       const msg = msgMap.get(msgId);
       if (msg) {
         if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         count++;
         for (const lid of msg.labelIds) {
-          if (lid !== labelId) coLabelSet.add(lid);
+          if (lid !== primaryId) coLabelSet.add(lid);
         }
       } else if (!locationLabelId) {
         count++;
       }
     }
 
-    return { labelId, count, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count, coLabels: [...coLabelSet] };
   }
 
   private timestampToDateString(timestamp: number): string {
@@ -254,8 +284,17 @@ export class CacheManager {
     return result;
   }
 
-  /** Cross-reference: for each message ID from a label query, add the label to its record. */
+  /** Cross-reference: for each message ID from a label query, add the label to its record and store the label index. */
   private async crossReferenceLabel(labelId: string, messageIds: string[]): Promise<void> {
+    // Store label→messageIds index for fast lookup in queryLabel
+    const existingIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+    if (existingIndex) {
+      const merged = new Set(existingIndex);
+      for (const id of messageIds) merged.add(id);
+      await db.setMeta(`labelIdx:${labelId}`, [...merged]);
+    } else {
+      await db.setMeta(`labelIdx:${labelId}`, messageIds);
+    }
     const batchSize = 500;
     for (let i = 0; i < messageIds.length; i += batchSize) {
       const chunk = messageIds.slice(i, i + batchSize);

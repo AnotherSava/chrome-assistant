@@ -9,6 +9,7 @@ A side panel extension for Gmail that provides quick label-based filtering and n
 **Features:**
 - Browse all your Gmail labels in a multi-column layout
 - Click a label to filter the Gmail page by that label
+- Include sub-labels: selecting a parent label shows messages from all its children too (configurable)
 - Filter by location (Inbox, Sent, All Mail) and time scope
 - Dynamic label filtering — only shows labels that appear on matching messages, powered by a progressive message metadata cache
 - Auto-hide side panel when leaving Gmail

@@ -200,10 +200,12 @@ const KEY_LABEL_COLUMNS = "ca_label_columns";
 const KEY_SCOPE_VALUE = "ca_scope_value";
 const KEY_LOCATION = "ca_location";
 const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
+const KEY_INCLUDE_CHILDREN = "ca_include_children";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
 let locationValue: string = loadSetting(KEY_LOCATION, "inbox");
 let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
+let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
 
 const LOCATION_OPTIONS: { value: string; label: string }[] = [
   { value: "inbox", label: "Inbox" },
@@ -235,7 +237,7 @@ function buildDisplayPanel(): void {
   const panel = document.getElementById("display-panel");
   if (!panel) return;
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === labelColumns ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     labelColumns = parseInt(colSelect.value, 10);
@@ -247,6 +249,15 @@ function buildDisplayPanel(): void {
     returnToInbox = returnCheck.checked;
     saveSetting(KEY_RETURN_TO_INBOX, returnToInbox);
     syncState();
+  });
+  const childrenCheck = document.getElementById("include-children-check") as HTMLInputElement;
+  childrenCheck.addEventListener("change", () => {
+    includeChildren = childrenCheck.checked;
+    saveSetting(KEY_INCLUDE_CHILDREN, includeChildren);
+    if (activeLabelId) {
+      sendQueryLabel();
+      applyFilters();
+    }
   });
 }
 
@@ -374,6 +385,33 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
   return root;
 }
 
+export function setIncludeChildren(value: boolean): void {
+  includeChildren = value;
+}
+
+export function getDescendantIds(labelId: string, labels: GmailLabel[]): string[] {
+  const tree = buildLabelTree(labels);
+  function findNode(nodes: LabelTreeNode[]): LabelTreeNode | null {
+    for (const node of nodes) {
+      if (node.id === labelId) return node;
+      const found = findNode(node.children);
+      if (found) return found;
+    }
+    return null;
+  }
+  function collectIds(nodes: LabelTreeNode[]): string[] {
+    const ids: string[] = [];
+    for (const node of nodes) {
+      ids.push(node.id);
+      ids.push(...collectIds(node.children));
+    }
+    return ids;
+  }
+  const target = findNode(tree);
+  if (!target || target.children.length === 0) return [];
+  return collectIds(target.children);
+}
+
 function countNodes(node: LabelTreeNode): number {
   return 1 + node.children.reduce((sum, c) => sum + countNodes(c), 0);
 }
@@ -429,6 +467,7 @@ function setupLabelHandlers(): void {
         saveSetting(KEY_ACTIVE_LABEL_NAME, null);
         // No label selected — show all labels, clear query result
         lastLabelResult = null;
+        queryInFlight = false;
         renderFilteredLabels();
         applyFilters();
       } else {
@@ -462,7 +501,15 @@ function resetGmailToInbox(): void {
 
 function applyFilters(): void {
   if (!activePort) return;
-  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName: activeLabelName, scope: scopeToDate() });
+  let labelName: string | string[] | null = activeLabelName;
+  if (activeLabelName && activeLabelId && includeChildren && cachedLabels) {
+    const descendants = getDescendantIds(activeLabelId, cachedLabels);
+    if (descendants.length > 0) {
+      const descendantNames = descendants.map(id => cachedLabels!.find(l => l.id === id)?.name).filter((n): n is string => n !== undefined);
+      labelName = [activeLabelName, ...descendantNames];
+    }
+  }
+  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName, scope: scopeToDate() });
 }
 
 function renderFilterBar(): string {
@@ -521,13 +568,22 @@ let lastQueryError = false;
 /** Monotonic sequence number to correlate queryLabel requests with responses */
 let queryLabelSeq = 0;
 
+/** Whether a queryLabel request is currently in flight — prevents duplicate queries */
+let queryInFlight = false;
+
 /** Send a queryLabel request to background for the currently selected label */
 function sendQueryLabel(): void {
-  if (!activePort || !activeLabelId) return;
+  if (!activePort || !activeLabelId || queryInFlight) return;
+  queryInFlight = true;
   lastQueryError = false;
   queryLabelSeq++;
   updateCacheProgress();
-  activePort.postMessage({ type: "queryLabel", labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
+  const labelIds = [activeLabelId];
+  if (includeChildren && cachedLabels) {
+    const descendants = getDescendantIds(activeLabelId, cachedLabels);
+    labelIds.push(...descendants);
+  }
+  activePort.postMessage({ type: "queryLabel", labelIds, labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -741,6 +797,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
   } else if (message.type === "labelResult" && message.labelId !== undefined) {
     // Query result from background cache — ignore stale responses
     if (message.labelId === activeLabelId && (message.seq === undefined || message.seq === queryLabelSeq)) {
+      queryInFlight = false;
       if (message.error) {
         // Query failed — clear stale result so labels show unfiltered, don't hide everything
         lastLabelResult = null;

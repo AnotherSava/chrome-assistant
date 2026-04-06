@@ -1,5 +1,5 @@
-// @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from "vitest";
+// @vitest-environment happy-dom
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Minimal DOM setup for sidepanel.ts module-level code
 function setupDOM(): void {
@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -210,6 +210,8 @@ describe("handleMessage", () => {
     // Select a label
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
+    // Simulate the query response arriving (clears queryInFlight)
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabels: [] });
     vi.clearAllMocks();
 
     // Cache completes — should trigger re-query
@@ -295,5 +297,113 @@ describe("scopeToTimestamp", () => {
 
   it("returns null for unknown scope", () => {
     expect(scopeToTimestamp("unknown")).toBeNull();
+  });
+});
+
+describe("getDescendantIds", () => {
+  it("returns all descendants for a nested label", () => {
+    const labels = [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Games/Chess", type: "user" },
+      { id: "L4", name: "Games/Chess/Online", type: "user" },
+      { id: "L5", name: "Work", type: "user" },
+    ];
+    const descendants = getDescendantIds("L1", labels);
+    expect(descendants).toContain("L2");
+    expect(descendants).toContain("L3");
+    expect(descendants).toContain("L4");
+    expect(descendants).not.toContain("L1");
+    expect(descendants).not.toContain("L5");
+  });
+
+  it("returns empty for leaf label", () => {
+    const labels = [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Work", type: "user" },
+    ];
+    const descendants = getDescendantIds("L2", labels);
+    expect(descendants).toEqual([]);
+  });
+
+  it("returns empty for label with no children in the tree", () => {
+    const labels = [
+      { id: "L1", name: "Work", type: "user" },
+      { id: "L2", name: "Personal", type: "user" },
+    ];
+    const descendants = getDescendantIds("L1", labels);
+    expect(descendants).toEqual([]);
+  });
+});
+
+describe("sendQueryLabel with include children", () => {
+  beforeEach(() => {
+    setupDOM();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    setIncludeChildren(true);
+  });
+
+  it("sends array with descendants when setting is on", () => {
+    // Default includeChildren is true (from loadSetting default)
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Games/Chess", type: "user" },
+      { id: "L4", name: "Work", type: "user" },
+    ] });
+    vi.clearAllMocks();
+
+    // Click parent label "Games"
+    const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
+    link?.click();
+
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "queryLabel",
+      labelIds: expect.arrayContaining(["L1", "L2", "L3"]),
+      labelId: "L1",
+    }));
+
+    // Also verify applyFilters message includes descendant label names
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "applyFilters",
+      labelName: expect.arrayContaining(["Games", "Games/18xx", "Games/Chess"]),
+    }));
+  });
+
+  it("sends single-element array when setting is off", () => {
+    setIncludeChildren(false);
+
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Work", type: "user" },
+    ] });
+
+    // Deselect any previously active label (state persists across tests)
+    const activeLink = document.querySelector('.label-link.active') as HTMLAnchorElement;
+    if (activeLink) activeLink.click();
+    vi.clearAllMocks();
+
+    // Click parent label "Games"
+    const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
+    link?.click();
+
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "queryLabel",
+      labelIds: ["L1"],
+      labelId: "L1",
+    }));
+
+    // Verify applyFilters sends single label name (not array) when children disabled
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "applyFilters",
+      labelName: "Games",
+    }));
   });
 });

@@ -169,9 +169,13 @@ describe("CacheManager", () => {
     });
 
     it("supports incremental refresh with scope date", async () => {
-      // Simulate a previous completed fetch
+      // Simulate a previous completed fetch with existing label indexes
       mockDb._meta.set("fetchState", { phase: "complete", lastFetchTimestamp: 1700000000000 });
       mockDb._meta.set("account", "/mail/u/0/");
+      mockDb._meta.set("labelIdx:INBOX", ["m1"]);
+      mockDb._meta.set("labelIdx:SENT", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m1"]);
 
       mockApi.fetchLabels.mockResolvedValue(testLabels);
       mockApi.fetchLabelMessageIds.mockResolvedValue([]);
@@ -212,10 +216,15 @@ describe("CacheManager", () => {
       mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["INBOX", "SENT", "Label_1"] });
       mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["SENT", "Label_2"] });
       mockDb._store.set("m4", { id: "m4", internalDate: 4000, labelIds: ["INBOX", "Label_2"] });
+      // Populate label index (mirrors what crossReferenceLabel stores)
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2", "m4"]);
+      mockDb._meta.set("labelIdx:SENT", ["m2", "m3"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3", "m4"]);
     });
 
     it("returns count and co-occurring labels for a label", async () => {
-      const result = await manager.queryLabel("INBOX", undefined, null);
+      const result = await manager.queryLabel(["INBOX"], undefined, null);
       expect(result.count).toBe(3); // m1, m2, m4
       expect(result.coLabels).toContain("Label_1");
       expect(result.coLabels).toContain("SENT");
@@ -223,27 +232,28 @@ describe("CacheManager", () => {
     });
 
     it("filters by location (inbox)", async () => {
-      const result = await manager.queryLabel("Label_1", "inbox", null);
+      const result = await manager.queryLabel(["Label_1"], "inbox", null);
       expect(result.count).toBe(2); // m1, m2 (both have INBOX)
     });
 
     it("filters by location (sent)", async () => {
-      const result = await manager.queryLabel("Label_1", "sent", null);
+      const result = await manager.queryLabel(["Label_1"], "sent", null);
       expect(result.count).toBe(1); // m2 (has SENT)
     });
 
     it("does not filter by location for 'all'", async () => {
-      const result = await manager.queryLabel("Label_1", "all", null);
+      const result = await manager.queryLabel(["Label_1"], "all", null);
       expect(result.count).toBe(2); // m1, m2
     });
 
     it("filters by scope timestamp when all messages have dates", async () => {
-      const result = await manager.queryLabel("INBOX", undefined, 2500);
+      const result = await manager.queryLabel(["INBOX"], undefined, 2500);
       expect(result.count).toBe(1); // m4 (internalDate 4000 >= 2500)
     });
 
     it("uses scope fallback when some messages lack dates", async () => {
       mockDb._store.set("m5", { id: "m5", internalDate: null, labelIds: ["INBOX", "Label_1"] });
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2", "m4", "m5"]);
 
       // Setup labels for the fallback
       mockApi.fetchLabels.mockResolvedValue(testLabels);
@@ -252,13 +262,14 @@ describe("CacheManager", () => {
       // The fallback calls fetchLabelMessageIds with a scope date
       mockApi.fetchLabelMessageIds.mockResolvedValue(["m2", "m4"]);
 
-      const result = await manager.queryLabel("INBOX", undefined, 2000);
+      const result = await manager.queryLabel(["INBOX"], undefined, 2000);
       // Fallback returns count based on scoped API IDs cross-referenced with IndexedDB
       expect(result.count).toBe(2);
     });
 
     it("returns empty result for unknown label", async () => {
-      const result = await manager.queryLabel("NONEXISTENT", undefined, null);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      const result = await manager.queryLabel(["NONEXISTENT"], undefined, null);
       expect(result.count).toBe(0);
       expect(result.coLabels).toEqual([]);
     });
@@ -268,12 +279,44 @@ describe("CacheManager", () => {
       mockDb._meta.set("fetchState", { phase: "labels", lastFetchTimestamp: null });
       // The priority fetch will call fetchLabelMessageIds for the uncached label
       mockApi.fetchLabelMessageIds.mockResolvedValue(["m10", "m11"]);
-      const result = await manager.queryLabel("Label_priority", undefined, null);
+      const result = await manager.queryLabel(["Label_priority"], undefined, null);
       expect(mockApi.fetchLabelMessageIds).toHaveBeenCalledWith("Label_priority");
       expect(result.count).toBe(2);
       // Messages should now be in the DB for subsequent queries
       const cached = await mockDb.getMessagesByLabel("Label_priority");
       expect(cached.length).toBe(2);
+    });
+
+    it("returns union count and combined co-labels for multiple label IDs", async () => {
+      // Label_1 has m1, m2; Label_2 has m3, m4; m2 is shared via SENT
+      const result = await manager.queryLabel(["Label_1", "Label_2"], undefined, null);
+      expect(result.count).toBe(4); // m1, m2, m3, m4 (all unique)
+      expect(result.labelId).toBe("Label_1"); // primary ID
+      // Primary label (Label_1) should be excluded from co-labels
+      expect(result.coLabels).not.toContain("Label_1");
+      // Sub-label IDs (Label_2) should appear as co-labels
+      expect(result.coLabels).toContain("Label_2");
+      expect(result.coLabels).toContain("INBOX");
+      expect(result.coLabels).toContain("SENT");
+    });
+
+    it("excludes only primary ID from co-labels, sub-label IDs appear if messages have them", async () => {
+      // Add a message that has both Label_1 and Label_2
+      mockDb._store.set("m5", { id: "m5", internalDate: 5000, labelIds: ["Label_1", "Label_2", "INBOX"] });
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2", "m5"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3", "m4", "m5"]);
+      const result = await manager.queryLabel(["Label_1", "Label_2"], undefined, null);
+      // Label_2 should appear as a co-label (not excluded)
+      expect(result.coLabels).toContain("Label_2");
+      // Label_1 (primary) should not appear
+      expect(result.coLabels).not.toContain("Label_1");
+    });
+
+    it("filters by location with multiple label IDs", async () => {
+      // Label_1: m1 (INBOX), m2 (INBOX+SENT); Label_2: m3 (SENT), m4 (INBOX)
+      const result = await manager.queryLabel(["Label_1", "Label_2"], "inbox", null);
+      // Only messages with INBOX: m1, m2, m4
+      expect(result.count).toBe(3);
     });
   });
 

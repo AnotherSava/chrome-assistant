@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// Mock cache-db module — getMeta returns null (no prior fetch state) by default
+vi.mock("../src/cache-db.js", () => ({
+  getMeta: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock cache-manager module before background.ts imports it
 vi.mock("../src/cache-manager.js", () => {
   const mockStartFetch = vi.fn().mockResolvedValue(undefined);
@@ -84,21 +89,21 @@ describe("startCacheIfNeeded", () => {
     vi.clearAllMocks();
   });
 
-  it("starts cache fetch on first call", () => {
-    startCacheIfNeeded("/mail/u/0/");
+  it("starts cache fetch on first call", async () => {
+    await startCacheIfNeeded("/mail/u/0/");
     expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
     expect(alarmsCreateMock).toHaveBeenCalledWith("cache-keepalive", { periodInMinutes: 0.4 });
   });
 
-  it("does not restart cache for same account", () => {
-    startCacheIfNeeded("/mail/u/0/");
-    startCacheIfNeeded("/mail/u/0/");
+  it("does not restart cache for same account", async () => {
+    await startCacheIfNeeded("/mail/u/0/");
+    await startCacheIfNeeded("/mail/u/0/");
     expect(cacheManager.startFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("restarts cache on account change", () => {
-    startCacheIfNeeded("/mail/u/0/");
-    startCacheIfNeeded("/mail/u/1/");
+  it("restarts cache on account change", async () => {
+    await startCacheIfNeeded("/mail/u/0/");
+    await startCacheIfNeeded("/mail/u/1/");
     expect(cacheManager.startFetch).toHaveBeenCalledTimes(2);
     expect(cacheManager.startFetch).toHaveBeenLastCalledWith("/mail/u/1/");
   });
@@ -106,7 +111,7 @@ describe("startCacheIfNeeded", () => {
 
 describe("cacheManager integration", () => {
   it("exposes queryLabel via cacheManager", async () => {
-    const result = await cacheManager.queryLabel("INBOX", "inbox", null);
+    const result = await cacheManager.queryLabel(["INBOX"], "inbox", null);
     expect(result).toEqual({ labelId: "INBOX", count: 5, coLabels: ["STARRED"] });
   });
 
