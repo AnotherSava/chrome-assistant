@@ -1,4 +1,4 @@
-// @vitest-environment jsdom
+// @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Minimal DOM setup for sidepanel.ts module-level code
@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, getDescendantIds } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -364,11 +364,8 @@ describe("sendQueryLabel with include children", () => {
   });
 
   it("sends single-element array when setting is off", () => {
-    // Turn off includeChildren via localStorage
-    localStorage.setItem("ca_include_children", JSON.stringify(false));
+    setIncludeChildren(false);
 
-    // Re-import to pick up the setting change — but since module is already loaded,
-    // we simulate by toggling the display panel checkbox instead
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [
       { id: "L1", name: "Games", type: "user" },
@@ -376,14 +373,9 @@ describe("sendQueryLabel with include children", () => {
       { id: "L3", name: "Work", type: "user" },
     ] });
 
-    // Open display panel and uncheck the include-children checkbox
-    const btnDisplay = document.getElementById("btn-display");
-    btnDisplay?.click();
-    const checkbox = document.getElementById("include-children-check") as HTMLInputElement;
-    if (checkbox) {
-      checkbox.checked = false;
-      checkbox.dispatchEvent(new Event("change"));
-    }
+    // Deselect any previously active label (state persists across tests)
+    const activeLink = document.querySelector('.label-link.active') as HTMLAnchorElement;
+    if (activeLink) activeLink.click();
     vi.clearAllMocks();
 
     // Click parent label "Games"
@@ -396,15 +388,7 @@ describe("sendQueryLabel with include children", () => {
       labelId: "L1",
     }));
 
-    // Clean up
-    localStorage.removeItem("ca_include_children");
-    // Re-enable for subsequent tests
-    const btnDisplay2 = document.getElementById("btn-display");
-    btnDisplay2?.click();
-    const checkbox2 = document.getElementById("include-children-check") as HTMLInputElement;
-    if (checkbox2) {
-      checkbox2.checked = true;
-      checkbox2.dispatchEvent(new Event("change"));
-    }
+    // Restore for subsequent tests
+    setIncludeChildren(true);
   });
 });

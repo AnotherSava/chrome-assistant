@@ -385,6 +385,10 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
   return root;
 }
 
+export function setIncludeChildren(value: boolean): void {
+  includeChildren = value;
+}
+
 export function getDescendantIds(labelId: string, labels: GmailLabel[]): string[] {
   const tree = buildLabelTree(labels);
   function findNode(nodes: LabelTreeNode[]): LabelTreeNode | null {
