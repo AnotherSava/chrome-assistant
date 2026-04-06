@@ -24,6 +24,7 @@ export function openDatabase(indexedDB: IDBFactory = globalThis.indexedDB): Prom
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+  dbPromise.catch(() => { dbPromise = null; });
   return dbPromise;
 }
 
@@ -62,6 +63,27 @@ export async function putMessages(messages: CacheMessage[]): Promise<void> {
 export async function getMessage(id: string): Promise<CacheMessage | undefined> {
   const db = await openDatabase();
   return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.get(id));
+}
+
+/** Batch-read multiple messages by ID in a single transaction. */
+export async function getMessagesBatch(ids: string[]): Promise<Map<string, CacheMessage>> {
+  if (ids.length === 0) return new Map();
+  const db = await openDatabase();
+  return new Promise<Map<string, CacheMessage>>((resolve, reject) => {
+    const tx = db.transaction(MESSAGES_STORE, "readonly");
+    const store = tx.objectStore(MESSAGES_STORE);
+    const results = new Map<string, CacheMessage>();
+    let completed = 0;
+    for (const id of ids) {
+      const request = store.get(id);
+      request.onsuccess = () => {
+        if (request.result) results.set(id, request.result as CacheMessage);
+        completed++;
+        if (completed === ids.length) resolve(results);
+      };
+      request.onerror = () => reject(request.error);
+    }
+  });
 }
 
 export async function getMessagesByLabel(labelId: string): Promise<CacheMessage[]> {
@@ -131,4 +153,25 @@ export async function clearAll(): Promise<void> {
 export async function getMessageCount(): Promise<number> {
   const db = await openDatabase();
   return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.count());
+}
+
+export async function countMessagesWithoutDates(): Promise<number> {
+  const db = await openDatabase();
+  return new Promise<number>((resolve, reject) => {
+    const tx = db.transaction(MESSAGES_STORE, "readonly");
+    const store = tx.objectStore(MESSAGES_STORE);
+    const request = store.openCursor();
+    let count = 0;
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor) {
+        const msg = cursor.value as CacheMessage;
+        if (msg.internalDate === null) count++;
+        cursor.continue();
+      } else {
+        resolve(count);
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
 }

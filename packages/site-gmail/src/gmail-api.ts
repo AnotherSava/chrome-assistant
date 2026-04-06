@@ -1,5 +1,5 @@
-import type { GmailLabel, MessageMeta } from "@core/types.js";
-export type { GmailLabel, MessageMeta };
+import type { GmailLabel } from "@core/types.js";
+export type { GmailLabel };
 
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const BATCH_BASE = "https://www.googleapis.com/batch/gmail/v1";
@@ -52,15 +52,9 @@ interface MessagesListResponse {
   resultSizeEstimate?: number;
 }
 
-interface MessageMinimalResponse {
-  id: string;
-  labelIds?: string[];
-  internalDate?: string;
-}
-
 export function buildSearchQuery(location: string | undefined, labelName: string | null, scope: string | null, beforeDate?: string | null): string {
   const parts: string[] = [];
-  if (labelName) parts.push(`label:"${labelName.replace(/"/g, "").replace(/[/ ]/g, "-").toLowerCase()}"`);
+  if (labelName) parts.push(`label:${formatLabelForQuery(labelName)}`);
   const loc = location ?? "inbox";
   if (loc !== "all") parts.push(`in:${loc}`);
   if (scope) parts.push(`after:${scope}`);
@@ -81,34 +75,14 @@ export async function parallelMap<T, R>(items: T[], fn: (item: T) => Promise<R>,
   return results;
 }
 
-export interface FetchMessagePageResult {
-  messages: MessageMeta[];
-  nextPageToken: string | null;
-  totalEstimate: number;
-}
-
-export async function fetchMessagePage(query: string, pageToken?: string | null, concurrency: number = 5): Promise<FetchMessagePageResult> {
+/** Fetch all message IDs for a label, paginating automatically. Uses labelIds API parameter for reliable filtering (avoids search query syntax issues with system/category labels). */
+export async function fetchLabelMessageIds(labelId: string, scopeDate?: string): Promise<string[]> {
   const token = await getAuthToken();
-  let path = `/messages?maxResults=500&q=${encodeURIComponent(query)}`;
-  if (pageToken) path += `&pageToken=${encodeURIComponent(pageToken)}`;
-  const listData = await gmailFetch<MessagesListResponse>(path, token);
-  const messageIds = listData.messages ?? [];
-  const totalEstimate = listData.resultSizeEstimate ?? 0;
-  const messages = await parallelMap(messageIds, async (msg) => {
-    const detail = await gmailFetch<MessageMinimalResponse>(`/messages/${msg.id}?format=minimal`, token);
-    return { id: detail.id, labelIds: detail.labelIds ?? [], internalDate: Number(detail.internalDate ?? 0) } satisfies MessageMeta;
-  }, concurrency);
-  return { messages, nextPageToken: listData.nextPageToken ?? null, totalEstimate };
-}
-
-/** Fetch all message IDs for a label query, paginating automatically. No per-message fetch. */
-export async function fetchLabelMessageIds(labelName: string, scopeDate?: string): Promise<string[]> {
-  const token = await getAuthToken();
-  const query = scopeDate ? `label:${formatLabelForQuery(labelName)} after:${scopeDate}` : `label:${formatLabelForQuery(labelName)}`;
   const allIds: string[] = [];
   let pageToken: string | undefined;
   do {
-    let path = `/messages?maxResults=500&q=${encodeURIComponent(query)}`;
+    let path = `/messages?maxResults=500&labelIds=${encodeURIComponent(labelId)}`;
+    if (scopeDate) path += `&q=${encodeURIComponent(`after:${scopeDate}`)}`;
     if (pageToken) path += `&pageToken=${encodeURIComponent(pageToken)}`;
     const data = await gmailFetch<MessagesListResponse>(path, token);
     for (const msg of data.messages ?? []) allIds.push(msg.id);
@@ -124,7 +98,7 @@ export function formatLabelForQuery(labelName: string): string {
 
 /** Build a multipart/mixed batch request body for Gmail batch API. */
 export function buildBatchRequestBody(messageIds: string[], boundary: string): string {
-  const parts = messageIds.map((id, index) => `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <msg${index}>\r\n\r\nGET /gmail/v1/users/me/messages/${id}?format=minimal&fields=id,internalDate\r\n`);
+  const parts = messageIds.map((id, index) => `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <msg${index}>\r\n\r\nGET /gmail/v1/users/me/messages/${id}?format=minimal&fields=id,internalDate\r\n\r\n`);
   return parts.join("") + `--${boundary}--`;
 }
 

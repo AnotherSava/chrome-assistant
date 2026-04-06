@@ -1,5 +1,5 @@
-import type { PinMode, MessageMeta } from "@core/types.js";
-import { fetchLabels, type GmailLabel, fetchMessagePage, buildSearchQuery } from "./gmail-api.js";
+import type { PinMode } from "@core/types.js";
+import { fetchLabels, type GmailLabel, buildSearchQuery } from "./gmail-api.js";
 import { CacheManager, type CacheProgress } from "./cache-manager.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
@@ -7,11 +7,14 @@ const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 interface PortState { returnToInbox: boolean; onFiltersTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null }
 const portState = new Map<chrome.runtime.Port, PortState>();
 const pendingReturnToInbox = new Map<number, ReturnType<typeof setTimeout>>();
+/** Last hash fragment the extension navigated each tab to via applyFilters — used to suppress userNavigated for our own navigations. */
+const lastExtensionNavHash = new Map<number, string>();
 let pinMode: PinMode = "pinned";
 
 const cacheManager = new CacheManager();
 let cacheStarted = false;
 let currentAccountPath: string | null = null;
+let cacheGeneration = 0;
 const CACHE_ALARM_NAME = "cache-keepalive";
 
 cacheManager.setProgressCallback((progress: CacheProgress) => {
@@ -50,22 +53,57 @@ chrome.commands.getAll((commands) => {
 
 export function startCacheIfNeeded(accountPath: string): void {
   if (cacheStarted && currentAccountPath === accountPath) return;
-  if (currentAccountPath !== null && currentAccountPath !== accountPath) {
-    cacheManager.abort();
-    cacheStarted = false;
-  }
   currentAccountPath = accountPath;
   cacheStarted = true;
+  const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
-  cacheManager.startFetch(accountPath).catch((err) => {
+  cacheManager.startFetch(accountPath).then(() => {
+    if (gen === cacheGeneration) cacheStarted = false;
+  }).catch((err) => {
     console.warn("Cache fetch failed:", err);
-    cacheStarted = false;
-    chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+    if (gen === cacheGeneration) {
+      cacheStarted = false;
+      chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+    }
   });
 }
 
 function isGmail(url: string | undefined): boolean {
   return url !== undefined && GMAIL_PATTERN.test(url);
+}
+
+function urlHash(url: string): string {
+  const idx = url.indexOf("#");
+  if (idx === -1) return "";
+  try { return decodeURIComponent(url.slice(idx + 1).replace(/\+/g, " ")); } catch { return url.slice(idx + 1).replace(/\+/g, " "); }
+}
+
+/** Returns true if the Gmail URL hash is a list/section view (not an individual email). */
+export function isGmailListView(url: string): boolean {
+  const hashIdx = url.indexOf("#");
+  if (hashIdx === -1) return true;
+  const hash = url.slice(hashIdx + 1);
+  // Known section-only views (no sub-path)
+  if (/^(inbox|sent|starred|snoozed|drafts|imp|chats|trash|spam|all|scheduled|settings)$/.test(hash)) return true;
+  // Category views: category/social, category/updates, etc.
+  if (/^category\/\w+$/.test(hash)) return true;
+  // Label views: label/Name or label/Name/SubName (but not label/Name/MessageId)
+  // Gmail message IDs in URLs are 16+ char alphanumeric strings
+  if (hash.startsWith("label/")) {
+    const lastSegment = hash.split("/").pop() ?? "";
+    return lastSegment.length < 16 || !/^[A-Za-z0-9_-]+$/.test(lastSegment);
+  }
+  // Search views
+  if (hash.startsWith("search/")) return true;
+  // Settings sub-pages
+  if (hash.startsWith("settings/")) return true;
+  // Anything else with a long last segment is likely a message view
+  const segments = hash.split("/");
+  if (segments.length >= 2) {
+    const last = segments[segments.length - 1];
+    if (last.length >= 16 && /^[A-Za-z0-9_-]+$/.test(last)) return false;
+  }
+  return true;
 }
 
 function gmailAccountPath(url: string | undefined): string {
@@ -107,7 +145,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -127,7 +165,8 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         }
       });
     } else if (message.type === "queryLabel" && message.labelId) {
-      cacheManager.queryLabel(message.labelId, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: message.labelId, count: 0, coLabels: [] }); });
+      const seq = message.seq;
+      cacheManager.queryLabel(message.labelId, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: message.labelId, count: 0, coLabels: [], error: true, seq }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
@@ -138,12 +177,12 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "applyFilters") {
       if (state.gmailTabId !== null && state.gmailTabUrl) {
         const base = `https://mail.google.com${gmailAccountPath(state.gmailTabUrl)}`;
-        chrome.tabs.update(state.gmailTabId, { url: buildGmailUrl(base, message.location, message.labelName ?? null, message.scope ?? null) });
+        const url = buildGmailUrl(base, message.location, message.labelName ?? null, message.scope ?? null);
+        lastExtensionNavHash.set(state.gmailTabId, urlHash(url));
+        chrome.tabs.update(state.gmailTabId, { url });
       }
     } else if (message.type === "fetchLabels") {
       fetchLabels().then((labels) => { port.postMessage({ type: "labelsReady", labels }); }).catch(() => { port.postMessage({ type: "labelsError" }); });
-    } else if (message.type === "fetchMessagePage" && message.query !== undefined && message.fetchId) {
-      fetchMessagePage(message.query, message.pageToken).then((result) => { port.postMessage({ type: "messagePageReady", messages: result.messages, nextPageToken: result.nextPageToken, totalEstimate: result.totalEstimate, fetchId: message.fetchId }); }).catch(() => { port.postMessage({ type: "messagePageError", fetchId: message.fetchId }); });
     }
   });
 
@@ -155,7 +194,9 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       // Delay return-to-inbox so reconnects after service worker restarts can cancel it
       const timeoutId = setTimeout(() => {
         pendingReturnToInbox.delete(tabId);
-        chrome.tabs.update(tabId, { url: `${base}#inbox` }).catch(() => {});
+        const url = `${base}#inbox`;
+        lastExtensionNavHash.set(tabId, "inbox");
+        chrome.tabs.update(tabId, { url }).catch(() => {});
       }, 2000);
       pendingReturnToInbox.set(tabId, timeoutId);
     }
@@ -171,6 +212,19 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url !== undefined) {
     const pending = pendingReturnToInbox.get(tabId);
     if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tabId); }
+  }
+  // Detect user-initiated Gmail navigation (hash changes not caused by the extension)
+  if (changeInfo.url !== undefined && isGmail(changeInfo.url) && portState.size > 0) {
+    const lastHash = lastExtensionNavHash.get(tabId);
+    const currentHash = urlHash(changeInfo.url);
+    if (lastHash && currentHash === lastHash) {
+      // Hash matches what the extension navigated to — not a user action
+    } else {
+      lastExtensionNavHash.delete(tabId);
+      if (isGmailListView(changeInfo.url) && tab.windowId !== undefined) {
+        broadcastToWindow(tab.windowId, { type: "userNavigated" });
+      }
+    }
   }
   if (portState.size === 0) return;
   if (changeInfo.status === "complete") {
@@ -252,6 +306,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 export function _resetCacheState(): void {
   cacheStarted = false;
   currentAccountPath = null;
+  cacheGeneration = 0;
 }
 
 /** Exported for testing — access the cache manager instance */

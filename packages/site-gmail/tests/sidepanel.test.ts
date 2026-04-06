@@ -108,7 +108,7 @@ describe("handleMessage", () => {
     handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
 
     const progress = document.getElementById("cache-progress");
-    expect(progress?.innerHTML).toContain("✔");
+    expect(progress?.innerHTML).toBe("");
   });
 
   it("handles labelResult by filtering displayed labels", () => {
@@ -226,7 +226,7 @@ describe("handleMessage", () => {
     handleMessage({ type: "labelsError" });
 
     const content = document.getElementById("content");
-    expect(content?.innerHTML).toContain("Failed to load labels");
+    expect(content?.innerHTML).toContain("Loading labels...");
   });
 
   it("handles fetchError gracefully", () => {
@@ -234,6 +234,42 @@ describe("handleMessage", () => {
 
     const content = document.getElementById("content");
     expect(content?.innerHTML).toContain("Failed to fetch emails");
+  });
+
+  it("shows error status in cache progress when labelResult has error", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Personal", type: "user" }] });
+
+    // Select Work label
+    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
+    workLink?.click();
+
+    // Simulate error response from background
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabels: [], error: true });
+
+    const progress = document.getElementById("cache-progress");
+    expect(progress?.innerHTML).toContain("query failed");
+
+    // Both labels should still be visible (unfiltered)
+    const content = document.getElementById("content");
+    expect(content?.innerHTML).toContain("Work");
+    expect(content?.innerHTML).toContain("Personal");
+  });
+
+  it("clears error status when a successful labelResult arrives", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Personal", type: "user" }] });
+
+    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
+    workLink?.click();
+
+    // Error first
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabels: [], error: true });
+
+    // Then success — error should be cleared
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabels: ["Label_2"] });
+    const progress = document.getElementById("cache-progress");
+    expect(progress?.innerHTML).not.toContain("query failed");
   });
 });
 

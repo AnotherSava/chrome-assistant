@@ -96,10 +96,9 @@ describe("startCacheIfNeeded", () => {
     expect(cacheManager.startFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("aborts and restarts cache on account change", () => {
+  it("restarts cache on account change", () => {
     startCacheIfNeeded("/mail/u/0/");
     startCacheIfNeeded("/mail/u/1/");
-    expect(cacheManager.abort).toHaveBeenCalled();
     expect(cacheManager.startFetch).toHaveBeenCalledTimes(2);
     expect(cacheManager.startFetch).toHaveBeenLastCalledWith("/mail/u/1/");
   });

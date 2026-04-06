@@ -11,6 +11,7 @@ vi.mock("../src/cache-db.js", () => {
     closeDatabase: vi.fn().mockResolvedValue(undefined),
     putMessages: vi.fn(async (messages: CacheMessage[]) => { for (const m of messages) store.set(m.id, m); }),
     getMessage: vi.fn(async (id: string) => store.get(id)),
+    getMessagesBatch: vi.fn(async (ids: string[]) => { const map = new Map<string, CacheMessage>(); for (const id of ids) { const m = store.get(id); if (m) map.set(id, m); } return map; }),
     getMessagesByLabel: vi.fn(async (labelId: string) => [...store.values()].filter(m => m.labelIds.includes(labelId))),
     getMeta: vi.fn(async (key: string) => meta.get(key)),
     setMeta: vi.fn(async (key: string, value: unknown) => { meta.set(key, value); }),
@@ -24,6 +25,7 @@ vi.mock("../src/cache-db.js", () => {
     }),
     clearAll: vi.fn(async () => { store.clear(); meta.clear(); }),
     getMessageCount: vi.fn(async () => store.size),
+    countMessagesWithoutDates: vi.fn(async () => { let count = 0; for (const m of store.values()) { if (m.internalDate === null) count++; } return count; }),
     _store: store,
     _meta: meta,
   };
@@ -48,6 +50,7 @@ const mockDb = dbMock as unknown as {
   getMessagesWithoutDates: ReturnType<typeof vi.fn>;
   clearAll: ReturnType<typeof vi.fn>;
   getMessageCount: ReturnType<typeof vi.fn>;
+  countMessagesWithoutDates: ReturnType<typeof vi.fn>;
   _store: Map<string, CacheMessage>;
   _meta: Map<string, unknown>;
 };
@@ -89,17 +92,18 @@ describe("CacheManager", () => {
     });
     mockDb.clearAll.mockImplementation(async () => { mockDb._store.clear(); mockDb._meta.clear(); });
     mockDb.getMessageCount.mockImplementation(async () => mockDb._store.size);
+    mockDb.countMessagesWithoutDates.mockImplementation(async () => { let count = 0; for (const m of mockDb._store.values()) { if (m.internalDate === null) count++; } return count; });
   });
 
   describe("startFetch", () => {
     it("runs Phase 1 (label queries) and Phase 2 (date fetch)", async () => {
       mockApi.fetchLabels.mockResolvedValue(testLabels);
       // INBOX has messages m1, m2; SENT has m2, m3; Work has m1; Personal has m3
-      mockApi.fetchLabelMessageIds.mockImplementation(async (labelName: string) => {
-        if (labelName === "INBOX") return ["m1", "m2"];
-        if (labelName === "SENT") return ["m2", "m3"];
-        if (labelName === "Work") return ["m1"];
-        if (labelName === "Personal") return ["m3"];
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2"];
+        if (labelId === "SENT") return ["m2", "m3"];
+        if (labelId === "Label_1") return ["m1"];
+        if (labelId === "Label_2") return ["m3"];
         return [];
       });
       mockApi.batchFetchDates.mockResolvedValue([
@@ -258,6 +262,19 @@ describe("CacheManager", () => {
       expect(result.count).toBe(0);
       expect(result.coLabels).toEqual([]);
     });
+
+    it("prioritizes uncached label when cache is still building", async () => {
+      // Simulate cache in labels phase
+      mockDb._meta.set("fetchState", { phase: "labels", lastFetchTimestamp: null });
+      // The priority fetch will call fetchLabelMessageIds for the uncached label
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m10", "m11"]);
+      const result = await manager.queryLabel("Label_priority", undefined, null);
+      expect(mockApi.fetchLabelMessageIds).toHaveBeenCalledWith("Label_priority");
+      expect(result.count).toBe(2);
+      // Messages should now be in the DB for subsequent queries
+      const cached = await mockDb.getMessagesByLabel("Label_priority");
+      expect(cached.length).toBe(2);
+    });
   });
 
   describe("cross-referencing", () => {
@@ -267,9 +284,9 @@ describe("CacheManager", () => {
         { id: "Label_1", name: "Work", type: "user" },
       ]);
       // Both queries return message "m1"
-      mockApi.fetchLabelMessageIds.mockImplementation(async (labelName: string) => {
-        if (labelName === "INBOX") return ["m1"];
-        if (labelName === "Work") return ["m1"];
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1"];
+        if (labelId === "Label_1") return ["m1"];
         return [];
       });
       mockApi.batchFetchDates.mockResolvedValue([{ id: "m1", internalDate: 5000 }]);

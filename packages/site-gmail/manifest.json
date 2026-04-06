@@ -5,6 +5,7 @@
   "description": "A Chrome extension for Gmail, part of Another Chrome Assistant project",
   "permissions": [
     "activeTab",
+    "alarms",
     "identity",
     "sidePanel",
     "storage",

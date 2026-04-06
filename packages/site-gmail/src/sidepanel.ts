@@ -3,7 +3,6 @@ import { escapeHtml, ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSetting, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
 import { buildSearchQuery } from "./gmail-api.js";
-(window as any).__queryLabel = () => { if (activePort && activeLabelId) activePort.postMessage({ type: "queryLabel", labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue) }); };
 interface LabelTreeNode { name: string; fullName: string; id: string; children: LabelTreeNode[] }
 
 let currentTab: "summary" | "filters" = "filters";
@@ -289,12 +288,12 @@ function showSummary(): void {
   showContent('<div class="status">Summary is coming soon...</div>');
 }
 
-function switchTab(tab: "summary" | "filters"): void {
+function switchTab(tab: "summary" | "filters", skipNavigation: boolean = false): void {
   currentTab = tab;
   syncState();
   document.querySelectorAll<HTMLElement>(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   if (tab === "summary") {
-    if (returnToInbox && onGmailPage) resetGmailToInbox();
+    if (!skipNavigation && returnToInbox && onGmailPage) resetGmailToInbox();
     showSummary();
   } else {
     if (onGmailPage) {
@@ -302,7 +301,7 @@ function switchTab(tab: "summary" | "filters"): void {
       if (cachedLabels) {
         pendingFilterApply = false;
         applyFilters();
-        renderLabels(cachedLabels);
+        renderFilteredLabels();
       }
     }
     loadLabels(true);
@@ -516,10 +515,19 @@ let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number;
 /** Last label query result from background */
 let lastLabelResult: { labelId: string; count: number; coLabels: string[] } | null = null;
 
+/** Whether the last queryLabel request failed */
+let lastQueryError = false;
+
+/** Monotonic sequence number to correlate queryLabel requests with responses */
+let queryLabelSeq = 0;
+
 /** Send a queryLabel request to background for the currently selected label */
 function sendQueryLabel(): void {
   if (!activePort || !activeLabelId) return;
-  activePort.postMessage({ type: "queryLabel", labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue) });
+  lastQueryError = false;
+  queryLabelSeq++;
+  updateCacheProgress();
+  activePort.postMessage({ type: "queryLabel", labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -586,21 +594,21 @@ function updateCacheProgress(): void {
   if (!el) return;
   const parts: string[] = [];
 
-  if (lastCacheProgress) {
-    if (lastCacheProgress.phase === "labels") {
-      parts.push(formatCacheStatus("cache", false, `labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}`, null));
-    } else if (lastCacheProgress.phase === "dates") {
-      parts.push(formatCacheStatus("cache", false, `dates ${lastCacheProgress.datesDone}/${lastCacheProgress.datesTotal}`, null));
-    } else if (lastCacheProgress.phase === "complete") {
-      parts.push(formatCacheStatus("cache", true, null, null));
-    }
-  }
-
-  if (lastLabelResult && activeLabelId) {
+  if (lastQueryError && activeLabelId) {
+    parts.push("query failed — showing unfiltered labels");
+  } else if (lastLabelResult && activeLabelId) {
     parts.push(formatCacheStatus("current", true, null, lastLabelResult.count));
   }
 
-  el.innerHTML = parts.length > 0 ? `Caching: ${parts.join(" | ")}` : "";
+  if (lastCacheProgress) {
+    if (lastCacheProgress.phase === "labels") {
+      parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal} ${cacheStatusIcon(false)}`);
+    } else if (lastCacheProgress.phase === "dates") {
+      parts.push(`Background caching: dates ${lastCacheProgress.datesDone}/${lastCacheProgress.datesTotal} ${cacheStatusIcon(false)}`);
+    }
+  }
+
+  el.innerHTML = parts.join(" | ");
 }
 
 function refreshLabelsIfVisible(): void {
@@ -660,7 +668,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; datesTotal?: number; datesDone?: number; labelId?: string; count?: number; coLabels?: string[]; complete?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; datesTotal?: number; datesDone?: number; labelId?: string; count?: number; coLabels?: string[]; complete?: boolean; seq?: number; error?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -712,7 +720,14 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (activeLabelId) sendQueryLabel();
   } else if (message.type === "labelsError") {
     pendingFilterApply = false;
-    if (currentTab === "filters" && onGmailPage && !cachedLabels) showContent('<div class="status">Failed to load labels. Try refreshing the page.</div>');
+    if (currentTab === "filters" && onGmailPage && !cachedLabels) {
+      showContent('<div class="status">Loading labels...</div>');
+      setTimeout(() => { if (!cachedLabels && onGmailPage) loadLabels(true); }, 3000);
+    }
+  } else if (message.type === "userNavigated") {
+    // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
+    // skipNavigation: the user already navigated where they want, don't override with return-to-inbox
+    if (currentTab !== "summary") switchTab("summary", true);
   } else if (message.type === "notOnGmail") {
     onGmailPage = false;
     cachedLabels = null;
@@ -724,10 +739,20 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     // When cache completes, re-query the active label to get final counts
     if (message.phase === "complete" && activeLabelId) sendQueryLabel();
   } else if (message.type === "labelResult" && message.labelId !== undefined) {
-    // Query result from background cache
-    if (message.labelId === activeLabelId) {
-      lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabels: message.coLabels ?? [] };
-      refreshLabelsIfVisible();
+    // Query result from background cache — ignore stale responses
+    if (message.labelId === activeLabelId && (message.seq === undefined || message.seq === queryLabelSeq)) {
+      if (message.error) {
+        // Query failed — clear stale result so labels show unfiltered, don't hide everything
+        lastLabelResult = null;
+        lastQueryError = true;
+        refreshLabelsIfVisible();
+        updateCacheProgress();
+      } else {
+        lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabels: message.coLabels ?? [] };
+        lastQueryError = false;
+        refreshLabelsIfVisible();
+        updateCacheProgress();
+      }
     }
   } else if (message.type === "fetchError") {
     showContent('<div class="status">Failed to fetch emails. Try refreshing the page.</div>');

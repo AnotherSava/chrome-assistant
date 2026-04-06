@@ -21,10 +21,6 @@ export interface LabelQueryResult {
 
 export type ProgressCallback = (progress: CacheProgress) => void;
 
-interface LabelCoverage {
-  [labelId: string]: { complete: boolean; scope: number | null };
-}
-
 interface FetchState {
   phase: "labels" | "dates" | "complete";
   lastFetchTimestamp: number | null;
@@ -34,6 +30,13 @@ export class CacheManager {
   private labels: GmailLabel[] = [];
   private onProgress: ProgressCallback | null = null;
   private aborted = false;
+  private fetchGeneration = 0;
+  private activeFetch: Promise<void> | null = null;
+  /** Labels already processed (by priority or main loop) — skipped by main loop. */
+  private processedLabels = new Set<string>();
+  /** Resolves when a priority label finishes; main loop awaits this between iterations. */
+  private priorityBarrier: Promise<void> | null = null;
+  private priorityResolve: (() => void) | null = null;
 
   setProgressCallback(callback: ProgressCallback): void {
     this.onProgress = callback;
@@ -43,10 +46,28 @@ export class CacheManager {
     this.aborted = true;
   }
 
+  /** Returns true if the current fetch has been superseded or aborted. */
+  private isStale(generation: number): boolean {
+    return this.aborted || generation !== this.fetchGeneration;
+  }
+
   /** Start the full cache population: Phase 1 (labels) then Phase 2 (dates). */
   async startFetch(accountPath: string): Promise<void> {
+    this.aborted = true;
+    if (this.activeFetch) await this.activeFetch.catch(() => {});
     this.aborted = false;
+    this.processedLabels.clear();
+    const generation = ++this.fetchGeneration;
+    const fetchPromise = this.runFetch(accountPath, generation);
+    this.activeFetch = fetchPromise;
+    try {
+      await fetchPromise;
+    } finally {
+      if (this.activeFetch === fetchPromise) this.activeFetch = null;
+    }
+  }
 
+  private async runFetch(accountPath: string, generation: number): Promise<void> {
     const storedAccount = await db.getMeta<string>("account");
     if (storedAccount && storedAccount !== accountPath) {
       await db.clearAll();
@@ -67,48 +88,55 @@ export class CacheManager {
     await db.setMeta("fetchState", { phase: "labels", lastFetchTimestamp: fetchState?.lastFetchTimestamp ?? null });
 
     for (const label of labelsToQuery) {
-      if (this.aborted) return;
-      const messageIds = await fetchLabelMessageIds(label.name, scopeDate);
+      // Wait for any priority label processing to finish before continuing
+      if (this.priorityBarrier) await this.priorityBarrier;
+      if (this.isStale(generation)) return;
+      if (this.processedLabels.has(label.id)) { labelsDone++; this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 }); continue; }
+      const messageIds = await fetchLabelMessageIds(label.id, scopeDate);
       await this.crossReferenceLabel(label.id, messageIds);
+      this.processedLabels.add(label.id);
       labelsDone++;
       this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 });
     }
 
-    const coverage: LabelCoverage = {};
-    for (const label of labelsToQuery) {
-      coverage[label.id] = { complete: true, scope: null };
-    }
-    await db.setMeta("labelCoverage", coverage);
+    if (this.isStale(generation)) return;
+    await this.fetchDates(labelsTotal, generation);
 
-    if (this.aborted) return;
-    await this.fetchDates(labelsTotal);
-
+    if (this.isStale(generation)) return;
     const now = Date.now();
     await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: now });
     this.emitProgress({ phase: "complete", labelsTotal, labelsDone: labelsTotal, datesTotal: 0, datesDone: 0 });
   }
 
   /** Phase 2: batch-fetch dates for messages that don't have them yet. */
-  private async fetchDates(labelsTotal: number): Promise<void> {
-    const totalMessages = await db.getMessageCount();
+  private async fetchDates(labelsTotal: number, generation: number): Promise<void> {
     let datesDone = 0;
 
-    await db.setMeta("fetchState", { phase: "dates", lastFetchTimestamp: null });
+    const prevState = await db.getMeta<FetchState>("fetchState");
+    await db.setMeta("fetchState", { phase: "dates", lastFetchTimestamp: prevState?.lastFetchTimestamp ?? null });
 
     let batch = await db.getMessagesWithoutDates(100);
-    const datesTotal = await this.countMessagesWithoutDates();
+    const datesTotal = await db.countMessagesWithoutDates();
 
     this.emitProgress({ phase: "dates", labelsTotal, labelsDone: labelsTotal, datesTotal, datesDone });
 
     while (batch.length > 0) {
-      if (this.aborted) return;
+      if (this.isStale(generation)) return;
       const ids = batch.map(m => m.id);
       const results = await batchFetchDates(ids);
+      const batchMap = new Map(batch.map(m => [m.id, m]));
+      const returnedIds = new Set(results.map(r => r.id));
       const updates: CacheMessage[] = [];
       for (const result of results) {
-        const existing = await db.getMessage(result.id);
+        const existing = batchMap.get(result.id);
         if (existing) {
           updates.push({ ...existing, internalDate: result.internalDate });
+        }
+      }
+      // Mark messages that were not returned by the batch API (deleted/inaccessible) with internalDate 0 to prevent infinite loop
+      for (const msg of batch) {
+        if (!returnedIds.has(msg.id)) {
+          updates.push({ ...msg, internalDate: 0 });
         }
       }
       if (updates.length > 0) await db.putMessages(updates);
@@ -118,22 +146,22 @@ export class CacheManager {
     }
   }
 
-  private async countMessagesWithoutDates(): Promise<number> {
-    let count = 0;
-    let batch = await db.getMessagesWithoutDates(1000);
-    while (batch.length > 0) {
-      count += batch.length;
-      if (batch.length < 1000) break;
-      batch = await db.getMessagesWithoutDates(1000);
-    }
-    // This is an approximation since getMessagesWithoutDates scans from start.
-    // For a more accurate count, we'd need a dedicated query. For progress reporting this is fine.
-    return count;
-  }
 
   /** Query the cache for a label's message count and co-occurring labels. */
   async queryLabel(labelId: string, location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
     let messages = await db.getMessagesByLabel(labelId);
+
+    // If cache hasn't indexed this label yet, prioritize it now
+    if (messages.length === 0 && !this.processedLabels.has(labelId)) {
+      const fetchState = await db.getMeta<FetchState>("fetchState");
+      if (fetchState && fetchState.phase !== "complete") {
+        await this.prioritizeLabel(labelId);
+        messages = await db.getMessagesByLabel(labelId);
+      }
+    }
+
+    // Filter out messages marked as deleted/inaccessible (internalDate sentinel 0)
+    messages = messages.filter(m => m.internalDate !== 0);
 
     const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
     if (locationLabelId) {
@@ -159,27 +187,38 @@ export class CacheManager {
     return { labelId, count: messages.length, coLabels: [...coLabelSet] };
   }
 
+  /** Pause the main cache loop, process a single label, then resume. */
+  private async prioritizeLabel(labelId: string): Promise<void> {
+    this.priorityBarrier = new Promise(resolve => { this.priorityResolve = resolve; });
+    try {
+      const messageIds = await fetchLabelMessageIds(labelId);
+      await this.crossReferenceLabel(labelId, messageIds);
+      this.processedLabels.add(labelId);
+    } finally {
+      const resolve = this.priorityResolve;
+      this.priorityBarrier = null;
+      this.priorityResolve = null;
+      if (resolve) resolve();
+    }
+  }
+
   /** Scope fallback: use API to get scoped message IDs, cross-reference with IndexedDB for co-labels. */
   private async scopeFallback(labelId: string, locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
-    const label = this.labels.find(l => l.id === labelId);
-    if (!label) return { labelId, count: 0, coLabels: [] };
-
     const dateStr = this.timestampToDateString(scopeTimestamp);
-    const scopedIds = await fetchLabelMessageIds(label.name, dateStr);
-    const scopedIdSet = new Set(scopedIds);
-
+    const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
+    const msgMap = await db.getMessagesBatch(scopedIds);
     const coLabelSet = new Set<string>();
     let count = 0;
 
     for (const msgId of scopedIds) {
-      const msg = await db.getMessage(msgId);
+      const msg = msgMap.get(msgId);
       if (msg) {
         if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         count++;
         for (const lid of msg.labelIds) {
           if (lid !== labelId) coLabelSet.add(lid);
         }
-      } else {
+      } else if (!locationLabelId) {
         count++;
       }
     }
@@ -220,9 +259,10 @@ export class CacheManager {
     const batchSize = 500;
     for (let i = 0; i < messageIds.length; i += batchSize) {
       const chunk = messageIds.slice(i, i + batchSize);
+      const existingMap = await db.getMessagesBatch(chunk);
       const updates: CacheMessage[] = [];
       for (const id of chunk) {
-        const existing = await db.getMessage(id);
+        const existing = existingMap.get(id);
         if (existing) {
           if (!existing.labelIds.includes(labelId)) {
             updates.push({ ...existing, labelIds: [...existing.labelIds, labelId] });
