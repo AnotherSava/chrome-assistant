@@ -79,12 +79,12 @@ When a user selects a parent label (e.g. "Games"), only messages directly tagged
 - Modify: `packages/site-gmail/src/sidepanel.ts`
 - Modify: `packages/site-gmail/tests/gmail-api.test.ts`
 
-- [ ] Update `buildSearchQuery` to accept `labelName: string | string[]`. When given an array with more than one entry, produce `{label:"a" OR label:"b" OR label:"c"}` using Gmail's grouping syntax. Single entry behaves as before.
-- [ ] Update `applyFilters` in sidepanel to pass the array of label names (active + descendants) when `includeChildren` is enabled
-- [ ] Add test: buildSearchQuery with single label produces current format
-- [ ] Add test: buildSearchQuery with multiple labels produces `{...OR...}` format
-- [ ] Add test: buildSearchQuery with multiple labels + location + scope combines correctly
-- [ ] Run project test suite — must pass before next task
+- [x] Update `buildSearchQuery` to accept `labelName: string | string[]`. When given an array with more than one entry, produce `{label:"a" OR label:"b" OR label:"c"}` using Gmail's grouping syntax. Single entry behaves as before.
+- [x] Update `applyFilters` in sidepanel to pass the array of label names (active + descendants) when `includeChildren` is enabled
+- [x] Add test: buildSearchQuery with single label produces current format
+- [x] Add test: buildSearchQuery with multiple labels produces `{...OR...}` format
+- [x] Add test: buildSearchQuery with multiple labels + location + scope combines correctly
+- [x] Run project test suite — must pass before next task
 
 ### Task 4: Verify acceptance criteria
 

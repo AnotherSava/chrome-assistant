@@ -48,6 +48,20 @@ describe("buildSearchQuery", () => {
     const result = buildSearchQuery("sent", "Reports", null);
     expect(result).toBe('label:"reports" in:sent');
   });
+
+  it("produces single label format for single-element array", () => {
+    expect(buildSearchQuery("inbox", ["Work"], null)).toBe('label:"work" in:inbox');
+  });
+
+  it("produces OR-grouped format for multiple labels", () => {
+    const result = buildSearchQuery("all", ["Games", "Games/18xx", "Games/Chess"], null);
+    expect(result).toBe('{label:"games" OR label:"games-18xx" OR label:"games-chess"}');
+  });
+
+  it("combines multiple labels with location and scope", () => {
+    const result = buildSearchQuery("inbox", ["Work", "Work/Projects"], "2024/01/01", "2024/06/01");
+    expect(result).toBe('{label:"work" OR label:"work-projects"} in:inbox after:2024/01/01 before:2024/06/01');
+  });
 });
 
 describe("parallelMap", () => {

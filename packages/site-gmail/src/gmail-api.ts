@@ -52,9 +52,16 @@ interface MessagesListResponse {
   resultSizeEstimate?: number;
 }
 
-export function buildSearchQuery(location: string | undefined, labelName: string | null, scope: string | null, beforeDate?: string | null): string {
+export function buildSearchQuery(location: string | undefined, labelName: string | string[] | null, scope: string | null, beforeDate?: string | null): string {
   const parts: string[] = [];
-  if (labelName) parts.push(`label:${formatLabelForQuery(labelName)}`);
+  if (labelName) {
+    const names = Array.isArray(labelName) ? labelName : [labelName];
+    if (names.length === 1) {
+      parts.push(`label:${formatLabelForQuery(names[0])}`);
+    } else if (names.length > 1) {
+      parts.push(`{${names.map(n => `label:${formatLabelForQuery(n)}`).join(" OR ")}}`);
+    }
+  }
   const loc = location ?? "inbox";
   if (loc !== "all") parts.push(`in:${loc}`);
   if (scope) parts.push(`after:${scope}`);

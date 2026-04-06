@@ -145,7 +145,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | string[] | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -268,7 +268,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 // Handle messages from side panel
-export function buildGmailUrl(base: string, location: string | undefined, labelName: string | null, scope: string | null): string {
+export function buildGmailUrl(base: string, location: string | undefined, labelName: string | string[] | null, scope: string | null): string {
   const loc = location ?? "inbox";
   const query = buildSearchQuery(location, labelName, scope);
   if (!query) return `${base}#${loc}`;

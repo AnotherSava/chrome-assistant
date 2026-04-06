@@ -496,7 +496,15 @@ function resetGmailToInbox(): void {
 
 function applyFilters(): void {
   if (!activePort) return;
-  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName: activeLabelName, scope: scopeToDate() });
+  let labelName: string | string[] | null = activeLabelName;
+  if (activeLabelName && activeLabelId && includeChildren && cachedLabels) {
+    const descendants = getDescendantIds(activeLabelId, cachedLabels);
+    if (descendants.length > 0) {
+      const descendantNames = descendants.map(id => cachedLabels!.find(l => l.id === id)?.name).filter((n): n is string => n !== undefined);
+      labelName = [activeLabelName, ...descendantNames];
+    }
+  }
+  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName, scope: scopeToDate() });
 }
 
 function renderFilterBar(): string {
