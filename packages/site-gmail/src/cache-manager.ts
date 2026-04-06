@@ -147,16 +147,29 @@ export class CacheManager {
   }
 
 
-  /** Query the cache for a label's message count and co-occurring labels. */
-  async queryLabel(labelId: string, location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
-    let messages = await db.getMessagesByLabel(labelId);
+  /** Query the cache for a label's message count and co-occurring labels. Accepts multiple label IDs and unions their messages. */
+  async queryLabel(labelIds: string[], location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
+    const primaryId = labelIds[0];
+    const seen = new Set<string>();
+    let messages: CacheMessage[] = [];
 
-    // If cache hasn't indexed this label yet, prioritize it now
-    if (messages.length === 0 && !this.processedLabels.has(labelId)) {
-      const fetchState = await db.getMeta<FetchState>("fetchState");
-      if (fetchState && fetchState.phase !== "complete") {
-        await this.prioritizeLabel(labelId);
-        messages = await db.getMessagesByLabel(labelId);
+    for (const labelId of labelIds) {
+      let labelMessages = await db.getMessagesByLabel(labelId);
+
+      // If cache hasn't indexed this label yet, prioritize it now
+      if (labelMessages.length === 0 && !this.processedLabels.has(labelId)) {
+        const fetchState = await db.getMeta<FetchState>("fetchState");
+        if (fetchState && fetchState.phase !== "complete") {
+          await this.prioritizeLabel(labelId);
+          labelMessages = await db.getMessagesByLabel(labelId);
+        }
+      }
+
+      for (const msg of labelMessages) {
+        if (!seen.has(msg.id)) {
+          seen.add(msg.id);
+          messages.push(msg);
+        }
       }
     }
 
@@ -173,18 +186,18 @@ export class CacheManager {
       if (allHaveDates) {
         messages = messages.filter(m => m.internalDate !== null && m.internalDate >= scopeTimestamp);
       } else {
-        return this.scopeFallback(labelId, locationLabelId, scopeTimestamp);
+        return this.scopeFallback(labelIds, locationLabelId, scopeTimestamp);
       }
     }
 
     const coLabelSet = new Set<string>();
     for (const msg of messages) {
       for (const lid of msg.labelIds) {
-        if (lid !== labelId) coLabelSet.add(lid);
+        if (lid !== primaryId) coLabelSet.add(lid);
       }
     }
 
-    return { labelId, count: messages.length, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count: messages.length, coLabels: [...coLabelSet] };
   }
 
   /** Pause the main cache loop, process a single label, then resume. */
@@ -202,28 +215,41 @@ export class CacheManager {
     }
   }
 
-  /** Scope fallback: use API to get scoped message IDs, cross-reference with IndexedDB for co-labels. */
-  private async scopeFallback(labelId: string, locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
+  /** Scope fallback: use API to get scoped message IDs for all label IDs, cross-reference with IndexedDB for co-labels. */
+  private async scopeFallback(labelIds: string[], locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
+    const primaryId = labelIds[0];
     const dateStr = this.timestampToDateString(scopeTimestamp);
-    const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
-    const msgMap = await db.getMessagesBatch(scopedIds);
+    const seenIds = new Set<string>();
+    const allScopedIds: string[] = [];
+
+    for (const labelId of labelIds) {
+      const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
+      for (const id of scopedIds) {
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          allScopedIds.push(id);
+        }
+      }
+    }
+
+    const msgMap = await db.getMessagesBatch(allScopedIds);
     const coLabelSet = new Set<string>();
     let count = 0;
 
-    for (const msgId of scopedIds) {
+    for (const msgId of allScopedIds) {
       const msg = msgMap.get(msgId);
       if (msg) {
         if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         count++;
         for (const lid of msg.labelIds) {
-          if (lid !== labelId) coLabelSet.add(lid);
+          if (lid !== primaryId) coLabelSet.add(lid);
         }
       } else if (!locationLabelId) {
         count++;
       }
     }
 
-    return { labelId, count, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count, coLabels: [...coLabelSet] };
   }
 
   private timestampToDateString(timestamp: number): string {

@@ -145,7 +145,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -164,9 +164,10 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           port.postMessage({ type: "notOnGmail" });
         }
       });
-    } else if (message.type === "queryLabel" && message.labelId) {
+    } else if (message.type === "queryLabel" && (message.labelIds || message.labelId)) {
       const seq = message.seq;
-      cacheManager.queryLabel(message.labelId, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: message.labelId, count: 0, coLabels: [], error: true, seq }); });
+      const labelIds = message.labelIds ?? [message.labelId!];
+      cacheManager.queryLabel(labelIds, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabels: [], error: true, seq }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;

@@ -106,7 +106,7 @@ describe("startCacheIfNeeded", () => {
 
 describe("cacheManager integration", () => {
   it("exposes queryLabel via cacheManager", async () => {
-    const result = await cacheManager.queryLabel("INBOX", "inbox", null);
+    const result = await cacheManager.queryLabel(["INBOX"], "inbox", null);
     expect(result).toEqual({ labelId: "INBOX", count: 5, coLabels: ["STARRED"] });
   });
 
