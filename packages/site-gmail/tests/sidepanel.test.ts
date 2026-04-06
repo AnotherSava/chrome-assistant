@@ -210,6 +210,8 @@ describe("handleMessage", () => {
     // Select a label
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
+    // Simulate the query response arriving (clears queryInFlight)
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabels: [] });
     vi.clearAllMocks();
 
     // Cache completes — should trigger re-query

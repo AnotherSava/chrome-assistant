@@ -169,9 +169,13 @@ describe("CacheManager", () => {
     });
 
     it("supports incremental refresh with scope date", async () => {
-      // Simulate a previous completed fetch
+      // Simulate a previous completed fetch with existing label indexes
       mockDb._meta.set("fetchState", { phase: "complete", lastFetchTimestamp: 1700000000000 });
       mockDb._meta.set("account", "/mail/u/0/");
+      mockDb._meta.set("labelIdx:INBOX", ["m1"]);
+      mockDb._meta.set("labelIdx:SENT", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m1"]);
 
       mockApi.fetchLabels.mockResolvedValue(testLabels);
       mockApi.fetchLabelMessageIds.mockResolvedValue([]);
@@ -212,6 +216,11 @@ describe("CacheManager", () => {
       mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["INBOX", "SENT", "Label_1"] });
       mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["SENT", "Label_2"] });
       mockDb._store.set("m4", { id: "m4", internalDate: 4000, labelIds: ["INBOX", "Label_2"] });
+      // Populate label index (mirrors what crossReferenceLabel stores)
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2", "m4"]);
+      mockDb._meta.set("labelIdx:SENT", ["m2", "m3"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3", "m4"]);
     });
 
     it("returns count and co-occurring labels for a label", async () => {
@@ -244,6 +253,7 @@ describe("CacheManager", () => {
 
     it("uses scope fallback when some messages lack dates", async () => {
       mockDb._store.set("m5", { id: "m5", internalDate: null, labelIds: ["INBOX", "Label_1"] });
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2", "m4", "m5"]);
 
       // Setup labels for the fallback
       mockApi.fetchLabels.mockResolvedValue(testLabels);
@@ -258,6 +268,7 @@ describe("CacheManager", () => {
     });
 
     it("returns empty result for unknown label", async () => {
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
       const result = await manager.queryLabel(["NONEXISTENT"], undefined, null);
       expect(result.count).toBe(0);
       expect(result.coLabels).toEqual([]);
@@ -292,6 +303,8 @@ describe("CacheManager", () => {
     it("excludes only primary ID from co-labels, sub-label IDs appear if messages have them", async () => {
       // Add a message that has both Label_1 and Label_2
       mockDb._store.set("m5", { id: "m5", internalDate: 5000, labelIds: ["Label_1", "Label_2", "INBOX"] });
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2", "m5"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3", "m4", "m5"]);
       const result = await manager.queryLabel(["Label_1", "Label_2"], undefined, null);
       // Label_2 should appear as a co-label (not excluded)
       expect(result.coLabels).toContain("Label_2");

@@ -467,6 +467,7 @@ function setupLabelHandlers(): void {
         saveSetting(KEY_ACTIVE_LABEL_NAME, null);
         // No label selected — show all labels, clear query result
         lastLabelResult = null;
+        queryInFlight = false;
         renderFilteredLabels();
         applyFilters();
       } else {
@@ -567,9 +568,13 @@ let lastQueryError = false;
 /** Monotonic sequence number to correlate queryLabel requests with responses */
 let queryLabelSeq = 0;
 
+/** Whether a queryLabel request is currently in flight — prevents duplicate queries */
+let queryInFlight = false;
+
 /** Send a queryLabel request to background for the currently selected label */
 function sendQueryLabel(): void {
-  if (!activePort || !activeLabelId) return;
+  if (!activePort || !activeLabelId || queryInFlight) return;
+  queryInFlight = true;
   lastQueryError = false;
   queryLabelSeq++;
   updateCacheProgress();
@@ -792,6 +797,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
   } else if (message.type === "labelResult" && message.labelId !== undefined) {
     // Query result from background cache — ignore stale responses
     if (message.labelId === activeLabelId && (message.seq === undefined || message.seq === queryLabelSeq)) {
+      queryInFlight = false;
       if (message.error) {
         // Query failed — clear stale result so labels show unfiltered, don't hide everything
         lastLabelResult = null;
