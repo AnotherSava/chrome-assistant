@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, getDescendantIds } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -295,5 +295,116 @@ describe("scopeToTimestamp", () => {
 
   it("returns null for unknown scope", () => {
     expect(scopeToTimestamp("unknown")).toBeNull();
+  });
+});
+
+describe("getDescendantIds", () => {
+  it("returns all descendants for a nested label", () => {
+    const labels = [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Games/Chess", type: "user" },
+      { id: "L4", name: "Games/Chess/Online", type: "user" },
+      { id: "L5", name: "Work", type: "user" },
+    ];
+    const descendants = getDescendantIds("L1", labels);
+    expect(descendants).toContain("L2");
+    expect(descendants).toContain("L3");
+    expect(descendants).toContain("L4");
+    expect(descendants).not.toContain("L1");
+    expect(descendants).not.toContain("L5");
+  });
+
+  it("returns empty for leaf label", () => {
+    const labels = [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Work", type: "user" },
+    ];
+    const descendants = getDescendantIds("L2", labels);
+    expect(descendants).toEqual([]);
+  });
+
+  it("returns empty for label with no children in the tree", () => {
+    const labels = [
+      { id: "L1", name: "Work", type: "user" },
+      { id: "L2", name: "Personal", type: "user" },
+    ];
+    const descendants = getDescendantIds("L1", labels);
+    expect(descendants).toEqual([]);
+  });
+});
+
+describe("sendQueryLabel with include children", () => {
+  beforeEach(() => {
+    setupDOM();
+    vi.clearAllMocks();
+  });
+
+  it("sends array with descendants when setting is on", () => {
+    // Default includeChildren is true (from loadSetting default)
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Games/Chess", type: "user" },
+      { id: "L4", name: "Work", type: "user" },
+    ] });
+    vi.clearAllMocks();
+
+    // Click parent label "Games"
+    const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
+    link?.click();
+
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "queryLabel",
+      labelIds: expect.arrayContaining(["L1", "L2", "L3"]),
+      labelId: "L1",
+    }));
+  });
+
+  it("sends single-element array when setting is off", () => {
+    // Turn off includeChildren via localStorage
+    localStorage.setItem("ca_include_children", JSON.stringify(false));
+
+    // Re-import to pick up the setting change — but since module is already loaded,
+    // we simulate by toggling the display panel checkbox instead
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "L1", name: "Games", type: "user" },
+      { id: "L2", name: "Games/18xx", type: "user" },
+      { id: "L3", name: "Work", type: "user" },
+    ] });
+
+    // Open display panel and uncheck the include-children checkbox
+    const btnDisplay = document.getElementById("btn-display");
+    btnDisplay?.click();
+    const checkbox = document.getElementById("include-children-check") as HTMLInputElement;
+    if (checkbox) {
+      checkbox.checked = false;
+      checkbox.dispatchEvent(new Event("change"));
+    }
+    vi.clearAllMocks();
+
+    // Click parent label "Games"
+    const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
+    link?.click();
+
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "queryLabel",
+      labelIds: ["L1"],
+      labelId: "L1",
+    }));
+
+    // Clean up
+    localStorage.removeItem("ca_include_children");
+    // Re-enable for subsequent tests
+    const btnDisplay2 = document.getElementById("btn-display");
+    btnDisplay2?.click();
+    const checkbox2 = document.getElementById("include-children-check") as HTMLInputElement;
+    if (checkbox2) {
+      checkbox2.checked = true;
+      checkbox2.dispatchEvent(new Event("change"));
+    }
   });
 });

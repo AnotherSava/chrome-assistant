@@ -61,16 +61,16 @@ When a user selects a parent label (e.g. "Games"), only messages directly tagged
 - Modify: `packages/site-gmail/src/sidepanel.ts`
 - Modify: `packages/site-gmail/tests/sidepanel.test.ts`
 
-- [ ] Add `ca_include_children` setting (boolean, default true), loaded on startup
-- [ ] Add checkbox to `buildDisplayPanel` after the "Return to Inbox" checkbox: "Include sub-labels when selecting a parent"
-- [ ] Add helper `getDescendantIds(labelId: string): string[]` that walks the cached label tree (from `buildLabelTree`) to collect all descendant label IDs. Returns empty array for leaf labels.
-- [ ] Update `sendQueryLabel` to resolve descendants when setting is enabled: if `includeChildren` is true and the active label has sub-labels, send `labelIds: [activeLabelId, ...descendantIds]`; otherwise send `labelIds: [activeLabelId]`
-- [ ] Update `renderFilteredLabels` to exclude all queried label IDs from active highlighting (only `activeLabelId` gets `.active` class — this is already the case, just verify)
-- [ ] Add test: getDescendantIds returns all descendants for a nested label
-- [ ] Add test: getDescendantIds returns empty for leaf label
-- [ ] Add test: sendQueryLabel sends array with descendants when setting is on
-- [ ] Add test: sendQueryLabel sends single-element array when setting is off
-- [ ] Run project test suite — must pass before next task
+- [x] Add `ca_include_children` setting (boolean, default true), loaded on startup
+- [x] Add checkbox to `buildDisplayPanel` after the "Return to Inbox" checkbox: "Include sub-labels when selecting a parent"
+- [x] Add helper `getDescendantIds(labelId: string): string[]` that walks the cached label tree (from `buildLabelTree`) to collect all descendant label IDs. Returns empty array for leaf labels.
+- [x] Update `sendQueryLabel` to resolve descendants when setting is enabled: if `includeChildren` is true and the active label has sub-labels, send `labelIds: [activeLabelId, ...descendantIds]`; otherwise send `labelIds: [activeLabelId]`
+- [x] Update `renderFilteredLabels` to exclude all queried label IDs from active highlighting (only `activeLabelId` gets `.active` class — this is already the case, just verify)
+- [x] Add test: getDescendantIds returns all descendants for a nested label
+- [x] Add test: getDescendantIds returns empty for leaf label
+- [x] Add test: sendQueryLabel sends array with descendants when setting is on
+- [x] Add test: sendQueryLabel sends single-element array when setting is off
+- [x] Run project test suite — must pass before next task
 
 ### Task 3: Update Gmail search query for multiple labels
 
