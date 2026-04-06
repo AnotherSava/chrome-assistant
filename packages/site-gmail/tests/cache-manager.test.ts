@@ -26,6 +26,24 @@ vi.mock("../src/cache-db.js", () => {
     clearAll: vi.fn(async () => { store.clear(); meta.clear(); }),
     getMessageCount: vi.fn(async () => store.size),
     countMessagesWithoutDates: vi.fn(async () => { let count = 0; for (const m of store.values()) { if (m.internalDate === null) count++; } return count; }),
+    getFilteredLabelCounts: vi.fn(async (labelIds: string[], location: string | undefined, scopeTimestamp: number | null) => {
+      const counts: Record<string, number> = {};
+      const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
+      for (const labelId of labelIds) {
+        const msgIds = meta.get(`labelIdx:${labelId}`) as string[] | undefined;
+        if (!msgIds || msgIds.length === 0) { counts[labelId] = 0; continue; }
+        let count = 0;
+        for (const id of msgIds) {
+          const msg = store.get(id);
+          if (!msg || msg.internalDate === 0) continue;
+          if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
+          if (scopeTimestamp !== null && (msg.internalDate === null || msg.internalDate < scopeTimestamp)) continue;
+          count++;
+        }
+        counts[labelId] = count;
+      }
+      return counts;
+    }),
     _store: store,
     _meta: meta,
   };
@@ -51,6 +69,7 @@ const mockDb = dbMock as unknown as {
   clearAll: ReturnType<typeof vi.fn>;
   getMessageCount: ReturnType<typeof vi.fn>;
   countMessagesWithoutDates: ReturnType<typeof vi.fn>;
+  getFilteredLabelCounts: ReturnType<typeof vi.fn>;
   _store: Map<string, CacheMessage>;
   _meta: Map<string, unknown>;
 };
@@ -93,6 +112,24 @@ describe("CacheManager", () => {
     mockDb.clearAll.mockImplementation(async () => { mockDb._store.clear(); mockDb._meta.clear(); });
     mockDb.getMessageCount.mockImplementation(async () => mockDb._store.size);
     mockDb.countMessagesWithoutDates.mockImplementation(async () => { let count = 0; for (const m of mockDb._store.values()) { if (m.internalDate === null) count++; } return count; });
+    mockDb.getFilteredLabelCounts.mockImplementation(async (labelIds: string[], location: string | undefined, scopeTimestamp: number | null) => {
+      const counts: Record<string, number> = {};
+      const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
+      for (const labelId of labelIds) {
+        const msgIds = mockDb._meta.get(`labelIdx:${labelId}`) as string[] | undefined;
+        if (!msgIds || msgIds.length === 0) { counts[labelId] = 0; continue; }
+        let count = 0;
+        for (const id of msgIds) {
+          const msg = mockDb._store.get(id);
+          if (!msg || msg.internalDate === 0) continue;
+          if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
+          if (scopeTimestamp !== null && (msg.internalDate === null || msg.internalDate < scopeTimestamp)) continue;
+          count++;
+        }
+        counts[labelId] = count;
+      }
+      return counts;
+    });
   });
 
   describe("startFetch", () => {
@@ -226,9 +263,9 @@ describe("CacheManager", () => {
     it("returns count and co-occurring labels for a label", async () => {
       const result = await manager.queryLabel(["INBOX"], undefined, null);
       expect(result.count).toBe(3); // m1, m2, m4
-      expect(result.coLabels).toContain("Label_1");
-      expect(result.coLabels).toContain("SENT");
-      expect(result.coLabels).toContain("Label_2");
+      expect(result.coLabelCounts).toHaveProperty("Label_1");
+      expect(result.coLabelCounts).toHaveProperty("SENT");
+      expect(result.coLabelCounts).toHaveProperty("Label_2");
     });
 
     it("filters by location (inbox)", async () => {
@@ -271,7 +308,7 @@ describe("CacheManager", () => {
       mockApi.fetchLabelMessageIds.mockResolvedValue([]);
       const result = await manager.queryLabel(["NONEXISTENT"], undefined, null);
       expect(result.count).toBe(0);
-      expect(result.coLabels).toEqual([]);
+      expect(result.coLabelCounts).toEqual({});
     });
 
     it("prioritizes uncached label when cache is still building", async () => {
@@ -292,12 +329,12 @@ describe("CacheManager", () => {
       const result = await manager.queryLabel(["Label_1", "Label_2"], undefined, null);
       expect(result.count).toBe(4); // m1, m2, m3, m4 (all unique)
       expect(result.labelId).toBe("Label_1"); // primary ID
-      // Primary label (Label_1) should be excluded from co-labels
-      expect(result.coLabels).not.toContain("Label_1");
-      // Sub-label IDs (Label_2) should appear as co-labels
-      expect(result.coLabels).toContain("Label_2");
-      expect(result.coLabels).toContain("INBOX");
-      expect(result.coLabels).toContain("SENT");
+      // Primary label (Label_1) should be excluded from co-label counts
+      expect(result.coLabelCounts).not.toHaveProperty("Label_1");
+      // Sub-label IDs (Label_2) should appear as co-label counts
+      expect(result.coLabelCounts).toHaveProperty("Label_2");
+      expect(result.coLabelCounts).toHaveProperty("INBOX");
+      expect(result.coLabelCounts).toHaveProperty("SENT");
     });
 
     it("excludes only primary ID from co-labels, sub-label IDs appear if messages have them", async () => {
@@ -306,10 +343,10 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:Label_1", ["m1", "m2", "m5"]);
       mockDb._meta.set("labelIdx:Label_2", ["m3", "m4", "m5"]);
       const result = await manager.queryLabel(["Label_1", "Label_2"], undefined, null);
-      // Label_2 should appear as a co-label (not excluded)
-      expect(result.coLabels).toContain("Label_2");
+      // Label_2 should appear as a co-label count (not excluded)
+      expect(result.coLabelCounts).toHaveProperty("Label_2");
       // Label_1 (primary) should not appear
-      expect(result.coLabels).not.toContain("Label_1");
+      expect(result.coLabelCounts).not.toHaveProperty("Label_1");
     });
 
     it("filters by location with multiple label IDs", async () => {
@@ -317,6 +354,116 @@ describe("CacheManager", () => {
       const result = await manager.queryLabel(["Label_1", "Label_2"], "inbox", null);
       // Only messages with INBOX: m1, m2, m4
       expect(result.count).toBe(3);
+    });
+  });
+
+  describe("getLabelCounts", () => {
+    const hierarchyLabels: GmailLabel[] = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Work/Projects", type: "user" },
+      { id: "Label_3", name: "Work/Projects/Alpha", type: "user" },
+      { id: "Label_4", name: "Personal", type: "user" },
+    ];
+
+    async function setupManagerWithLabels(labels: GmailLabel[]): Promise<CacheManager> {
+      const mgr = new CacheManager();
+      mockApi.fetchLabels.mockResolvedValue(labels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.batchFetchDates.mockResolvedValue([]);
+      await mgr.startFetch("/mail/u/0/");
+      return mgr;
+    }
+
+    it("returns correct own counts per label", async () => {
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["INBOX", "Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["INBOX", "Label_1", "Label_2"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["SENT", "Label_4"] });
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:SENT", ["m3"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m2"]);
+      mockDb._meta.set("labelIdx:Label_3", []);
+      mockDb._meta.set("labelIdx:Label_4", ["m3"]);
+
+      const mgr = await setupManagerWithLabels(hierarchyLabels);
+      const counts = await mgr.getLabelCounts(undefined, null);
+
+      expect(counts["INBOX"].own).toBe(2);
+      expect(counts["SENT"].own).toBe(1);
+      expect(counts["Label_1"].own).toBe(2);
+      expect(counts["Label_2"].own).toBe(1);
+      expect(counts["Label_3"].own).toBe(0);
+      expect(counts["Label_4"].own).toBe(1);
+    });
+
+    it("returns correct inclusive counts for parent labels (deduplicated)", async () => {
+      // m1: Work only, m2: Work + Work/Projects, m3: Work/Projects/Alpha only
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["Label_1", "Label_2"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["Label_3"] });
+      mockDb._meta.set("labelIdx:INBOX", []);
+      mockDb._meta.set("labelIdx:SENT", []);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m2"]);
+      mockDb._meta.set("labelIdx:Label_3", ["m3"]);
+      mockDb._meta.set("labelIdx:Label_4", []);
+
+      const mgr = await setupManagerWithLabels(hierarchyLabels);
+      const counts = await mgr.getLabelCounts(undefined, null);
+
+      // Work inclusive = m1 + m2 + m3 (deduplicated, m2 appears in both Work and Work/Projects)
+      expect(counts["Label_1"].inclusive).toBe(3);
+      // Work/Projects inclusive = m2 + m3 (Work/Projects + Work/Projects/Alpha)
+      expect(counts["Label_2"].inclusive).toBe(2);
+      // Work/Projects/Alpha is a leaf — inclusive == own
+      expect(counts["Label_3"].inclusive).toBe(1);
+      expect(counts["Label_3"].own).toBe(1);
+      // Personal is a leaf
+      expect(counts["Label_4"].inclusive).toBe(0);
+      expect(counts["Label_4"].own).toBe(0);
+    });
+
+    it("filters counts by location", async () => {
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["INBOX", "Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["SENT", "Label_1"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["INBOX", "Label_2"] });
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m3"]);
+      mockDb._meta.set("labelIdx:SENT", ["m2"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3"]);
+      mockDb._meta.set("labelIdx:Label_3", []);
+      mockDb._meta.set("labelIdx:Label_4", []);
+
+      const mgr = await setupManagerWithLabels(hierarchyLabels);
+      const counts = await mgr.getLabelCounts("inbox", null);
+
+      // Only messages with INBOX: m1, m3
+      expect(counts["Label_1"].own).toBe(1); // m1 only (m2 is SENT)
+      expect(counts["Label_2"].own).toBe(1); // m3
+      expect(counts["INBOX"].own).toBe(2);
+      expect(counts["SENT"].own).toBe(0); // no SENT messages have INBOX
+    });
+
+    it("filters counts by scope timestamp", async () => {
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["INBOX", "Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 5000, labelIds: ["INBOX", "Label_1"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 8000, labelIds: ["INBOX", "Label_2"] });
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2", "m3"]);
+      mockDb._meta.set("labelIdx:SENT", []);
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m3"]);
+      mockDb._meta.set("labelIdx:Label_3", []);
+      mockDb._meta.set("labelIdx:Label_4", []);
+
+      const mgr = await setupManagerWithLabels(hierarchyLabels);
+      const counts = await mgr.getLabelCounts(undefined, 3000);
+
+      // Only messages with internalDate >= 3000: m2 (5000), m3 (8000)
+      expect(counts["Label_1"].own).toBe(1); // m2 only
+      expect(counts["Label_2"].own).toBe(1); // m3
+      expect(counts["INBOX"].own).toBe(2); // m2, m3
     });
   });
 

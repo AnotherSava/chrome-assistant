@@ -8,7 +8,7 @@ vi.mock("../src/cache-db.js", () => ({
 // Mock cache-manager module before background.ts imports it
 vi.mock("../src/cache-manager.js", () => {
   const mockStartFetch = vi.fn().mockResolvedValue(undefined);
-  const mockQueryLabel = vi.fn().mockResolvedValue({ labelId: "INBOX", count: 5, coLabels: ["STARRED"] });
+  const mockQueryLabel = vi.fn().mockResolvedValue({ labelId: "INBOX", count: 5, coLabelCounts: { STARRED: 1 } });
   const mockAbort = vi.fn();
   const mockSetProgressCallback = vi.fn();
   return {
@@ -112,7 +112,7 @@ describe("startCacheIfNeeded", () => {
 describe("cacheManager integration", () => {
   it("exposes queryLabel via cacheManager", async () => {
     const result = await cacheManager.queryLabel(["INBOX"], "inbox", null);
-    expect(result).toEqual({ labelId: "INBOX", count: 5, coLabels: ["STARRED"] });
+    expect(result).toEqual({ labelId: "INBOX", count: 5, coLabelCounts: { STARRED: 1 } });
   });
 
   it("has a progress callback set", () => {

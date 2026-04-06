@@ -2,8 +2,8 @@ import type { CacheMessage, GmailLabel } from "@core/types.js";
 import * as db from "./cache-db.js";
 import { fetchLabels, fetchLabelMessageIds, batchFetchDates } from "./gmail-api.js";
 
-/** System labels to query during Phase 1 label fetch */
-const SYSTEM_LABELS_TO_QUERY = ["INBOX", "SENT", "IMPORTANT", "STARRED", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_PROMOTIONS", "CATEGORY_FORUMS", "UNREAD"];
+/** System labels to query during Phase 1 label fetch — only INBOX and SENT are needed for location filtering */
+const SYSTEM_LABELS_TO_QUERY = ["INBOX", "SENT"];
 
 export interface CacheProgress {
   phase: "labels" | "dates" | "complete";
@@ -11,12 +11,13 @@ export interface CacheProgress {
   labelsDone: number;
   datesTotal: number;
   datesDone: number;
+  currentLabel?: string;
 }
 
 export interface LabelQueryResult {
   labelId: string;
   count: number;
-  coLabels: string[];
+  coLabelCounts: Record<string, number>;
 }
 
 export type ProgressCallback = (progress: CacheProgress) => void;
@@ -99,7 +100,7 @@ export class CacheManager {
       await this.crossReferenceLabel(label.id, messageIds);
       this.processedLabels.add(label.id);
       labelsDone++;
-      this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 });
+      this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0, currentLabel: label.name });
     }
 
     if (this.isStale(generation)) return;
@@ -133,13 +134,13 @@ export class CacheManager {
       for (const result of results) {
         const existing = batchMap.get(result.id);
         if (existing) {
-          updates.push({ ...existing, internalDate: result.internalDate });
+          updates.push({ ...existing, internalDate: result.internalDate, status: "fetched" });
         }
       }
-      // Mark messages that were not returned by the batch API (deleted/inaccessible) with internalDate 0 to prevent infinite loop
+      // Mark messages not returned by the batch API as inaccessible to prevent re-fetching
       for (const msg of batch) {
         if (!returnedIds.has(msg.id)) {
-          updates.push({ ...msg, internalDate: 0 });
+          updates.push({ ...msg, status: "inaccessible" });
         }
       }
       if (updates.length > 0) await db.putMessages(updates);
@@ -149,6 +150,65 @@ export class CacheManager {
     }
   }
 
+
+  /** Get own and inclusive counts for all known labels, filtered by location/scope. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). */
+  async getLabelCounts(location: string | undefined, scopeTimestamp: number | null, labelsOverride?: GmailLabel[]): Promise<Record<string, { own: number; inclusive: number }>> {
+    const labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
+    const allLabelIds = labels.map(l => l.id);
+    const ownCounts = await db.getFilteredLabelCounts(allLabelIds, location, scopeTimestamp);
+
+    const result: Record<string, { own: number; inclusive: number }> = {};
+
+    for (const label of labels) {
+      // Skip labels not yet in the cache — no count is better than a wrong (0)
+      if (!(label.id in ownCounts)) continue;
+      const own = ownCounts[label.id];
+
+      // Find descendants via prefix matching (e.g. "Work/Projects" is a child of "Work")
+      const descendants = labels.filter(l => l.id !== label.id && l.name.startsWith(label.name + "/"));
+
+      if (descendants.length === 0) {
+        result[label.id] = { own, inclusive: own };
+        continue;
+      }
+
+      // Compute inclusive count: union parent + descendant message IDs, deduplicate, then filter
+      const descendantIds = descendants.map(l => l.id);
+      const allIds = [label.id, ...descendantIds];
+      const seenMsgIds = new Set<string>();
+      const allMsgIds: string[] = [];
+
+      for (const lid of allIds) {
+        const msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
+        if (msgIds) {
+          for (const id of msgIds) {
+            if (!seenMsgIds.has(id)) {
+              seenMsgIds.add(id);
+              allMsgIds.push(id);
+            }
+          }
+        }
+      }
+
+      if (allMsgIds.length === 0) {
+        result[label.id] = { own, inclusive: 0 };
+        continue;
+      }
+
+      const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
+      const msgMap = await db.getMessagesBatch(allMsgIds);
+      let inclusive = 0;
+      for (const msg of msgMap.values()) {
+        if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
+        if (scopeTimestamp !== null && (!msg.internalDate || msg.internalDate < scopeTimestamp)) continue;
+        inclusive++;
+      }
+
+      result[label.id] = { own, inclusive };
+    }
+
+    return result;
+  }
 
   /** Query the cache for a label's message count and co-occurring labels. Accepts multiple label IDs and unions their messages. */
   async queryLabel(labelIds: string[], location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
@@ -160,8 +220,8 @@ export class CacheManager {
       // Look up message IDs from label index (O(1) meta read) instead of scanning all messages
       let msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
 
-      // If no index entry, the label hasn't been cached yet — fetch it now
-      if (!msgIds) {
+      // If no index entry or empty index, the label hasn't been cached yet — fetch it now
+      if (!msgIds || msgIds.length === 0) {
         await this.prioritizeLabel(labelId);
         msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
       }
@@ -177,31 +237,28 @@ export class CacheManager {
       }
     }
 
-    // Filter out messages marked as deleted/inaccessible (internalDate sentinel 0)
-    messages = messages.filter(m => m.internalDate !== 0);
-
     const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
     if (locationLabelId) {
       messages = messages.filter(m => m.labelIds.includes(locationLabelId));
     }
 
     if (scopeTimestamp !== null) {
-      const allHaveDates = messages.every(m => m.internalDate !== null);
+      const allHaveDates = messages.every(m => !!m.internalDate);
       if (allHaveDates) {
-        messages = messages.filter(m => m.internalDate !== null && m.internalDate >= scopeTimestamp);
+        messages = messages.filter(m => m.internalDate! >= scopeTimestamp);
       } else {
         return this.scopeFallback(labelIds, locationLabelId, scopeTimestamp);
       }
     }
 
-    const coLabelSet = new Set<string>();
+    const coLabelCounts: Record<string, number> = {};
     for (const msg of messages) {
       for (const lid of msg.labelIds) {
-        if (lid !== primaryId) coLabelSet.add(lid);
+        if (lid !== primaryId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
       }
     }
 
-    return { labelId: primaryId, count: messages.length, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count: messages.length, coLabelCounts };
   }
 
   /** Pause the main cache loop, process a single label, then resume. */
@@ -237,7 +294,7 @@ export class CacheManager {
     }
 
     const msgMap = await db.getMessagesBatch(allScopedIds);
-    const coLabelSet = new Set<string>();
+    const coLabelCounts: Record<string, number> = {};
     let count = 0;
 
     for (const msgId of allScopedIds) {
@@ -246,14 +303,14 @@ export class CacheManager {
         if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         count++;
         for (const lid of msg.labelIds) {
-          if (lid !== primaryId) coLabelSet.add(lid);
+          if (lid !== primaryId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
         }
       } else if (!locationLabelId) {
         count++;
       }
     }
 
-    return { labelId: primaryId, count, coLabels: [...coLabelSet] };
+    return { labelId: primaryId, count, coLabelCounts };
   }
 
   private timestampToDateString(timestamp: number): string {
@@ -261,11 +318,12 @@ export class CacheManager {
     return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
   }
 
-  /** Build the list of labels to query, combining system labels with user labels. */
+  /** Build the list of labels to query. Sorted alphabetically with sub-labels before parents so inclusive counts are ready when the parent is processed. */
   private buildLabelQueryList(): GmailLabel[] {
-    const result: GmailLabel[] = [];
     const addedIds = new Set<string>();
+    const result: GmailLabel[] = [];
 
+    // System labels first (needed for location filtering)
     for (const sysId of SYSTEM_LABELS_TO_QUERY) {
       const label = this.labels.find(l => l.id === sysId);
       if (label && !addedIds.has(label.id)) {
@@ -274,11 +332,16 @@ export class CacheManager {
       }
     }
 
-    for (const label of this.labels) {
-      if (label.type === "user" && !addedIds.has(label.id)) {
-        result.push(label);
-        addedIds.add(label.id);
-      }
+    // User labels: alphabetically, sub-labels before parents
+    const userLabels = this.labels.filter(l => l.type === "user" && !addedIds.has(l.id));
+    userLabels.sort((a, b) => {
+      if (a.name.startsWith(b.name + "/")) return -1; // a is child of b → a first
+      if (b.name.startsWith(a.name + "/")) return 1;  // b is child of a → b first
+      return a.name.localeCompare(b.name);
+    });
+    for (const label of userLabels) {
+      result.push(label);
+      addedIds.add(label.id);
     }
 
     return result;
@@ -303,11 +366,13 @@ export class CacheManager {
       for (const id of chunk) {
         const existing = existingMap.get(id);
         if (existing) {
-          if (!existing.labelIds.includes(labelId)) {
-            updates.push({ ...existing, labelIds: [...existing.labelIds, labelId] });
+          const needsLabel = !existing.labelIds.includes(labelId);
+          const needsStatusReset = existing.status === "inaccessible";
+          if (needsLabel || needsStatusReset) {
+            updates.push({ ...existing, labelIds: needsLabel ? [...existing.labelIds, labelId] : existing.labelIds, status: needsStatusReset ? "pending" : existing.status });
           }
         } else {
-          updates.push({ id, internalDate: null, labelIds: [labelId] });
+          updates.push({ id, internalDate: null, labelIds: [labelId], status: "pending" });
         }
       }
       if (updates.length > 0) await db.putMessages(updates);

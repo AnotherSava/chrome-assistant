@@ -129,7 +129,7 @@ export async function getMessagesWithoutDates(batchSize: number = 100): Promise<
       const cursor = request.result;
       if (cursor && results.length < batchSize) {
         const msg = cursor.value as CacheMessage;
-        if (msg.internalDate === null) results.push(msg);
+        if (msg.status === "pending" || (!msg.status && msg.internalDate === null)) results.push(msg);
         cursor.continue();
       } else {
         resolve(results);
@@ -150,6 +150,29 @@ export async function clearAll(): Promise<void> {
   });
 }
 
+/** Given label IDs, read their labelIdx entries, batch-fetch message records, filter by location/scope, and return per-label count. */
+export async function getFilteredLabelCounts(labelIds: string[], location: string | undefined, scopeTimestamp: number | null): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
+
+  for (const labelId of labelIds) {
+    const msgIds = await getMeta<string[]>(`labelIdx:${labelId}`);
+    if (!msgIds) continue;
+    if (msgIds.length === 0) { counts[labelId] = 0; continue; }
+
+    const msgMap = await getMessagesBatch(msgIds);
+    let count = 0;
+    for (const msg of msgMap.values()) {
+      if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
+      if (scopeTimestamp !== null && (!msg.internalDate || msg.internalDate < scopeTimestamp)) continue;
+      count++;
+    }
+    counts[labelId] = count;
+  }
+
+  return counts;
+}
+
 export async function getMessageCount(): Promise<number> {
   const db = await openDatabase();
   return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.count());
@@ -166,7 +189,7 @@ export async function countMessagesWithoutDates(): Promise<number> {
       const cursor = request.result;
       if (cursor) {
         const msg = cursor.value as CacheMessage;
-        if (msg.internalDate === null) count++;
+        if (msg.status === "pending" || (!msg.status && msg.internalDate === null)) count++;
         cursor.continue();
       } else {
         resolve(count);

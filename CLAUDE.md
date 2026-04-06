@@ -75,10 +75,10 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
 - `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
 - `packages/site-gmail/src/background.ts` — service worker (port-based messaging, CacheManager integration, queryLabel relay, cacheState push to sidepanel, return-to-inbox on disconnect, user-navigation detection for auto-tab-switch)
-- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, cache-driven label filtering via queryLabel/cacheState messages)
+- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, label counts, cache-driven label filtering via queryLabel/cacheState messages)
 - `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch, label-query message ID fetch, Gmail batch API for date fetching, search query builder)
-- `packages/site-gmail/src/cache-db.ts` — IndexedDB storage layer (messages store with label cross-reference, meta store for fetch state and label coverage)
-- `packages/site-gmail/src/cache-manager.ts` — cache orchestrator (label-query-based fetch, batch date fetch, queryLabel API, progress reporting, incremental refresh)
+- `packages/site-gmail/src/cache-db.ts` — IndexedDB storage layer (messages store with label cross-reference, meta store for fetch state and label coverage, filtered label count queries)
+- `packages/site-gmail/src/cache-manager.ts` — cache orchestrator (label-query-based fetch, batch date fetch, queryLabel API with co-label counts, getLabelCounts for own/inclusive per-label counts, progress reporting, incremental refresh)
 - `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons
 

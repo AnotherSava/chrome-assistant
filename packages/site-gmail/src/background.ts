@@ -60,7 +60,11 @@ export async function startCacheIfNeeded(accountPath: string): Promise<void> {
   cacheStarted = true;
   // Check if cache was recently completed — skip if within refresh interval
   const fetchState = await getMeta<{ phase: string; lastFetchTimestamp: number | null }>("fetchState");
-  if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) return;
+  if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) {
+    // Verify label indexes exist — cache might predate the index feature
+    const hasIndex = await getMeta<string[]>("labelIdx:INBOX");
+    if (hasIndex) return;
+  }
   const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
   cacheManager.startFetch(accountPath).catch((err) => {
@@ -174,7 +178,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "queryLabel" && (message.labelIds || message.labelId)) {
       const seq = message.seq;
       const labelIds = message.labelIds ?? [message.labelId!];
-      cacheManager.queryLabel(labelIds, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabels: [], error: true, seq }); });
+      cacheManager.queryLabel(labelIds, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabelCounts: {}, error: true, seq }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
@@ -190,7 +194,19 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         chrome.tabs.update(state.gmailTabId, { url });
       }
     } else if (message.type === "fetchLabels") {
-      fetchLabels().then((labels) => { port.postMessage({ type: "labelsReady", labels }); }).catch(() => { port.postMessage({ type: "labelsError" }); });
+      const fetchSeq = message.seq;
+      fetchLabels().then((labels) => {
+        const response: Record<string, unknown> = { type: "labelsReady", labels };
+        if (fetchSeq !== undefined) response.seq = fetchSeq;
+        port.postMessage(response);
+      }).catch(() => { port.postMessage({ type: "labelsError" }); });
+    } else if (message.type === "fetchCounts") {
+      const fetchSeq = message.seq;
+      cacheManager.getLabelCounts(message.location, message.scopeTimestamp ?? null).then((counts) => {
+        const response: Record<string, unknown> = { type: "countsReady", counts };
+        if (fetchSeq !== undefined) response.seq = fetchSeq;
+        port.postMessage(response);
+      }).catch(() => { /* counts are optional */ });
     }
   });
 

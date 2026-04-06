@@ -201,11 +201,13 @@ const KEY_SCOPE_VALUE = "ca_scope_value";
 const KEY_LOCATION = "ca_location";
 const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
 const KEY_INCLUDE_CHILDREN = "ca_include_children";
+const KEY_SHOW_COUNTS = "ca_show_counts";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
 let locationValue: string = loadSetting(KEY_LOCATION, "inbox");
 let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
 let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
+let showCounts: boolean = loadSetting(KEY_SHOW_COUNTS, true);
 
 const LOCATION_OPTIONS: { value: string; label: string }[] = [
   { value: "inbox", label: "Inbox" },
@@ -237,7 +239,7 @@ function buildDisplayPanel(): void {
   const panel = document.getElementById("display-panel");
   if (!panel) return;
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === labelColumns ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     labelColumns = parseInt(colSelect.value, 10);
@@ -257,6 +259,19 @@ function buildDisplayPanel(): void {
     if (activeLabelId) {
       sendQueryLabel();
       applyFilters();
+    } else {
+      refreshLabelsIfVisible();
+    }
+  });
+  const countsCheck = document.getElementById("show-counts-check") as HTMLInputElement;
+  countsCheck.addEventListener("change", () => {
+    showCounts = countsCheck.checked;
+    saveSetting(KEY_SHOW_COUNTS, showCounts);
+    if (showCounts) {
+      loadLabels(true);
+    } else {
+      labelCounts = null;
+      refreshLabelsIfVisible();
     }
   });
 }
@@ -389,6 +404,10 @@ export function setIncludeChildren(value: boolean): void {
   includeChildren = value;
 }
 
+export function setShowCounts(value: boolean): void {
+  showCounts = value;
+}
+
 export function getDescendantIds(labelId: string, labels: GmailLabel[]): string[] {
   const tree = buildLabelTree(labels);
   function findNode(nodes: LabelTreeNode[]): LabelTreeNode | null {
@@ -441,12 +460,66 @@ function splitIntoColumns(nodes: LabelTreeNode[], numColumns: number): LabelTree
   return columns;
 }
 
+function getLabelCount(labelId: string): number | null {
+  if (!showCounts) return null;
+  if (activeLabelId && lastLabelResult) {
+    // When a label is selected, show co-label counts from the query result
+    if (labelId === activeLabelId) return lastLabelResult.count;
+    const count = lastLabelResult.coLabelCounts[labelId];
+    return count !== undefined ? count : null;
+  }
+  // No label selected — use global label counts
+  if (!labelCounts) return null;
+  const entry = labelCounts[labelId];
+  if (!entry) return null;
+  return includeChildren ? entry.inclusive : entry.own;
+}
+
+/** Update count spans in-place without re-rendering the label tree. */
+function updateCountsInPlace(): void {
+  document.querySelectorAll<HTMLAnchorElement>(".label-link").forEach((link) => {
+    const labelId = link.dataset.labelId;
+    if (!labelId) return;
+    const count = getLabelCount(labelId);
+    let span = link.querySelector(".label-count") as HTMLSpanElement | null;
+    if (count !== null) {
+      if (span) {
+        span.textContent = ` (${count})`;
+      } else {
+        span = document.createElement("span");
+        span.className = "label-count";
+        span.textContent = ` (${count})`;
+        link.appendChild(span);
+      }
+    } else if (span) {
+      span.remove();
+    }
+  });
+}
+
+/** Whether a fetchCounts request is in flight */
+let countsInFlight = false;
+/** Whether more progress arrived while a fetchCounts was in flight */
+let countsPending = false;
+
+/** Request just label counts from background (no Gmail API call). */
+function requestCounts(): void {
+  if (!activePort || !showCounts) return;
+  if (countsInFlight) { countsPending = true; return; }
+  countsInFlight = true;
+  countsPending = false;
+  fetchCountsSeq++;
+  activePort.postMessage({ type: "fetchCounts", location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: fetchCountsSeq });
+}
+
 function renderLabelTree(nodes: LabelTreeNode[]): string {
   if (nodes.length === 0) return "";
   const items = nodes.map((node) => {
     const hasChildren = node.children.length > 0;
     const activeClass = node.id === activeLabelId ? " active" : "";
-    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name)}</a>`;
+    const count = getLabelCount(node.id);
+    const countSpan = count !== null ? `<span class="label-count"> (${count})</span>` : "";
+    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name)}${countSpan}</a>`;
     const children = hasChildren ? `<ul class="label-tree">${renderLabelTree(node.children)}</ul>` : "";
     return `<li class="label-node">${link}${children}</li>`;
   }).join("");
@@ -467,7 +540,6 @@ function setupLabelHandlers(): void {
         saveSetting(KEY_ACTIVE_LABEL_NAME, null);
         // No label selected — show all labels, clear query result
         lastLabelResult = null;
-        queryInFlight = false;
         renderFilteredLabels();
         applyFilters();
       } else {
@@ -525,6 +597,7 @@ function setupFilterBar(): void {
     saveSetting(KEY_LOCATION, locationValue);
     sendQueryLabel();
     applyFilters();
+    if (showCounts) requestCounts();
   });
   const scopeSelect = document.getElementById("scope-select") as HTMLSelectElement | null;
   scopeSelect?.addEventListener("change", () => {
@@ -532,10 +605,12 @@ function setupFilterBar(): void {
     saveSetting(KEY_SCOPE_VALUE, scopeValue);
     sendQueryLabel();
     applyFilters();
+    if (showCounts) requestCounts();
   });
 }
 
 let cachedLabels: GmailLabel[] | null = null;
+let labelCounts: Record<string, { own: number; inclusive: number }> | null = null;
 
 function renderLabels(labels: GmailLabel[]): void {
   switchZoomContext("gmail");
@@ -557,10 +632,10 @@ function renderLabels(labels: GmailLabel[]): void {
 // ---------------------------------------------------------------------------
 
 /** Last cache progress pushed from background */
-let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; datesTotal: number; datesDone: number } | null = null;
+let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; datesTotal: number; datesDone: number; currentLabel?: string } | null = null;
 
 /** Last label query result from background */
-let lastLabelResult: { labelId: string; count: number; coLabels: string[] } | null = null;
+let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
 
 /** Whether the last queryLabel request failed */
 let lastQueryError = false;
@@ -568,13 +643,15 @@ let lastQueryError = false;
 /** Monotonic sequence number to correlate queryLabel requests with responses */
 let queryLabelSeq = 0;
 
-/** Whether a queryLabel request is currently in flight — prevents duplicate queries */
-let queryInFlight = false;
+/** Monotonic sequence number to correlate fetchLabels requests with labelsReady responses */
+let fetchLabelsSeq = 0;
+
+/** Separate sequence number for fetchCounts requests */
+let fetchCountsSeq = 0;
 
 /** Send a queryLabel request to background for the currently selected label */
 function sendQueryLabel(): void {
-  if (!activePort || !activeLabelId || queryInFlight) return;
-  queryInFlight = true;
+  if (!activePort || !activeLabelId) return;
   lastQueryError = false;
   queryLabelSeq++;
   updateCacheProgress();
@@ -614,7 +691,7 @@ function renderFilteredLabels(): void {
   }
 
   // Use the cache query result to filter visible labels
-  const coLabelIds = new Set(lastLabelResult.coLabels);
+  const coLabelIds = new Set(Object.keys(lastLabelResult.coLabelCounts));
 
   // Always show the active label and its parent chain
   coLabelIds.add(activeLabelId);
@@ -658,7 +735,8 @@ function updateCacheProgress(): void {
 
   if (lastCacheProgress) {
     if (lastCacheProgress.phase === "labels") {
-      parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal} ${cacheStatusIcon(false)}`);
+      const labelName = lastCacheProgress.currentLabel ? ` — ${lastCacheProgress.currentLabel}` : "";
+      parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
     } else if (lastCacheProgress.phase === "dates") {
       parts.push(`Background caching: dates ${lastCacheProgress.datesDone}/${lastCacheProgress.datesTotal} ${cacheStatusIcon(false)}`);
     }
@@ -678,7 +756,8 @@ function loadLabels(forceRefresh: boolean = false): void {
   }
   if (!cachedLabels) showContent('<div class="status">Loading labels...</div>');
   if (activePort) {
-    activePort.postMessage({ type: "fetchLabels" });
+    fetchLabelsSeq++;
+    activePort.postMessage({ type: "fetchLabels", seq: fetchLabelsSeq });
   }
 }
 
@@ -724,7 +803,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; datesTotal?: number; datesDone?: number; labelId?: string; count?: number; coLabels?: string[]; complete?: boolean; seq?: number; error?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; datesTotal?: number; datesDone?: number; currentLabel?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -735,6 +814,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (accountChanged) {
       // Clear stale label UI state from the previous account
       cachedLabels = null;
+      labelCounts = null;
       activeLabelId = null;
       activeLabelName = null;
       lastLabelResult = null;
@@ -752,7 +832,10 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
       showSummary();
     }
   } else if (message.type === "labelsReady" && message.labels) {
+    // Ignore stale responses from earlier fetchLabels requests (avoids race on account switches)
+    if (message.seq !== undefined && message.seq !== fetchLabelsSeq) return;
     cachedLabels = message.labels;
+    labelCounts = showCounts ? (message.counts ?? null) : null;
     // Validate and refresh saved label against the current account's labels
     if (activeLabelId !== null) {
       const matchedLabel = cachedLabels.find((l) => l.id === activeLabelId);
@@ -774,12 +857,20 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     refreshLabelsIfVisible();
     // If a label is selected, query its data from the cache
     if (activeLabelId) sendQueryLabel();
+    // Request counts separately (non-blocking)
+    if (showCounts) requestCounts();
   } else if (message.type === "labelsError") {
     pendingFilterApply = false;
     if (currentTab === "filters" && onGmailPage && !cachedLabels) {
       showContent('<div class="status">Loading labels...</div>');
       setTimeout(() => { if (!cachedLabels && onGmailPage) loadLabels(true); }, 3000);
     }
+  } else if (message.type === "countsReady" && message.counts) {
+    if (message.seq !== undefined && message.seq !== fetchCountsSeq) return;
+    countsInFlight = false;
+    labelCounts = message.counts;
+    updateCountsInPlace();
+    if (countsPending) requestCounts();
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
     // skipNavigation: the user already navigated where they want, don't override with return-to-inbox
@@ -790,14 +881,18 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "cacheState") {
     // Cache progress pushed from background
-    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, datesTotal: message.datesTotal ?? 0, datesDone: message.datesDone ?? 0 };
+    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, datesTotal: message.datesTotal ?? 0, datesDone: message.datesDone ?? 0, currentLabel: message.currentLabel };
     updateCacheProgress();
-    // When cache completes, re-query the active label to get final counts
-    if (message.phase === "complete" && activeLabelId) sendQueryLabel();
+    // Refresh counts during cache build and on completion
+    if (message.phase === "complete") {
+      if (activeLabelId) sendQueryLabel();
+      if (showCounts) requestCounts();
+    } else if (message.phase === "labels" && showCounts) {
+      requestCounts();
+    }
   } else if (message.type === "labelResult" && message.labelId !== undefined) {
     // Query result from background cache — ignore stale responses
     if (message.labelId === activeLabelId && (message.seq === undefined || message.seq === queryLabelSeq)) {
-      queryInFlight = false;
       if (message.error) {
         // Query failed — clear stale result so labels show unfiltered, don't hide everything
         lastLabelResult = null;
@@ -805,7 +900,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
         refreshLabelsIfVisible();
         updateCacheProgress();
       } else {
-        lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabels: message.coLabels ?? [] };
+        lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabelCounts: message.coLabelCounts ?? {} };
         lastQueryError = false;
         refreshLabelsIfVisible();
         updateCacheProgress();

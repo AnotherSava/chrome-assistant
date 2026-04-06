@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren, setShowCounts } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -125,7 +125,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Simulate background returning labelResult — only Label_2 co-occurs
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 42, coLabels: ["Label_2"] });
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 42, coLabelCounts: { Label_2: 1 } });
 
     // Content should show Work and Personal but not Archive
     const content = document.getElementById("content");
@@ -159,7 +159,7 @@ describe("handleMessage", () => {
     // Select then deselect
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabels: [] });
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabelCounts: {} });
 
     // After labelResult, Personal might be hidden. Now deselect:
     const workLink2 = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
@@ -184,7 +184,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Result arrives for a different label (stale result) — should be ignored
-    handleMessage({ type: "labelResult", labelId: "Label_999", count: 0, coLabels: [] });
+    handleMessage({ type: "labelResult", labelId: "Label_999", count: 0, coLabelCounts: {} });
 
     // Both labels should still be visible (no filtering applied from stale result)
     const content = document.getElementById("content");
@@ -210,8 +210,6 @@ describe("handleMessage", () => {
     // Select a label
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
-    // Simulate the query response arriving (clears queryInFlight)
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabels: [] });
     vi.clearAllMocks();
 
     // Cache completes — should trigger re-query
@@ -247,7 +245,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Simulate error response from background
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabels: [], error: true });
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabelCounts: {}, error: true });
 
     const progress = document.getElementById("cache-progress");
     expect(progress?.innerHTML).toContain("query failed");
@@ -266,10 +264,10 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Error first
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabels: [], error: true });
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabelCounts: {}, error: true });
 
     // Then success — error should be cleared
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabels: ["Label_2"] });
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 1 } });
     const progress = document.getElementById("cache-progress");
     expect(progress?.innerHTML).not.toContain("query failed");
   });
@@ -405,5 +403,100 @@ describe("sendQueryLabel with include children", () => {
       type: "applyFilters",
       labelName: "Games",
     }));
+  });
+});
+
+describe("label counts rendering", () => {
+  beforeEach(() => {
+    setupDOM();
+    vi.clearAllMocks();
+    setShowCounts(true);
+  });
+
+  afterEach(() => {
+    setShowCounts(true);
+  });
+
+  it("renderLabelTree includes count spans when labelsReady has counts", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ];
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+      Label_2: { own: 5, inclusive: 5 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const countSpans = content?.querySelectorAll(".label-count");
+    expect(countSpans?.length).toBe(2);
+    // Labels are sorted alphabetically: Personal (5), Work (10)
+    expect(countSpans?.[0]?.textContent).toBe(" (5)");
+    expect(countSpans?.[1]?.textContent).toBe(" (10)");
+  });
+
+  it("does not show counts when showCounts is disabled", () => {
+    setShowCounts(false);
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+    ];
+    const counts = { Label_1: { own: 10, inclusive: 10 } };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const countSpans = content?.querySelectorAll(".label-count");
+    expect(countSpans?.length).toBe(0);
+  });
+
+  it("shows co-label counts when a label is selected", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ];
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+      Label_2: { own: 5, inclusive: 5 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    // Select Work label
+    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
+    workLink?.click();
+
+    // Simulate labelResult with co-label counts
+    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 3 } });
+
+    const content = document.getElementById("content");
+    const countSpans = content?.querySelectorAll(".label-count");
+    // Work (10) and Personal (3) should have counts
+    expect(countSpans?.length).toBe(2);
+    // Work label shows the query result count
+    const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
+    expect(workCount?.textContent).toBe(" (10)");
+    // Personal shows co-label count
+    const personalCount = content?.querySelector('[data-label-id="Label_2"] .label-count');
+    expect(personalCount?.textContent).toBe(" (3)");
+  });
+
+  it("updates displayed counts when countsReady arrives after labelsReady", () => {
+    // Fresh account to clear stale state
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/99/" });
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ] });
+
+    // No counts yet (labelsReady has no counts field)
+    expect(document.querySelectorAll(".label-count").length).toBe(0);
+
+    // countsReady arrives — counts appear via in-place update
+    handleMessage({ type: "countsReady", counts: { Label_1: { own: 42, inclusive: 42 }, Label_2: { own: 7, inclusive: 7 } } });
+    const countSpans = document.querySelectorAll(".label-count");
+    expect(countSpans.length).toBe(2);
   });
 });
