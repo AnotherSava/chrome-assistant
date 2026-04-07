@@ -257,7 +257,7 @@ describe("CacheManager", () => {
     });
 
     it("returns count and co-occurring labels for a label", async () => {
-      const result = await manager.queryLabel(["INBOX"], null);
+      const result = await manager.queryLabel("INBOX", false, null);
       expect(result.count).toBe(3); // m1, m2, m4
       expect(result.coLabelCounts).toHaveProperty("Label_1");
       expect(result.coLabelCounts).toHaveProperty("SENT");
@@ -265,12 +265,12 @@ describe("CacheManager", () => {
     });
 
     it("returns all messages for a label without location filtering", async () => {
-      const result = await manager.queryLabel(["Label_1"], null);
+      const result = await manager.queryLabel("Label_1", false, null);
       expect(result.count).toBe(2); // m1, m2
     });
 
     it("filters by scope timestamp when all messages have dates", async () => {
-      const result = await manager.queryLabel(["INBOX"], 2500);
+      const result = await manager.queryLabel("INBOX", false, 2500);
       expect(result.count).toBe(1); // m4 (internalDate 4000 >= 2500)
     });
 
@@ -285,14 +285,14 @@ describe("CacheManager", () => {
       // The fallback calls fetchLabelMessageIds with a scope date
       mockApi.fetchLabelMessageIds.mockResolvedValue(["m2", "m4"]);
 
-      const result = await manager.queryLabel(["INBOX"], 2000);
+      const result = await manager.queryLabel("INBOX", false, 2000);
       // Fallback returns count based on scoped API IDs cross-referenced with IndexedDB
       expect(result.count).toBe(2);
     });
 
     it("returns empty result for unknown label", async () => {
       mockApi.fetchLabelMessageIds.mockResolvedValue([]);
-      const result = await manager.queryLabel(["NONEXISTENT"], null);
+      const result = await manager.queryLabel("NONEXISTENT", false, null);
       expect(result.count).toBe(0);
       expect(result.coLabelCounts).toEqual({});
     });
@@ -302,7 +302,7 @@ describe("CacheManager", () => {
       mockDb._meta.set("fetchState", { phase: "labels", lastFetchTimestamp: null });
       // The priority fetch will call fetchLabelMessageIds for the uncached label
       mockApi.fetchLabelMessageIds.mockResolvedValue(["m10", "m11"]);
-      const result = await manager.queryLabel(["Label_priority"], null);
+      const result = await manager.queryLabel("Label_priority", false, null);
       expect(mockApi.fetchLabelMessageIds).toHaveBeenCalledWith("Label_priority");
       expect(result.count).toBe(2);
       // Messages should now be in the DB for subsequent queries
@@ -310,29 +310,62 @@ describe("CacheManager", () => {
       expect(cached.length).toBe(2);
     });
 
-    it("returns union count and combined co-labels for multiple label IDs", async () => {
-      // Label_1 has m1, m2; Label_2 has m3, m4; m2 is shared via SENT
-      const result = await manager.queryLabel(["Label_1", "Label_2"], null);
-      expect(result.count).toBe(4); // m1, m2, m3, m4 (all unique)
-      expect(result.labelId).toBe("Label_1"); // primary ID
-      // Primary label (Label_1) should be excluded from co-label counts
-      expect(result.coLabelCounts).not.toHaveProperty("Label_1");
-      // Sub-label IDs (Label_2) should appear as co-label counts
+    it("resolves descendants via prefix matching when includeChildren is true", async () => {
+      // Setup labels with hierarchy: Work, Work/Projects, Work/Projects/Alpha
+      const hierarchyLabels: GmailLabel[] = [
+        { id: "INBOX", name: "INBOX", type: "system" },
+        { id: "SENT", name: "SENT", type: "system" },
+        { id: "Label_1", name: "Work", type: "user" },
+        { id: "Label_2", name: "Work/Projects", type: "user" },
+        { id: "Label_3", name: "Work/Projects/Alpha", type: "user" },
+        { id: "Label_4", name: "Personal", type: "user" },
+      ];
+      // Populate labels on the manager via startFetch
+      mockApi.fetchLabels.mockResolvedValue(hierarchyLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.batchFetchDates.mockResolvedValue([]);
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/");
+
+      // Populate cache: Work has m1, Work/Projects has m2, Work/Projects/Alpha has m3
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["Label_1", "Label_2"] });
+      mockDb._store.set("m3", { id: "m3", internalDate: 3000, labelIds: ["Label_3"] });
+      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m2"]);
+      mockDb._meta.set("labelIdx:Label_3", ["m3"]);
+
+      // Query Work with includeChildren — should include Work, Work/Projects, Work/Projects/Alpha
+      const result = await mgr.queryLabel("Label_1", true, null);
+      expect(result.labelId).toBe("Label_1");
+      expect(result.count).toBe(3); // m1, m2, m3 (deduplicated)
+      // Label_2 and Label_3 should appear as co-labels (only Label_1 excluded as primary)
       expect(result.coLabelCounts).toHaveProperty("Label_2");
-      expect(result.coLabelCounts).toHaveProperty("INBOX");
-      expect(result.coLabelCounts).toHaveProperty("SENT");
+      expect(result.coLabelCounts).toHaveProperty("Label_3");
+      expect(result.coLabelCounts).not.toHaveProperty("Label_1");
     });
 
-    it("excludes only primary ID from co-labels, sub-label IDs appear if messages have them", async () => {
-      // Add a message that has both Label_1 and Label_2
-      mockDb._store.set("m5", { id: "m5", internalDate: 5000, labelIds: ["Label_1", "Label_2", "INBOX"] });
-      mockDb._meta.set("labelIdx:Label_1", ["m1", "m2", "m5"]);
-      mockDb._meta.set("labelIdx:Label_2", ["m3", "m4", "m5"]);
-      const result = await manager.queryLabel(["Label_1", "Label_2"], null);
-      // Label_2 should appear as a co-label count (not excluded)
-      expect(result.coLabelCounts).toHaveProperty("Label_2");
-      // Label_1 (primary) should not appear
-      expect(result.coLabelCounts).not.toHaveProperty("Label_1");
+    it("does not include descendants when includeChildren is false", async () => {
+      const hierarchyLabels: GmailLabel[] = [
+        { id: "INBOX", name: "INBOX", type: "system" },
+        { id: "SENT", name: "SENT", type: "system" },
+        { id: "Label_1", name: "Work", type: "user" },
+        { id: "Label_2", name: "Work/Projects", type: "user" },
+      ];
+      mockApi.fetchLabels.mockResolvedValue(hierarchyLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.batchFetchDates.mockResolvedValue([]);
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/");
+
+      mockDb._store.set("m1", { id: "m1", internalDate: 1000, labelIds: ["Label_1"] });
+      mockDb._store.set("m2", { id: "m2", internalDate: 2000, labelIds: ["Label_2"] });
+      mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_2", ["m2"]);
+
+      // Query Work without children — should only get m1
+      const result = await mgr.queryLabel("Label_1", false, null);
+      expect(result.count).toBe(1);
     });
   });
 

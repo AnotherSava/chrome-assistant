@@ -13,6 +13,9 @@ vi.mock("../src/cache-manager.js", () => {
   const mockSetProgressCallback = vi.fn();
   const mockUpdateSystemLabelSettings = vi.fn();
   const mockPrioritizeLabel = vi.fn().mockResolvedValue(undefined);
+  const mockGetLabels = vi.fn().mockReturnValue([]);
+  const mockSetLabels = vi.fn();
+  const mockGetLabelCounts = vi.fn().mockResolvedValue({ INBOX: { own: 10, inclusive: 10 } });
   return {
     CacheManager: vi.fn().mockImplementation(() => ({
       startFetch: mockStartFetch,
@@ -21,9 +24,13 @@ vi.mock("../src/cache-manager.js", () => {
       setProgressCallback: mockSetProgressCallback,
       updateSystemLabelSettings: mockUpdateSystemLabelSettings,
       prioritizeLabel: mockPrioritizeLabel,
+      getLabels: mockGetLabels,
+      setLabels: mockSetLabels,
+      getLabelCounts: mockGetLabelCounts,
       resetReady: vi.fn(),
       resolveReady: vi.fn(),
       loadLabels: vi.fn().mockResolvedValue(undefined),
+      whenReady: vi.fn().mockResolvedValue(undefined),
       markProcessed: vi.fn(),
       showStarred: false,
       showImportant: false,
@@ -35,19 +42,24 @@ vi.mock("../src/cache-manager.js", () => {
 const noop = () => {};
 const alarmsClearMock = vi.fn().mockResolvedValue(undefined);
 const alarmsCreateMock = vi.fn();
+let onConnectListener: ((port: unknown) => void) | null = null;
+const tabsUpdateMock = vi.fn().mockResolvedValue(undefined);
 (globalThis as Record<string, unknown>).chrome = {
   storage: { session: { get: noop, set: noop } },
   sidePanel: { setPanelBehavior: noop },
   commands: { getAll: noop, onCommand: { addListener: noop } },
   action: { setTitle: noop, onClicked: { addListener: noop } },
-  runtime: { onConnect: { addListener: noop } },
-  tabs: { onUpdated: { addListener: noop }, onActivated: { addListener: noop }, query: vi.fn(), update: vi.fn(), get: vi.fn() },
+  runtime: { onConnect: { addListener: (cb: (port: unknown) => void) => { onConnectListener = cb; } } },
+  tabs: { onUpdated: { addListener: noop }, onActivated: { addListener: noop }, query: vi.fn(), update: tabsUpdateMock, get: vi.fn() },
   identity: { getAuthToken: noop, removeCachedAuthToken: noop },
   alarms: { create: alarmsCreateMock, clear: alarmsClearMock, onAlarm: { addListener: noop } },
 };
 
 const { getMeta } = await import("../src/cache-db.js") as unknown as { getMeta: ReturnType<typeof vi.fn> };
 const { buildGmailUrl, startCacheIfNeeded, _resetCacheState, cacheManager } = await import("../src/background.js");
+
+// Capture the progress callback registered at module load time (before any clearAllMocks)
+const progressCallback = (cacheManager.setProgressCallback as ReturnType<typeof vi.fn>).mock.calls[0][0] as (progress: Record<string, unknown>) => void;
 
 describe("buildGmailUrl", () => {
   const base = "https://mail.google.com/mail/u/0/";
@@ -94,6 +106,15 @@ describe("buildGmailUrl", () => {
 
   it("escapes quotes in label names", () => {
     expect(buildGmailUrl(base, 'My "Label"', null)).toBe(`${base}#search/${encodeURIComponent('label:"my-label"')}`);
+  });
+
+  it("builds OR query for array of label names", () => {
+    const url = buildGmailUrl(base, ["Work", "Work/Projects"], null);
+    expect(url).toContain("search");
+    const decoded = decodeURIComponent(url.split("#search/")[1]);
+    expect(decoded).toContain("work");
+    expect(decoded).toContain("work-projects");
+    expect(decoded).toMatch(/OR/i);
   });
 });
 
@@ -259,6 +280,253 @@ describe("startCacheIfNeeded", () => {
     getMeta.mockResolvedValue(undefined);
     await startCacheIfNeeded("/mail/u/0/");
     expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+  });
+});
+
+/** Helper: create a fake port and connect it through the onConnect listener. */
+function createConnectedPort(gmailTabId: number, gmailTabUrl: string): { port: { postMessage: ReturnType<typeof vi.fn>; name: string; onMessage: { addListener: (cb: (msg: Record<string, unknown>) => void) => void }; onDisconnect: { addListener: (cb: () => void) => void } }; sendMessage: (msg: Record<string, unknown>) => void } {
+  let messageListener: ((msg: Record<string, unknown>) => void) | null = null;
+  const port = {
+    name: "sidepanel",
+    postMessage: vi.fn(),
+    onMessage: { addListener: (cb: (msg: Record<string, unknown>) => void) => { messageListener = cb; } },
+    onDisconnect: { addListener: noop },
+  };
+  onConnectListener!(port);
+  // Send initWindow which triggers tabs.query — mock it to return the gmail tab
+  const tabsQuery = (globalThis as unknown as { chrome: { tabs: { query: ReturnType<typeof vi.fn> } } }).chrome.tabs.query;
+  tabsQuery.mockResolvedValueOnce([{ id: gmailTabId, url: gmailTabUrl, windowId: 1 }]);
+  messageListener!({ type: "initWindow", windowId: 1 });
+  return {
+    port,
+    sendMessage: (msg: Record<string, unknown>) => { messageListener!(msg); },
+  };
+}
+
+describe("selectionChanged handler", () => {
+  beforeEach(() => {
+    _resetCacheState();
+    vi.clearAllMocks();
+    tabsUpdateMock.mockResolvedValue(undefined);
+  });
+
+  it("selectionChanged with labelId triggers query + navigation + labelResult response", async () => {
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Work/Projects", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 3, coLabelCounts: { INBOX: 2 } });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    // Wait for initWindow to complete
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, null);
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("label") });
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 3, seq: 1 }));
+  });
+
+  it("selectionChanged with null labelId navigates to #all and responds with empty result", async () => {
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: null, scopeTimestamp: null, seq: 2 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.queryLabel).not.toHaveBeenCalled();
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: "https://mail.google.com/mail/u/0/#all" });
+    expect(port.postMessage).toHaveBeenCalledWith({ type: "labelResult", labelId: null, count: 0, coLabelCounts: {}, seq: 2 });
+  });
+
+  it("selectionChanged with includeChildren resolves descendant names for Gmail URL", async () => {
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Work/Projects", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 5, coLabelCounts: {} });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: true, scope: null, scopeTimestamp: null, seq: 3 });
+    await new Promise(r => setTimeout(r, 0));
+
+    // URL should contain both label names in an OR query
+    const url = tabsUpdateMock.mock.calls[0][1].url as string;
+    expect(url).toContain("search");
+    expect(url).toContain("work");
+    expect(url).toContain("work-projects");
+  });
+
+  it("selectionChanged responds with error when queryLabel rejects but still navigates Gmail", async () => {
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("query failed"));
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    tabsUpdateMock.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 5 });
+    await new Promise(r => setTimeout(r, 0));
+
+    // Navigation should still happen despite query failure
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("work") });
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", error: true, seq: 5 }));
+  });
+
+  it("selectionChanged recovers labels via loadLabels when getLabels returns empty", async () => {
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
+    // Initially empty (simulating prior fetchLabels failure), then populated after loadLabels
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce([])
+      .mockReturnValue(labels);
+    (cacheManager.loadLabels as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 2, coLabelCounts: {} });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    tabsUpdateMock.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 10 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.loadLabels).toHaveBeenCalled();
+    // Navigation should use the recovered label name, not fall back to #all
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("work") });
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 2, seq: 10 }));
+  });
+
+  it("selectionChanged returns error when label recovery fails and includeChildren is true", async () => {
+    // getLabels returns empty even after loadLabels attempt (simulating persistent failure)
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    (cacheManager.loadLabels as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("network error"));
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    tabsUpdateMock.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: true, scope: null, scopeTimestamp: null, seq: 11 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.loadLabels).toHaveBeenCalled();
+    // Navigation should be skipped (label can't be resolved)
+    expect(tabsUpdateMock).not.toHaveBeenCalled();
+    // queryLabel should NOT be called — descendant resolution would silently degrade
+    expect(cacheManager.queryLabel).not.toHaveBeenCalled();
+    // Should return error result instead of degraded counts
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 0, error: true, seq: 11 }));
+  });
+
+  it("selectionChanged with null labelId and scope navigates to scoped search", async () => {
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: "2024/01/01", scopeTimestamp: null, seq: 4 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("search") });
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("after") });
+  });
+});
+
+describe("filtersOff handler", () => {
+  beforeEach(() => {
+    _resetCacheState();
+    vi.clearAllMocks();
+    tabsUpdateMock.mockResolvedValue(undefined);
+  });
+
+  it("filtersOff navigates to #inbox", async () => {
+    const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    tabsUpdateMock.mockClear();
+
+    sendMessage({ type: "filtersOff" });
+
+    expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: "https://mail.google.com/mail/u/0/#inbox" });
+  });
+});
+
+describe("cache-complete re-query", () => {
+  beforeEach(() => {
+    _resetCacheState();
+    vi.clearAllMocks();
+    tabsUpdateMock.mockResolvedValue(undefined);
+  });
+
+  it("pushes updated labelResult and countsReady when cache completes with active label", async () => {
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 10, coLabelCounts: { INBOX: 5 } });
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ Label_1: { own: 10, inclusive: 10 }, INBOX: { own: 50, inclusive: 50 } });
+
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+
+    // Send selectionChanged to store the last selection
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockClear();
+
+    // Simulate cache completion via the progress callback captured at module load
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 15, coLabelCounts: { INBOX: 8 } });
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
+    await new Promise(r => setTimeout(r, 0));
+
+    // Should re-query with stored selection parameters
+    expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, null);
+    // Should push updated labelResult to sidepanel with seq from last selection
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 15, seq: 1 }));
+    // Should push updated countsReady
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
+  });
+
+  it("does not re-query when cache completes with no active label", async () => {
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+
+    // Send selectionChanged with null to deselect
+    sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockClear();
+
+    // Simulate cache completion via the progress callback captured at module load
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
+    await new Promise(r => setTimeout(r, 0));
+
+    // Should NOT re-query (no active label)
+    expect(cacheManager.queryLabel).not.toHaveBeenCalled();
+    // Should still push countsReady
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
+  });
+
+  it("uses scope from fetchCounts when cache completes with no prior selectionChanged", async () => {
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000; // 1 month ago
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
+
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+
+    // Sidepanel sends fetchCounts with scope (no selectionChanged sent because no active label)
+    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockClear();
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 8, inclusive: 8 } });
+
+    // Simulate cache completion — pushUpdatedResults should use the scope from fetchCounts
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
+    await new Promise(r => setTimeout(r, 0));
+
+    // getLabelCounts should be called with the scoped timestamp, not null
+    expect(cacheManager.getLabelCounts).toHaveBeenCalledWith(scopeTimestamp);
+    expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
   });
 });
 

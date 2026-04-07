@@ -48,6 +48,16 @@ export class CacheManager {
     this.onProgress = callback;
   }
 
+  /** Get the current in-memory label list (used by the service worker to resolve label names). */
+  getLabels(): GmailLabel[] {
+    return this.labels;
+  }
+
+  /** Replace the in-memory label list (e.g. when fresher labels arrive from a fetchLabels call). */
+  setLabels(labels: GmailLabel[]): void {
+    this.labels = labels;
+  }
+
   /** Update which optional system labels are included in cache queries. */
   updateSystemLabelSettings(showStarred: boolean, showImportant: boolean): void {
     this.showStarred = showStarred;
@@ -254,20 +264,20 @@ export class CacheManager {
     return result;
   }
 
-  /** Query the cache for a label's message count and co-occurring labels. Accepts multiple label IDs and unions their messages. */
-  async queryLabel(labelIds: string[], scopeTimestamp: number | null): Promise<LabelQueryResult> {
-    const primaryId = labelIds[0];
+  /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. */
+  async queryLabel(labelId: string, includeChildren: boolean, scopeTimestamp: number | null): Promise<LabelQueryResult> {
+    const labelIds = this.resolveLabelIds(labelId, includeChildren);
     const seen = new Set<string>();
     let messages: CacheMessage[] = [];
 
-    for (const labelId of labelIds) {
+    for (const lid of labelIds) {
       // Look up message IDs from label index (O(1) meta read) instead of scanning all messages
-      let msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+      let msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
 
       // If no index entry or empty index, the label hasn't been cached yet — fetch it now
       if (!msgIds || msgIds.length === 0) {
-        await this.prioritizeLabel(labelId);
-        msgIds = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+        await this.prioritizeLabel(lid);
+        msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
       }
 
       if (msgIds) {
@@ -286,18 +296,18 @@ export class CacheManager {
       if (allHaveDates) {
         messages = messages.filter(m => m.internalDate! >= scopeTimestamp);
       } else {
-        return this.scopeFallback(labelIds, scopeTimestamp);
+        return this.scopeFallback(labelId, includeChildren, scopeTimestamp);
       }
     }
 
     const coLabelCounts: Record<string, number> = {};
     for (const msg of messages) {
       for (const lid of msg.labelIds) {
-        if (lid !== primaryId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
+        if (lid !== labelId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
       }
     }
 
-    return { labelId: primaryId, count: messages.length, coLabelCounts };
+    return { labelId, count: messages.length, coLabelCounts };
   }
 
   /** Mark a label as processed — prevents duplicate fetches via prioritizeLabel.
@@ -328,15 +338,24 @@ export class CacheManager {
     }
   }
 
+  /** Resolve a labelId into an array of IDs: just the label itself, or the label + its descendants via prefix matching. */
+  private resolveLabelIds(labelId: string, includeChildren: boolean): string[] {
+    if (!includeChildren) return [labelId];
+    const label = this.labels.find(l => l.id === labelId);
+    if (!label) return [labelId];
+    const descendants = this.labels.filter(l => l.id !== labelId && l.name.startsWith(label.name + "/"));
+    return [labelId, ...descendants.map(l => l.id)];
+  }
+
   /** Scope fallback: use API to get scoped message IDs for all label IDs, cross-reference with IndexedDB for co-labels. */
-  private async scopeFallback(labelIds: string[], scopeTimestamp: number): Promise<LabelQueryResult> {
-    const primaryId = labelIds[0];
+  private async scopeFallback(labelId: string, includeChildren: boolean, scopeTimestamp: number): Promise<LabelQueryResult> {
+    const labelIds = this.resolveLabelIds(labelId, includeChildren);
     const dateStr = this.timestampToDateString(scopeTimestamp);
     const seenIds = new Set<string>();
     const allScopedIds: string[] = [];
 
-    for (const labelId of labelIds) {
-      const scopedIds = await fetchLabelMessageIds(labelId, dateStr);
+    for (const lid of labelIds) {
+      const scopedIds = await fetchLabelMessageIds(lid, dateStr);
       for (const id of scopedIds) {
         if (!seenIds.has(id)) {
           seenIds.add(id);
@@ -354,14 +373,14 @@ export class CacheManager {
       if (msg) {
         count++;
         for (const lid of msg.labelIds) {
-          if (lid !== primaryId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
+          if (lid !== labelId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
         }
       } else {
         count++;
       }
     }
 
-    return { labelId: primaryId, count, coLabelCounts };
+    return { labelId, count, coLabelCounts };
   }
 
   private timestampToDateString(timestamp: number): string {

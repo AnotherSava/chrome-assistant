@@ -22,3 +22,6 @@ docs/plans/*
 
 # Draft documentation
 docs/draft/
+
+# Local convenience scripts (not committed)
+scripts/

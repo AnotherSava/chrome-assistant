@@ -1,0 +1,36 @@
+sequenceDiagram
+    participant SP as Sidepanel
+    participant SW as Service Worker
+    participant CM as Cache Manager
+    participant Gmail as Gmail Tab
+
+    Note over SP,Gmail: Label Selection
+    SP->>SW: selectionChanged {labelId, includeChildren, scope, scopeTimestamp, seq}
+    SW->>CM: queryLabel(labelId, includeChildren, scopeTimestamp)
+    CM-->>SW: {labelId, count, coLabelCounts}
+    SW->>CM: getLabels()
+    CM-->>SW: labels[]
+    SW->>Gmail: tabs.update(url) — label/search hash
+    SW->>SP: labelResult {labelId, count, coLabelCounts, seq}
+
+    Note over SP,Gmail: Label Deselection
+    SP->>SW: selectionChanged {labelId: null, ...}
+    SW->>Gmail: tabs.update(url) — #all or scoped search
+    SW->>SP: labelResult {labelId: null, count: 0, coLabelCounts: {}}
+
+    Note over SP,Gmail: Cache Complete Re-query
+    CM->>SW: cacheState {phase: "complete"}
+    SW->>CM: queryLabel(lastLabelId, lastIncludeChildren, lastScope)
+    CM-->>SW: updated {labelId, count, coLabelCounts}
+    SW->>SP: labelResult (updated)
+    SW->>CM: getLabelCounts(scopeTimestamp)
+    CM-->>SW: counts
+    SW->>SP: countsReady {counts}
+
+    Note over SP,Gmail: Filters Off
+    SP->>SW: filtersOff
+    SW->>Gmail: tabs.update(url) — #inbox
+
+    Note over SP,Gmail: User Navigation
+    Gmail->>SW: tabs.onUpdated (hash change)
+    SW->>SP: userNavigated (if not extension-initiated)

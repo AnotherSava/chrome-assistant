@@ -10,7 +10,6 @@ const KEY_ACTIVE_LABEL_NAME = "ca_active_label_name";
 let activeLabelId: string | null = loadSetting(KEY_ACTIVE_LABEL, null as string | null);
 let activeLabelName: string | null = loadSetting(KEY_ACTIVE_LABEL_NAME, null as string | null);
 let onGmailPage = false;
-let pendingFilterApply = false;
 let currentAccountPath: string | null = null;
 
 // ---------------------------------------------------------------------------
@@ -252,8 +251,7 @@ function buildDisplayPanel(): void {
     includeChildren = childrenCheck.checked;
     saveSetting(KEY_INCLUDE_CHILDREN, includeChildren);
     if (activeLabelId) {
-      sendQueryLabel();
-      applyFilters();
+      sendSelectionChanged();
     } else {
       refreshLabelsIfVisible();
     }
@@ -330,16 +328,12 @@ function switchTab(tab: "summary" | "filters", skipNavigation: boolean = false):
   syncState();
   document.querySelectorAll<HTMLElement>(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   if (tab === "summary") {
-    if (!skipNavigation && returnToInbox && onGmailPage) resetGmailToInbox();
+    if (!skipNavigation && returnToInbox && onGmailPage) sendFiltersOff();
     showSummary();
   } else {
-    if (onGmailPage) {
-      pendingFilterApply = true;
-      if (cachedLabels) {
-        pendingFilterApply = false;
-        applyFilters();
-        renderFilteredLabels();
-      }
+    if (onGmailPage && cachedLabels) {
+      sendSelectionChanged();
+      renderFilteredLabels();
     }
     loadLabels(true);
   }
@@ -444,28 +438,6 @@ export function setShowImportant(value: boolean): void {
   if (showImportant) LABELS_HIDDEN.delete("IMPORTANT"); else LABELS_HIDDEN.add("IMPORTANT");
 }
 
-export function getDescendantIds(labelId: string, labels: GmailLabel[]): string[] {
-  const tree = buildLabelTree(labels);
-  function findNode(nodes: LabelTreeNode[]): LabelTreeNode | null {
-    for (const node of nodes) {
-      if (node.id === labelId) return node;
-      const found = findNode(node.children);
-      if (found) return found;
-    }
-    return null;
-  }
-  function collectIds(nodes: LabelTreeNode[]): string[] {
-    const ids: string[] = [];
-    for (const node of nodes) {
-      ids.push(node.id);
-      ids.push(...collectIds(node.children));
-    }
-    return ids;
-  }
-  const target = findNode(tree);
-  if (!target || target.children.length === 0) return [];
-  return collectIds(target.children);
-}
 
 function countNodes(node: LabelTreeNode): number {
   return 1 + node.children.reduce((sum, c) => sum + countNodes(c), 0);
@@ -573,11 +545,10 @@ function selectLabel(labelId: string | null): void {
   document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
   if (labelId) {
     document.querySelector<HTMLElement>(`.label-link[data-label-id="${labelId}"]`)?.classList.add("active");
-    sendQueryLabel();
   } else {
     renderFilteredLabels();
   }
-  applyFilters();
+  sendSelectionChanged();
 }
 
 function setupLabelHandlers(): void {
@@ -602,22 +573,9 @@ function syncState(): void {
   if (activePort) activePort.postMessage({ type: "syncState", returnToInbox, onFiltersTab: currentTab === "filters" });
 }
 
-function resetGmailToInbox(): void {
+function sendFiltersOff(): void {
   if (!activePort) return;
-  activePort.postMessage({ type: "applyFilters", labelName: "INBOX", scope: null });
-}
-
-function applyFilters(): void {
-  if (!activePort) return;
-  let labelName: string | string[] | null = activeLabelName;
-  if (activeLabelName && activeLabelId && includeChildren && cachedLabels) {
-    const descendants = getDescendantIds(activeLabelId, cachedLabels);
-    if (descendants.length > 0) {
-      const descendantNames = descendants.map(id => cachedLabels!.find(l => l.id === id)?.name).filter((n): n is string => n !== undefined);
-      labelName = [activeLabelName, ...descendantNames];
-    }
-  }
-  activePort.postMessage({ type: "applyFilters", labelName, scope: scopeToDate() });
+  activePort.postMessage({ type: "filtersOff" });
 }
 
 function renderFilterBar(): string {
@@ -630,8 +588,7 @@ function setupFilterBar(): void {
   scopeSelect?.addEventListener("change", () => {
     scopeValue = scopeSelect.value;
     saveSetting(KEY_SCOPE_VALUE, scopeValue);
-    sendQueryLabel();
-    applyFilters();
+    sendSelectionChanged();
     if (showCounts) requestCounts();
   });
 }
@@ -676,18 +633,13 @@ let fetchLabelsSeq = 0;
 /** Separate sequence number for fetchCounts requests */
 let fetchCountsSeq = 0;
 
-/** Send a queryLabel request to background for the currently selected label */
-function sendQueryLabel(): void {
-  if (!activePort || !activeLabelId) return;
+/** Send a selectionChanged message to background for the current selection state */
+function sendSelectionChanged(): void {
+  if (!activePort) return;
   lastQueryError = false;
   queryLabelSeq++;
   updateCacheProgress();
-  const labelIds = [activeLabelId];
-  if (includeChildren && cachedLabels) {
-    const descendants = getDescendantIds(activeLabelId, cachedLabels);
-    labelIds.push(...descendants);
-  }
-  activePort.postMessage({ type: "queryLabel", labelIds, labelId: activeLabelId, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
+  activePort.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -834,7 +786,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
-    if (wasOffGmail) pendingFilterApply = true;
     // Detect Gmail account changes and reset state to avoid cross-account contamination
     const accountChanged = message.accountPath !== undefined && currentAccountPath !== null && message.accountPath !== currentAccountPath;
     if (message.accountPath !== undefined) currentAccountPath = message.accountPath;
@@ -848,7 +799,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
       lastCacheProgress = null;
       saveSetting(KEY_ACTIVE_LABEL, null);
       saveSetting(KEY_ACTIVE_LABEL_NAME, null);
-      pendingFilterApply = true;
     }
     // Auto-dismiss help if it was shown because user was on a non-Gmail page
     if (isShowingHelp() && !wasOffGmail && !accountChanged) return;
@@ -877,18 +827,12 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
         saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
       }
     }
-    // Apply filters only on initial return to Gmail, not on every label refresh
-    if (pendingFilterApply && onGmailPage && currentTab === "filters") {
-      pendingFilterApply = false;
-      applyFilters();
-    }
     refreshLabelsIfVisible();
-    // If a label is selected, query its data from the cache
-    if (activeLabelId) sendQueryLabel();
+    // If a label is selected, send selection to background for query + navigation
+    if (activeLabelId) sendSelectionChanged();
     // Request counts separately (non-blocking)
     if (showCounts) requestCounts();
   } else if (message.type === "labelsError") {
-    pendingFilterApply = false;
     if (currentTab === "filters" && onGmailPage && !cachedLabels) {
       showContent('<div class="status">Loading labels...</div>');
       setTimeout(() => { if (!cachedLabels && onGmailPage) loadLabels(true); }, 3000);
@@ -911,11 +855,8 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     // Cache progress pushed from background
     lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, datesTotal: message.datesTotal ?? 0, datesDone: message.datesDone ?? 0, currentLabel: message.currentLabel };
     updateCacheProgress();
-    // Refresh counts during cache build and on completion
-    if (message.phase === "complete") {
-      if (activeLabelId) sendQueryLabel();
-      if (showCounts) requestCounts();
-    } else if (message.phase === "labels" && showCounts) {
+    // Refresh counts during cache build (completion re-query is handled by service worker)
+    if (message.phase === "labels" && showCounts) {
       requestCounts();
     }
   } else if (message.type === "labelResult" && message.labelId !== undefined) {

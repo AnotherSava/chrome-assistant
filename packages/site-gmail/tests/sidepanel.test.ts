@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -134,7 +134,7 @@ describe("handleMessage", () => {
     expect(content?.innerHTML).not.toContain("Archive");
   });
 
-  it("sends queryLabel when label is selected", () => {
+  it("sends selectionChanged when label is selected", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [{ id: "Label_X", name: "TestLabel", type: "user" }, { id: "Label_Y", name: "Other", type: "user" }] });
     vi.clearAllMocks();
@@ -143,9 +143,7 @@ describe("handleMessage", () => {
     const link = document.querySelector('[data-label-id="Label_X"]') as HTMLAnchorElement;
     link?.click();
 
-    // Both applyFilters and queryLabel should be sent
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "applyFilters" }));
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "queryLabel", labelId: "Label_X" }));
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "selectionChanged", labelId: "Label_X" }));
   });
 
   it("deselecting a label shows all labels", () => {
@@ -203,7 +201,7 @@ describe("handleMessage", () => {
     expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "fetchLabels" }));
   });
 
-  it("re-queries active label when cache completes", () => {
+  it("does not re-query from sidepanel when cache completes (service worker handles it)", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }] });
 
@@ -212,10 +210,11 @@ describe("handleMessage", () => {
     workLink?.click();
     vi.clearAllMocks();
 
-    // Cache completes — should trigger re-query
+    // Cache completes — sidepanel should NOT send selectionChanged (service worker re-queries internally)
     handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
 
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "queryLabel", labelId: "Label_1" }));
+    const selectionMessages = mockPostMessage.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).type === "selectionChanged");
+    expect(selectionMessages).toHaveLength(0);
   });
 
   it("handles labelsError gracefully when no labels cached", () => {
@@ -298,44 +297,7 @@ describe("scopeToTimestamp", () => {
   });
 });
 
-describe("getDescendantIds", () => {
-  it("returns all descendants for a nested label", () => {
-    const labels = [
-      { id: "L1", name: "Games", type: "user" },
-      { id: "L2", name: "Games/18xx", type: "user" },
-      { id: "L3", name: "Games/Chess", type: "user" },
-      { id: "L4", name: "Games/Chess/Online", type: "user" },
-      { id: "L5", name: "Work", type: "user" },
-    ];
-    const descendants = getDescendantIds("L1", labels);
-    expect(descendants).toContain("L2");
-    expect(descendants).toContain("L3");
-    expect(descendants).toContain("L4");
-    expect(descendants).not.toContain("L1");
-    expect(descendants).not.toContain("L5");
-  });
-
-  it("returns empty for leaf label", () => {
-    const labels = [
-      { id: "L1", name: "Games", type: "user" },
-      { id: "L2", name: "Games/18xx", type: "user" },
-      { id: "L3", name: "Work", type: "user" },
-    ];
-    const descendants = getDescendantIds("L2", labels);
-    expect(descendants).toEqual([]);
-  });
-
-  it("returns empty for label with no children in the tree", () => {
-    const labels = [
-      { id: "L1", name: "Work", type: "user" },
-      { id: "L2", name: "Personal", type: "user" },
-    ];
-    const descendants = getDescendantIds("L1", labels);
-    expect(descendants).toEqual([]);
-  });
-});
-
-describe("sendQueryLabel with include children", () => {
+describe("sendSelectionChanged with include children", () => {
   beforeEach(() => {
     setupDOM();
     vi.clearAllMocks();
@@ -345,7 +307,7 @@ describe("sendQueryLabel with include children", () => {
     setIncludeChildren(true);
   });
 
-  it("sends array with descendants when setting is on", () => {
+  it("sends selectionChanged with includeChildren true when setting is on", () => {
     // Default includeChildren is true (from loadSetting default)
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [
@@ -361,19 +323,13 @@ describe("sendQueryLabel with include children", () => {
     link?.click();
 
     expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "queryLabel",
-      labelIds: expect.arrayContaining(["L1", "L2", "L3"]),
+      type: "selectionChanged",
       labelId: "L1",
-    }));
-
-    // Also verify applyFilters message includes descendant label names
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "applyFilters",
-      labelName: expect.arrayContaining(["Games", "Games/18xx", "Games/Chess"]),
+      includeChildren: true,
     }));
   });
 
-  it("sends single-element array when setting is off", () => {
+  it("sends selectionChanged with includeChildren false when setting is off", () => {
     setIncludeChildren(false);
 
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
@@ -393,15 +349,9 @@ describe("sendQueryLabel with include children", () => {
     link?.click();
 
     expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "queryLabel",
-      labelIds: ["L1"],
+      type: "selectionChanged",
       labelId: "L1",
-    }));
-
-    // Verify applyFilters sends single label name (not array) when children disabled
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "applyFilters",
-      labelName: "Games",
+      includeChildren: false,
     }));
   });
 });
