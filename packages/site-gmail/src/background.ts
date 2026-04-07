@@ -338,7 +338,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       if (isGmail(tab.url)) {
         const account = gmailAccountPath(tab.url);
         updateGmailTab(tab.windowId, tabId, tab.url ?? null);
-        broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
+        // Skip resultsReady for extension-initiated navigation — sidepanel already has the correct state
+        const currentHash = urlHash(tab.url ?? "");
+        const lastHash = lastExtensionNavHash.get(tabId);
+        if (!lastHash || currentHash !== lastHash) {
+          broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
+        }
         startCacheIfNeeded(account);
       } else {
         updateGmailTab(tab.windowId, null, null);

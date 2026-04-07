@@ -273,14 +273,7 @@ function buildDisplayPanel(): void {
   starredCheck.addEventListener("change", () => {
     setShowStarred(starredCheck.checked);
     saveSetting(KEY_SHOW_STARRED, showStarred);
-    if (!showStarred && activeLabelId === "STARRED") {
-      activeLabelId = null;
-      activeLabelName = null;
-      lastLabelResult = null;
-      saveSetting(KEY_ACTIVE_LABEL, null);
-      saveSetting(KEY_ACTIVE_LABEL_NAME, null);
-      applyFilters();
-    }
+    if (!showStarred && activeLabelId === "STARRED") selectLabel(null);
     refreshLabelsIfVisible();
     if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
   });
@@ -288,14 +281,7 @@ function buildDisplayPanel(): void {
   importantCheck.addEventListener("change", () => {
     setShowImportant(importantCheck.checked);
     saveSetting(KEY_SHOW_IMPORTANT, showImportant);
-    if (!showImportant && activeLabelId === "IMPORTANT") {
-      activeLabelId = null;
-      activeLabelName = null;
-      lastLabelResult = null;
-      saveSetting(KEY_ACTIVE_LABEL, null);
-      saveSetting(KEY_ACTIVE_LABEL_NAME, null);
-      applyFilters();
-    }
+    if (!showImportant && activeLabelId === "IMPORTANT") selectLabel(null);
     refreshLabelsIfVisible();
     if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
   });
@@ -576,31 +562,31 @@ function renderLabelTree(nodes: LabelTreeNode[]): string {
   return items;
 }
 
+/** Change the selected label. Pass null to deselect. */
+function selectLabel(labelId: string | null): void {
+  activeLabelId = labelId;
+  activeLabelName = labelId ? (cachedLabels?.find(l => l.id === labelId)?.name ?? null) : null;
+  saveSetting(KEY_ACTIVE_LABEL, activeLabelId);
+  saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
+  lastLabelResult = null;
+
+  document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
+  if (labelId) {
+    document.querySelector<HTMLElement>(`.label-link[data-label-id="${labelId}"]`)?.classList.add("active");
+    sendQueryLabel();
+  } else {
+    renderFilteredLabels();
+  }
+  applyFilters();
+}
+
 function setupLabelHandlers(): void {
   document.querySelectorAll<HTMLAnchorElement>(".label-link").forEach((link) => {
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const labelId = link.dataset.labelId;
       if (!labelId) return;
-      document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
-      if (activeLabelId === labelId) {
-        activeLabelId = null;
-        activeLabelName = null;
-        saveSetting(KEY_ACTIVE_LABEL, null);
-        saveSetting(KEY_ACTIVE_LABEL_NAME, null);
-        // No label selected — show all labels, clear query result
-        lastLabelResult = null;
-        renderFilteredLabels();
-        applyFilters();
-      } else {
-        activeLabelId = labelId;
-        activeLabelName = link.dataset.labelName ?? null;
-        saveSetting(KEY_ACTIVE_LABEL, labelId);
-        saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
-        link.classList.add("active");
-        sendQueryLabel();
-        applyFilters();
-      }
+      selectLabel(activeLabelId === labelId ? null : labelId);
     });
   });
 }
@@ -876,7 +862,8 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     // Ignore stale responses from earlier fetchLabels requests (avoids race on account switches)
     if (message.seq !== undefined && message.seq !== fetchLabelsSeq) return;
     cachedLabels = message.labels;
-    labelCounts = showCounts ? (message.counts ?? null) : null;
+    if (message.counts) labelCounts = message.counts;
+    else if (!showCounts) labelCounts = null;
     // Validate and refresh saved label against the current account's labels
     if (activeLabelId !== null) {
       const matchedLabel = cachedLabels.find((l) => l.id === activeLabelId);
