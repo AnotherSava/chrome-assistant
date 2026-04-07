@@ -438,7 +438,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         // Skip resultsReady for extension-initiated navigation — sidepanel already has the correct state
         const currentHash = urlHash(tab.url ?? "");
         const lastHash = lastExtensionNavHash.get(tabId);
-        if (!lastHash || currentHash !== lastHash) {
+        if (!lastHash || (currentHash !== lastHash && !currentHash.startsWith(lastHash + "/"))) {
           broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
         }
         startCacheIfNeeded(account);
