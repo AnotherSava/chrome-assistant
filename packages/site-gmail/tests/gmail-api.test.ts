@@ -2,65 +2,83 @@ import { describe, it, expect } from "vitest";
 import { buildSearchQuery, parallelMap, formatLabelForQuery, buildBatchRequestBody, parseBatchResponse } from "../src/gmail-api.js";
 
 describe("buildSearchQuery", () => {
-  it("returns empty string for all-mail with no filters", () => {
-    expect(buildSearchQuery("all", null, null)).toBe("");
+  it("returns empty string with no filters", () => {
+    expect(buildSearchQuery(null, null)).toBe("");
   });
 
-  it("adds in:inbox by default", () => {
-    expect(buildSearchQuery(undefined, null, null)).toBe("in:inbox");
-  });
-
-  it("adds in:location for non-all locations", () => {
-    expect(buildSearchQuery("sent", null, null)).toBe("in:sent");
-  });
-
-  it("adds label filter with name escaping", () => {
-    expect(buildSearchQuery("all", "Work/Projects", null)).toBe('label:"work-projects"');
+  it("adds label filter with name escaping for user labels", () => {
+    expect(buildSearchQuery("Work/Projects", null)).toBe('label:"work-projects"');
   });
 
   it("escapes quotes in label names", () => {
-    expect(buildSearchQuery("all", 'My "Label"', null)).toBe('label:"my-label"');
+    expect(buildSearchQuery('My "Label"', null)).toBe('label:"my-label"');
   });
 
   it("converts spaces to dashes in labels", () => {
-    expect(buildSearchQuery("all", "My Label", null)).toBe('label:"my-label"');
+    expect(buildSearchQuery("My Label", null)).toBe('label:"my-label"');
+  });
+
+  it("uses in:inbox for INBOX system label", () => {
+    expect(buildSearchQuery("INBOX", null)).toBe("in:inbox");
+  });
+
+  it("uses in:sent for SENT system label", () => {
+    expect(buildSearchQuery("SENT", null)).toBe("in:sent");
+  });
+
+  it("uses in:starred for STARRED system label", () => {
+    expect(buildSearchQuery("STARRED", null)).toBe("in:starred");
+  });
+
+  it("uses in:important for IMPORTANT system label", () => {
+    expect(buildSearchQuery("IMPORTANT", null)).toBe("in:important");
   });
 
   it("adds after:scope when provided", () => {
-    expect(buildSearchQuery("inbox", null, "2024/01/01")).toBe("in:inbox after:2024/01/01");
+    expect(buildSearchQuery("INBOX", "2024/01/01")).toBe("in:inbox after:2024/01/01");
   });
 
   it("adds before:date when provided", () => {
-    expect(buildSearchQuery("inbox", null, null, "2024/06/01")).toBe("in:inbox before:2024/06/01");
+    expect(buildSearchQuery(null, null, "2024/06/01")).toBe("before:2024/06/01");
   });
 
-  it("combines all parts", () => {
-    const result = buildSearchQuery("inbox", "Work", "2024/01/01", "2024/06/01");
-    expect(result).toBe('label:"work" in:inbox after:2024/01/01 before:2024/06/01');
+  it("combines label, scope, and beforeDate", () => {
+    const result = buildSearchQuery("Work", "2024/01/01", "2024/06/01");
+    expect(result).toBe('label:"work" after:2024/01/01 before:2024/06/01');
   });
 
   it("omits beforeDate when null", () => {
-    const result = buildSearchQuery("inbox", "Work", "2024/01/01", null);
-    expect(result).toBe('label:"work" in:inbox after:2024/01/01');
+    const result = buildSearchQuery("Work", "2024/01/01", null);
+    expect(result).toBe('label:"work" after:2024/01/01');
   });
 
   it("omits scope when null", () => {
-    const result = buildSearchQuery("sent", "Reports", null);
-    expect(result).toBe('label:"reports" in:sent');
+    const result = buildSearchQuery("Reports", null);
+    expect(result).toBe('label:"reports"');
   });
 
   it("produces single label format for single-element array", () => {
-    expect(buildSearchQuery("inbox", ["Work"], null)).toBe('label:"work" in:inbox');
+    expect(buildSearchQuery(["Work"], null)).toBe('label:"work"');
   });
 
   it("produces OR-grouped format for multiple labels", () => {
-    const result = buildSearchQuery("all", ["Games", "Games/18xx", "Games/Chess"], null);
+    const result = buildSearchQuery(["Games", "Games/18xx", "Games/Chess"], null);
     expect(result).toBe('{label:"games" OR label:"games-18xx" OR label:"games-chess"}');
   });
 
-  it("combines multiple labels with location and scope", () => {
-    const result = buildSearchQuery("inbox", ["Work", "Work/Projects"], "2024/01/01", "2024/06/01");
-    expect(result).toBe('{label:"work" OR label:"work-projects"} in:inbox after:2024/01/01 before:2024/06/01');
+  it("combines multiple labels with scope and beforeDate", () => {
+    const result = buildSearchQuery(["Work", "Work/Projects"], "2024/01/01", "2024/06/01");
+    expect(result).toBe('{label:"work" OR label:"work-projects"} after:2024/01/01 before:2024/06/01');
+  });
+
+  it("mixes system and user labels in OR group", () => {
+    const result = buildSearchQuery(["INBOX", "Work"], null);
+    expect(result).toBe('{in:inbox OR label:"work"}');
+  });
+
+  it("system label with scope produces in: with after:", () => {
+    const result = buildSearchQuery("SENT", "2024/01/01");
+    expect(result).toBe("in:sent after:2024/01/01");
   });
 });
 

@@ -28,6 +28,7 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
+    "@esbuild/linux-x64": "^0.28.0",
     "@rollup/rollup-linux-x64-musl": "^4.60.1",
     "@rollup/rollup-win32-x64-msvc": "^4.60.1"
   }

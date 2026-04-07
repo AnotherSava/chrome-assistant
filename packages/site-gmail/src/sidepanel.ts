@@ -2,7 +2,6 @@ import { renderHelp } from "./help.js";
 import { escapeHtml, ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSetting, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
-import { buildSearchQuery } from "./gmail-api.js";
 interface LabelTreeNode { name: string; fullName: string; id: string; children: LabelTreeNode[] }
 
 let currentTab: "summary" | "filters" = "filters";
@@ -198,22 +197,18 @@ document.addEventListener("mouseup", (e: MouseEvent) => {
 
 const KEY_LABEL_COLUMNS = "ca_label_columns";
 const KEY_SCOPE_VALUE = "ca_scope_value";
-const KEY_LOCATION = "ca_location";
 const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
 const KEY_INCLUDE_CHILDREN = "ca_include_children";
 const KEY_SHOW_COUNTS = "ca_show_counts";
+const KEY_SHOW_STARRED = "ca_show_starred";
+const KEY_SHOW_IMPORTANT = "ca_show_important";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
-let locationValue: string = loadSetting(KEY_LOCATION, "inbox");
 let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
 let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
 let showCounts: boolean = loadSetting(KEY_SHOW_COUNTS, true);
-
-const LOCATION_OPTIONS: { value: string; label: string }[] = [
-  { value: "inbox", label: "Inbox" },
-  { value: "sent", label: "Sent" },
-  { value: "all", label: "All" },
-];
+let showStarred: boolean = loadSetting(KEY_SHOW_STARRED, false);
+let showImportant: boolean = loadSetting(KEY_SHOW_IMPORTANT, false);
 
 let displayPanelOpen = false;
 
@@ -239,7 +234,7 @@ function buildDisplayPanel(): void {
   const panel = document.getElementById("display-panel");
   if (!panel) return;
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === labelColumns ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     labelColumns = parseInt(colSelect.value, 10);
@@ -273,6 +268,36 @@ function buildDisplayPanel(): void {
       labelCounts = null;
       refreshLabelsIfVisible();
     }
+  });
+  const starredCheck = document.getElementById("show-starred-check") as HTMLInputElement;
+  starredCheck.addEventListener("change", () => {
+    setShowStarred(starredCheck.checked);
+    saveSetting(KEY_SHOW_STARRED, showStarred);
+    if (!showStarred && activeLabelId === "STARRED") {
+      activeLabelId = null;
+      activeLabelName = null;
+      lastLabelResult = null;
+      saveSetting(KEY_ACTIVE_LABEL, null);
+      saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+      applyFilters();
+    }
+    refreshLabelsIfVisible();
+    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
+  });
+  const importantCheck = document.getElementById("show-important-check") as HTMLInputElement;
+  importantCheck.addEventListener("change", () => {
+    setShowImportant(importantCheck.checked);
+    saveSetting(KEY_SHOW_IMPORTANT, showImportant);
+    if (!showImportant && activeLabelId === "IMPORTANT") {
+      activeLabelId = null;
+      activeLabelName = null;
+      lastLabelResult = null;
+      saveSetting(KEY_ACTIVE_LABEL, null);
+      saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+      applyFilters();
+    }
+    refreshLabelsIfVisible();
+    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
   });
 }
 
@@ -351,11 +376,26 @@ function showContent(html: string): void {
 // Labels / Tags
 // ---------------------------------------------------------------------------
 
-const LABELS_HIDDEN = new Set(["INBOX", "SENT", "STARRED", "CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
+const LABELS_HIDDEN = new Set(["CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
+
+/** System labels shown in fixed order before user labels */
+const SYSTEM_LABEL_ORDER = ["INBOX", "SENT", "STARRED", "IMPORTANT"];
+
+// Apply initial hidden state for conditional system labels
+if (!showStarred) LABELS_HIDDEN.add("STARRED");
+if (!showImportant) LABELS_HIDDEN.add("IMPORTANT");
 
 function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
   const visible = labels.filter((l) => !LABELS_HIDDEN.has(l.id) && !LABELS_HIDDEN.has(l.name));
   visible.sort((a, b) => {
+    const aSystem = SYSTEM_LABEL_ORDER.indexOf(a.id);
+    const bSystem = SYSTEM_LABEL_ORDER.indexOf(b.id);
+    // Both are system labels in our fixed order — sort by that order
+    if (aSystem !== -1 && bSystem !== -1) return aSystem - bSystem;
+    // System labels in fixed order come first
+    if (aSystem !== -1) return -1;
+    if (bSystem !== -1) return 1;
+    // Other system labels before user labels
     if (a.type !== b.type) return a.type === "system" ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
@@ -406,6 +446,16 @@ export function setIncludeChildren(value: boolean): void {
 
 export function setShowCounts(value: boolean): void {
   showCounts = value;
+}
+
+export function setShowStarred(value: boolean): void {
+  showStarred = value;
+  if (showStarred) LABELS_HIDDEN.delete("STARRED"); else LABELS_HIDDEN.add("STARRED");
+}
+
+export function setShowImportant(value: boolean): void {
+  showImportant = value;
+  if (showImportant) LABELS_HIDDEN.delete("IMPORTANT"); else LABELS_HIDDEN.add("IMPORTANT");
 }
 
 export function getDescendantIds(labelId: string, labels: GmailLabel[]): string[] {
@@ -509,7 +559,7 @@ function requestCounts(): void {
   countsInFlight = true;
   countsPending = false;
   fetchCountsSeq++;
-  activePort.postMessage({ type: "fetchCounts", location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: fetchCountsSeq });
+  activePort.postMessage({ type: "fetchCounts", scopeTimestamp: scopeToTimestamp(scopeValue), seq: fetchCountsSeq });
 }
 
 function renderLabelTree(nodes: LabelTreeNode[]): string {
@@ -568,7 +618,7 @@ function syncState(): void {
 
 function resetGmailToInbox(): void {
   if (!activePort) return;
-  activePort.postMessage({ type: "applyFilters", location: "inbox", labelName: null, scope: null });
+  activePort.postMessage({ type: "applyFilters", labelName: "INBOX", scope: null });
 }
 
 function applyFilters(): void {
@@ -581,24 +631,15 @@ function applyFilters(): void {
       labelName = [activeLabelName, ...descendantNames];
     }
   }
-  activePort.postMessage({ type: "applyFilters", location: locationValue, labelName, scope: scopeToDate() });
+  activePort.postMessage({ type: "applyFilters", labelName, scope: scopeToDate() });
 }
 
 function renderFilterBar(): string {
-  const locOptions = LOCATION_OPTIONS.map((o) => `<option value="${o.value}"${o.value === locationValue ? " selected" : ""}>${o.label}</option>`).join("");
   const scopeOptions = SCOPE_OPTIONS.map((o) => `<option value="${o.value}"${o.value === scopeValue ? " selected" : ""}>${o.label}</option>`).join("");
-  return `<div class="filter-bar"><span class="filter-item"><label>Location:</label><select id="location-select">${locOptions}</select></span><span class="filter-break"></span><span class="filter-item"><label>Scope from:</label><select id="scope-select">${scopeOptions}</select></span><span class="filter-break"></span><div id="cache-progress" class="cache-progress"></div></div>`;
+  return `<div class="filter-bar"><span class="filter-item"><label>Scope from:</label><select id="scope-select">${scopeOptions}</select></span><span class="filter-break"></span><div id="cache-progress" class="cache-progress"></div></div>`;
 }
 
 function setupFilterBar(): void {
-  const locSelect = document.getElementById("location-select") as HTMLSelectElement | null;
-  locSelect?.addEventListener("change", () => {
-    locationValue = locSelect.value;
-    saveSetting(KEY_LOCATION, locationValue);
-    sendQueryLabel();
-    applyFilters();
-    if (showCounts) requestCounts();
-  });
   const scopeSelect = document.getElementById("scope-select") as HTMLSelectElement | null;
   scopeSelect?.addEventListener("change", () => {
     scopeValue = scopeSelect.value;
@@ -660,7 +701,7 @@ function sendQueryLabel(): void {
     const descendants = getDescendantIds(activeLabelId, cachedLabels);
     labelIds.push(...descendants);
   }
-  activePort.postMessage({ type: "queryLabel", labelIds, labelId: activeLabelId, location: locationValue, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
+  activePort.postMessage({ type: "queryLabel", labelIds, labelId: activeLabelId, scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -839,7 +880,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     // Validate and refresh saved label against the current account's labels
     if (activeLabelId !== null) {
       const matchedLabel = cachedLabels.find((l) => l.id === activeLabelId);
-      if (!matchedLabel) {
+      if (!matchedLabel || LABELS_HIDDEN.has(activeLabelId)) {
         activeLabelId = null;
         activeLabelName = null;
         saveSetting(KEY_ACTIVE_LABEL, null);
@@ -923,7 +964,7 @@ if (chrome.runtime?.connect) {
       activePort = port;
       reconnectDelay = 1000;
       port.onMessage.addListener(handleMessage);
-      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); syncState(); });
+      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant }); syncState(); });
       port.onDisconnect.addListener(() => {
         activePort = null;
         if (!chrome.runtime?.id) return;

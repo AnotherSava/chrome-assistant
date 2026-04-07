@@ -2,8 +2,8 @@ import type { CacheMessage, GmailLabel } from "@core/types.js";
 import * as db from "./cache-db.js";
 import { fetchLabels, fetchLabelMessageIds, batchFetchDates } from "./gmail-api.js";
 
-/** System labels to query during Phase 1 label fetch — only INBOX and SENT are needed for location filtering */
-const SYSTEM_LABELS_TO_QUERY = ["INBOX", "SENT"];
+/** System labels always cached */
+const BASE_SYSTEM_LABELS = ["INBOX", "SENT"];
 
 export interface CacheProgress {
   phase: "labels" | "dates" | "complete";
@@ -38,9 +38,20 @@ export class CacheManager {
   /** Resolves when a priority label finishes; main loop awaits this between iterations. */
   private priorityBarrier: Promise<void> | null = null;
   private priorityResolve: (() => void) | null = null;
+  /** Resolves once account setup and label fetch are complete — safe to call prioritizeLabel after. */
+  private initReady: Promise<void> = Promise.resolve();
+  private resolveInitReady: (() => void) | null = null;
+  showStarred = false;
+  showImportant = false;
 
   setProgressCallback(callback: ProgressCallback): void {
     this.onProgress = callback;
+  }
+
+  /** Update which optional system labels are included in cache queries. */
+  updateSystemLabelSettings(showStarred: boolean, showImportant: boolean): void {
+    this.showStarred = showStarred;
+    this.showImportant = showImportant;
   }
 
   abort(): void {
@@ -52,13 +63,41 @@ export class CacheManager {
     return this.aborted || generation !== this.fetchGeneration;
   }
 
+  /** Returns a promise that resolves once account setup and label fetch are complete. Safe to call prioritizeLabel after this resolves. */
+  whenReady(): Promise<void> {
+    return this.initReady;
+  }
+
+  /** Create a pending readiness gate. Must be called synchronously before any async work
+   *  so that whenReady() callers block until startFetch resolves initReady. */
+  resetReady(): void {
+    this.initReady = new Promise(resolve => { this.resolveInitReady = resolve; });
+  }
+
+  /** Resolve the readiness gate without running startFetch (e.g. when cache is already fresh). */
+  resolveReady(): void {
+    if (this.resolveInitReady) { this.resolveInitReady(); this.resolveInitReady = null; }
+  }
+
+  /** Populate the in-memory labels list without running a full fetch (e.g. after service worker restart with fresh cache). */
+  async loadLabels(): Promise<void> {
+    this.labels = await fetchLabels();
+  }
+
   /** Start the full cache population: Phase 1 (labels) then Phase 2 (dates). */
   async startFetch(accountPath: string): Promise<void> {
     this.aborted = true;
+    // Increment generation BEFORE awaiting the old fetch so the old fetch's finally block
+    // sees a stale generation and does not resolve the new readiness gate.
+    const generation = ++this.fetchGeneration;
     if (this.activeFetch) await this.activeFetch.catch(() => {});
     this.aborted = false;
     this.processedLabels.clear();
-    const generation = ++this.fetchGeneration;
+    // Reuse the pending readiness gate if resetReady() was already called (e.g. by startCacheIfNeeded),
+    // so callers who captured whenReady() before startFetch runs aren't left waiting on an orphaned promise.
+    if (!this.resolveInitReady) {
+      this.initReady = new Promise(resolve => { this.resolveInitReady = resolve; });
+    }
     const fetchPromise = this.runFetch(accountPath, generation);
     this.activeFetch = fetchPromise;
     try {
@@ -69,13 +108,20 @@ export class CacheManager {
   }
 
   private async runFetch(accountPath: string, generation: number): Promise<void> {
-    const storedAccount = await db.getMeta<string>("account");
-    if (storedAccount && storedAccount !== accountPath) {
-      await db.clearAll();
-    }
-    await db.setMeta("account", accountPath);
+    try {
+      const storedAccount = await db.getMeta<string>("account");
+      if (storedAccount && storedAccount !== accountPath) {
+        await db.clearAll();
+      }
+      await db.setMeta("account", accountPath);
 
-    this.labels = await fetchLabels();
+      this.labels = await fetchLabels();
+    } finally {
+      // Only resolve the readiness gate if this fetch is still the current one;
+      // otherwise a newer resetReady() has replaced the resolver and should be
+      // resolved by its own fetch to avoid unblocking callers prematurely.
+      if (generation === this.fetchGeneration && this.resolveInitReady) { this.resolveInitReady(); this.resolveInitReady = null; }
+    }
 
     const labelsToQuery = this.buildLabelQueryList();
     const labelsTotal = labelsToQuery.length;
@@ -151,11 +197,11 @@ export class CacheManager {
   }
 
 
-  /** Get own and inclusive counts for all known labels, filtered by location/scope. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). */
-  async getLabelCounts(location: string | undefined, scopeTimestamp: number | null, labelsOverride?: GmailLabel[]): Promise<Record<string, { own: number; inclusive: number }>> {
+  /** Get own and inclusive counts for all known labels, filtered by scope. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). */
+  async getLabelCounts(scopeTimestamp: number | null, labelsOverride?: GmailLabel[]): Promise<Record<string, { own: number; inclusive: number }>> {
     const labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
     const allLabelIds = labels.map(l => l.id);
-    const ownCounts = await db.getFilteredLabelCounts(allLabelIds, location, scopeTimestamp);
+    const ownCounts = await db.getFilteredLabelCounts(allLabelIds, scopeTimestamp);
 
     const result: Record<string, { own: number; inclusive: number }> = {};
 
@@ -195,11 +241,9 @@ export class CacheManager {
         continue;
       }
 
-      const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
       const msgMap = await db.getMessagesBatch(allMsgIds);
       let inclusive = 0;
       for (const msg of msgMap.values()) {
-        if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         if (scopeTimestamp !== null && (!msg.internalDate || msg.internalDate < scopeTimestamp)) continue;
         inclusive++;
       }
@@ -211,7 +255,7 @@ export class CacheManager {
   }
 
   /** Query the cache for a label's message count and co-occurring labels. Accepts multiple label IDs and unions their messages. */
-  async queryLabel(labelIds: string[], location: string | undefined, scopeTimestamp: number | null): Promise<LabelQueryResult> {
+  async queryLabel(labelIds: string[], scopeTimestamp: number | null): Promise<LabelQueryResult> {
     const primaryId = labelIds[0];
     const seen = new Set<string>();
     let messages: CacheMessage[] = [];
@@ -237,17 +281,12 @@ export class CacheManager {
       }
     }
 
-    const locationLabelId = location === "inbox" ? "INBOX" : location === "sent" ? "SENT" : null;
-    if (locationLabelId) {
-      messages = messages.filter(m => m.labelIds.includes(locationLabelId));
-    }
-
     if (scopeTimestamp !== null) {
       const allHaveDates = messages.every(m => !!m.internalDate);
       if (allHaveDates) {
         messages = messages.filter(m => m.internalDate! >= scopeTimestamp);
       } else {
-        return this.scopeFallback(labelIds, locationLabelId, scopeTimestamp);
+        return this.scopeFallback(labelIds, scopeTimestamp);
       }
     }
 
@@ -261,8 +300,21 @@ export class CacheManager {
     return { labelId: primaryId, count: messages.length, coLabelCounts };
   }
 
+  /** Mark a label as processed — prevents duplicate fetches via prioritizeLabel.
+   *  Used by the skip path to register labels whose indexes already exist in IndexedDB. */
+  markProcessed(labelId: string): void {
+    this.processedLabels.add(labelId);
+  }
+
   /** Pause the main cache loop, process a single label, then resume. */
-  private async prioritizeLabel(labelId: string): Promise<void> {
+  async prioritizeLabel(labelId: string): Promise<void> {
+    // Skip if this label was already fetched (avoids duplicate API calls when
+    // both the skip path and syncSettings race to prioritize the same label).
+    if (this.processedLabels.has(labelId)) return;
+    // Wait for any in-flight priority operation before starting a new one
+    while (this.priorityBarrier) await this.priorityBarrier;
+    // Re-check after waiting — the in-flight operation may have processed this label.
+    if (this.processedLabels.has(labelId)) return;
     this.priorityBarrier = new Promise(resolve => { this.priorityResolve = resolve; });
     try {
       const messageIds = await fetchLabelMessageIds(labelId);
@@ -277,7 +329,7 @@ export class CacheManager {
   }
 
   /** Scope fallback: use API to get scoped message IDs for all label IDs, cross-reference with IndexedDB for co-labels. */
-  private async scopeFallback(labelIds: string[], locationLabelId: string | null, scopeTimestamp: number): Promise<LabelQueryResult> {
+  private async scopeFallback(labelIds: string[], scopeTimestamp: number): Promise<LabelQueryResult> {
     const primaryId = labelIds[0];
     const dateStr = this.timestampToDateString(scopeTimestamp);
     const seenIds = new Set<string>();
@@ -300,12 +352,11 @@ export class CacheManager {
     for (const msgId of allScopedIds) {
       const msg = msgMap.get(msgId);
       if (msg) {
-        if (locationLabelId && !msg.labelIds.includes(locationLabelId)) continue;
         count++;
         for (const lid of msg.labelIds) {
           if (lid !== primaryId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
         }
-      } else if (!locationLabelId) {
+      } else {
         count++;
       }
     }
@@ -319,12 +370,15 @@ export class CacheManager {
   }
 
   /** Build the list of labels to query. Sorted alphabetically with sub-labels before parents so inclusive counts are ready when the parent is processed. */
-  private buildLabelQueryList(): GmailLabel[] {
+  buildLabelQueryList(): GmailLabel[] {
     const addedIds = new Set<string>();
     const result: GmailLabel[] = [];
 
-    // System labels first (needed for location filtering)
-    for (const sysId of SYSTEM_LABELS_TO_QUERY) {
+    // System labels first — always INBOX/SENT, conditionally STARRED/IMPORTANT
+    const systemIds = [...BASE_SYSTEM_LABELS];
+    if (this.showStarred) systemIds.push("STARRED");
+    if (this.showImportant) systemIds.push("IMPORTANT");
+    for (const sysId of systemIds) {
       const label = this.labels.find(l => l.id === sysId);
       if (label && !addedIds.has(label.id)) {
         result.push(label);

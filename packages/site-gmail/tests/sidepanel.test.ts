@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren, setShowCounts } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, getDescendantIds, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -145,7 +145,7 @@ describe("handleMessage", () => {
 
     // Both applyFilters and queryLabel should be sent
     expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "applyFilters" }));
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "queryLabel", labelId: "Label_X", location: "inbox" }));
+    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "queryLabel", labelId: "Label_X" }));
   });
 
   it("deselecting a label shows all labels", () => {
@@ -498,5 +498,81 @@ describe("label counts rendering", () => {
     handleMessage({ type: "countsReady", counts: { Label_1: { own: 42, inclusive: 42 }, Label_2: { own: 7, inclusive: 7 } } });
     const countSpans = document.querySelectorAll(".label-count");
     expect(countSpans.length).toBe(2);
+  });
+});
+
+describe("system labels in label tree", () => {
+  beforeEach(() => {
+    setupDOM();
+    vi.clearAllMocks();
+    setShowStarred(false);
+    setShowImportant(false);
+  });
+
+  afterEach(() => {
+    setShowStarred(false);
+    setShowImportant(false);
+  });
+
+  it("system labels appear before user labels when visible", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "Label_2", name: "Personal", type: "user" },
+      { id: "SENT", name: "SENT", type: "system" },
+    ];
+    handleMessage({ type: "labelsReady", labels });
+
+    const content = document.getElementById("content");
+    const links = content?.querySelectorAll(".label-link");
+    expect(links?.length).toBe(4);
+    // System labels should appear first in fixed order: INBOX, SENT
+    expect(links?.[0]?.getAttribute("data-label-id")).toBe("INBOX");
+    expect(links?.[1]?.getAttribute("data-label-id")).toBe("SENT");
+    // Then user labels alphabetically: Personal, Work
+    expect(links?.[2]?.getAttribute("data-label-id")).toBe("Label_2");
+    expect(links?.[3]?.getAttribute("data-label-id")).toBe("Label_1");
+  });
+
+  it("STARRED and IMPORTANT hidden when settings are off", () => {
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "STARRED", name: "STARRED", type: "system" },
+      { id: "IMPORTANT", name: "IMPORTANT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+    ];
+    handleMessage({ type: "labelsReady", labels });
+
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    expect(labelIds).toContain("INBOX");
+    expect(labelIds).toContain("SENT");
+    expect(labelIds).not.toContain("STARRED");
+    expect(labelIds).not.toContain("IMPORTANT");
+    expect(labelIds).toContain("Label_1");
+  });
+
+  it("STARRED and IMPORTANT visible when settings are on and co-label rules allow", () => {
+    setShowStarred(true);
+    setShowImportant(true);
+
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "STARRED", name: "STARRED", type: "system" },
+      { id: "IMPORTANT", name: "IMPORTANT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+    ];
+    handleMessage({ type: "labelsReady", labels });
+
+    const content = document.getElementById("content");
+    const links = content?.querySelectorAll(".label-link");
+    const labelIds = Array.from(links ?? []).map((l) => l.getAttribute("data-label-id"));
+    // All system labels visible in fixed order
+    expect(labelIds).toEqual(["INBOX", "SENT", "STARRED", "IMPORTANT", "Label_1"]);
   });
 });

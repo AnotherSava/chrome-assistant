@@ -58,12 +58,74 @@ export async function startCacheIfNeeded(accountPath: string): Promise<void> {
   if (cacheStarted && currentAccountPath === accountPath) return;
   currentAccountPath = accountPath;
   cacheStarted = true;
-  // Check if cache was recently completed — skip if within refresh interval
-  const fetchState = await getMeta<{ phase: string; lastFetchTimestamp: number | null }>("fetchState");
-  if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) {
-    // Verify label indexes exist — cache might predate the index feature
-    const hasIndex = await getMeta<string[]>("labelIdx:INBOX");
-    if (hasIndex) return;
+  // Create the readiness gate synchronously before any awaits so that syncSettings
+  // callers block on whenReady() even during the metadata check below.
+  cacheManager.resetReady();
+  // Check if cache was recently completed — skip if within refresh interval.
+  // Wrapped in try-catch so a preflight failure resolves the readiness gate and resets cacheStarted
+  // instead of leaving the worker wedged (gate pending, cacheStarted true, future starts short-circuit).
+  let skipFetch = false;
+  try {
+    // Only consider skipping if the cached data belongs to the same account;
+    // otherwise startFetch must run to clear stale data and set the new account.
+    const storedAccount = await getMeta<string>("account");
+    if (storedAccount === accountPath) {
+      const fetchState = await getMeta<{ phase: string; lastFetchTimestamp: number | null }>("fetchState");
+      if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) {
+        // Verify label indexes exist — cache might predate the index feature
+        const hasIndex = await getMeta<string[]>("labelIdx:INBOX");
+        if (hasIndex) { skipFetch = true; }
+      }
+    }
+  } catch (err) {
+    console.warn("Cache preflight check failed:", err);
+    cacheManager.resolveReady();
+    cacheStarted = false;
+    return;
+  }
+  if (skipFetch) {
+    // Populate in-memory labels so getLabelCounts works after service worker restart.
+    // If loadLabels fails (e.g. transient auth/network error), reset cacheStarted so
+    // the next call retries instead of short-circuiting with empty labels.
+    try {
+      await cacheManager.loadLabels();
+    } catch {
+      cacheManager.resolveReady();
+      cacheStarted = false;
+      return;
+    }
+    // Mark existing system label indexes as processed BEFORE resolveReady so that
+    // syncSettings callers unblocked by whenReady() see them and skip prioritizeLabel.
+    // Also collect missing labels for backfill after resolveReady.
+    const missingLabels: string[] = [];
+    try {
+      for (const [labelId, enabled] of [["STARRED", cacheManager.showStarred], ["IMPORTANT", cacheManager.showImportant]] as const) {
+        if (!enabled) continue;
+        if (await getMeta<string[]>(`labelIdx:${labelId}`)) { cacheManager.markProcessed(labelId); } else { missingLabels.push(labelId); }
+      }
+    } catch {
+      cacheManager.resolveReady();
+      cacheStarted = false;
+      return;
+    }
+    cacheManager.resolveReady();
+    // Fetch missing system label indexes — the cache may predate the user enabling these labels.
+    // This runs after resolveReady so syncSettings callers are unblocked.
+    let backfillFailed = false;
+    for (const labelId of missingLabels) {
+      await cacheManager.prioritizeLabel(labelId).catch(() => { backfillFailed = true; });
+    }
+    // If backfill failed, reset cacheStarted so the next startCacheIfNeeded retries
+    // instead of leaving the label uncached for the worker's lifetime.
+    if (backfillFailed) {
+      cacheStarted = false;
+    }
+    if (missingLabels.length > 0 && !backfillFailed) {
+      for (const [port] of portState) {
+        try { port.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0, datesTotal: 0, datesDone: 0 }); } catch { /* port may be dead */ }
+      }
+    }
+    return;
   }
   const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
@@ -156,7 +218,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | string[] | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; location?: string; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number }) => {
+  port.onMessage.addListener((message: { type: string; mode?: string; labelName?: string | string[] | null; labelId?: string; labelIds?: string[]; scope?: string | null; scopeTimestamp?: number | null; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; query?: string; pageToken?: string; fetchId?: string; seq?: number; showStarred?: boolean; showImportant?: boolean }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -178,7 +240,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "queryLabel" && (message.labelIds || message.labelId)) {
       const seq = message.seq;
       const labelIds = message.labelIds ?? [message.labelId!];
-      cacheManager.queryLabel(labelIds, message.location, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabelCounts: {}, error: true, seq }); });
+      cacheManager.queryLabel(labelIds, message.scopeTimestamp ?? null).then((result) => { port.postMessage({ type: "labelResult", ...result, seq }); }).catch(() => { port.postMessage({ type: "labelResult", labelId: labelIds[0], count: 0, coLabelCounts: {}, error: true, seq }); });
     } else if (message.type === "syncState") {
       if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
       if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
@@ -189,7 +251,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "applyFilters") {
       if (state.gmailTabId !== null && state.gmailTabUrl) {
         const base = `https://mail.google.com${gmailAccountPath(state.gmailTabUrl)}`;
-        const url = buildGmailUrl(base, message.location, message.labelName ?? null, message.scope ?? null);
+        const url = buildGmailUrl(base, message.labelName ?? null, message.scope ?? null);
         lastExtensionNavHash.set(state.gmailTabId, urlHash(url));
         chrome.tabs.update(state.gmailTabId, { url });
       }
@@ -200,9 +262,26 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         if (fetchSeq !== undefined) response.seq = fetchSeq;
         port.postMessage(response);
       }).catch(() => { port.postMessage({ type: "labelsError" }); });
+    } else if (message.type === "syncSettings") {
+      const prevStarred = cacheManager.showStarred;
+      const prevImportant = cacheManager.showImportant;
+      const showStarred = !!message.showStarred;
+      const showImportant = !!message.showImportant;
+      cacheManager.updateSystemLabelSettings(showStarred, showImportant);
+      // On-demand fetch only when transitioning from off to on AND cache is already initialized.
+      // On service worker restart, cacheStarted is false so we skip here — startFetch will include
+      // the labels via buildLabelQueryList since updateSystemLabelSettings was already called.
+      // Await whenReady() to ensure account setup and label fetch are complete before prioritizing.
+      if (cacheStarted) {
+        const notify = (): void => { try { port.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0, datesTotal: 0, datesDone: 0 }); } catch { /* port may be dead */ } };
+        cacheManager.whenReady().then(() => {
+          if (showStarred && !prevStarred) cacheManager.prioritizeLabel("STARRED").then(notify).catch(() => {});
+          if (showImportant && !prevImportant) cacheManager.prioritizeLabel("IMPORTANT").then(notify).catch(() => {});
+        }).catch(() => {});
+      }
     } else if (message.type === "fetchCounts") {
       const fetchSeq = message.seq;
-      cacheManager.getLabelCounts(message.location, message.scopeTimestamp ?? null).then((counts) => {
+      cacheManager.getLabelCounts(message.scopeTimestamp ?? null).then((counts) => {
         const response: Record<string, unknown> = { type: "countsReady", counts };
         if (fetchSeq !== undefined) response.seq = fetchSeq;
         port.postMessage(response);
@@ -291,14 +370,16 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   } catch { /* tab may not exist */ }
 });
 
-// Handle messages from side panel
-export function buildGmailUrl(base: string, location: string | undefined, labelName: string | string[] | null, scope: string | null): string {
-  const loc = location ?? "inbox";
-  const query = buildSearchQuery(location, labelName, scope);
-  if (!query) return `${base}#${loc}`;
-  // Single "in:location" with no other filters — use direct navigation instead of search
+export function buildGmailUrl(base: string, labelName: string | string[] | null, scope: string | null): string {
+  const query = buildSearchQuery(labelName, scope);
+  if (!query) return `${base}#all`;
+  // Single "in:..." clause with no other filters — use direct hash navigation
   const parts = query.split(" ");
-  if (parts.length === 1 && parts[0].startsWith("in:")) return `${base}#${loc}`;
+  if (parts.length === 1 && parts[0].startsWith("in:")) {
+    const loc = parts[0].slice(3);
+    const hashMap: Record<string, string> = { inbox: "inbox", sent: "sent", starred: "starred", important: "imp" };
+    return `${base}#${hashMap[loc] ?? loc}`;
+  }
   return `${base}#search/${encodeURIComponent(query)}`;
 }
 

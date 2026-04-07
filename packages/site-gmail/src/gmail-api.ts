@@ -52,18 +52,20 @@ interface MessagesListResponse {
   resultSizeEstimate?: number;
 }
 
-export function buildSearchQuery(location: string | undefined, labelName: string | string[] | null, scope: string | null, beforeDate?: string | null): string {
+const SYSTEM_LABEL_IN_MAP: Record<string, string> = { INBOX: "inbox", SENT: "sent", STARRED: "starred", IMPORTANT: "important" };
+
+export function buildSearchQuery(labelName: string | string[] | null, scope: string | null, beforeDate?: string | null): string {
   const parts: string[] = [];
   if (labelName) {
     const names = Array.isArray(labelName) ? labelName : [labelName];
     if (names.length === 1) {
-      parts.push(`label:${formatLabelForQuery(names[0])}`);
+      const inClause = SYSTEM_LABEL_IN_MAP[names[0]];
+      parts.push(inClause ? `in:${inClause}` : `label:${formatLabelForQuery(names[0])}`);
     } else if (names.length > 1) {
-      parts.push(`{${names.map(n => `label:${formatLabelForQuery(n)}`).join(" OR ")}}`);
+      const formatted = names.map(n => { const inClause = SYSTEM_LABEL_IN_MAP[n]; return inClause ? `in:${inClause}` : `label:${formatLabelForQuery(n)}`; });
+      parts.push(`{${formatted.join(" OR ")}}`);
     }
   }
-  const loc = location ?? "inbox";
-  if (loc !== "all") parts.push(`in:${loc}`);
   if (scope) parts.push(`after:${scope}`);
   if (beforeDate) parts.push(`before:${beforeDate}`);
   return parts.join(" ");
