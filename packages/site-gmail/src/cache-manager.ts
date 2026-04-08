@@ -1,16 +1,14 @@
 import type { CacheMessage, GmailLabel } from "@core/types.js";
 import * as db from "./cache-db.js";
-import { fetchLabels, fetchLabelMessageIds, batchFetchDates } from "./gmail-api.js";
+import { fetchLabels, fetchLabelMessageIds, fetchScopedMessageIds } from "./gmail-api.js";
 
 /** System labels always cached */
 const BASE_SYSTEM_LABELS = ["INBOX", "SENT"];
 
 export interface CacheProgress {
-  phase: "labels" | "dates" | "complete";
+  phase: "labels" | "scope" | "scope-done" | "complete";
   labelsTotal: number;
   labelsDone: number;
-  datesTotal: number;
-  datesDone: number;
   currentLabel?: string;
 }
 
@@ -23,7 +21,7 @@ export interface LabelQueryResult {
 export type ProgressCallback = (progress: CacheProgress) => void;
 
 interface FetchState {
-  phase: "labels" | "dates" | "complete";
+  phase: "labels" | "complete";
   lastFetchTimestamp: number | null;
 }
 
@@ -43,6 +41,16 @@ export class CacheManager {
   private resolveInitReady: (() => void) | null = null;
   showStarred = false;
   showImportant = false;
+  /** Pre-computed label indexes filtered by scope. null = no scope filter active. */
+  private scopedLabelIdx: Map<string, string[]> | null = null;
+  /** The set of message IDs in the current scope — kept for updating scopedLabelIdx when new labels are prioritized. */
+  private scopedIdSet: Set<string> | null = null;
+  /** The scope timestamp that scopedLabelIdx was built for — used by getLabelIndex to detect multi-window races where another port's setScopeFilter overwrote the shared state. */
+  private activeScopeTimestamp: number | null | undefined = undefined;
+  /** Monotonically increasing generation for setScopeFilter — prevents stale in-flight calls from overwriting fresher results. */
+  private scopeFilterGen = 0;
+  /** Per-timestamp cache of scoped ID sets — enables correct on-the-fly intersection when multiple windows use different scopes and the active scopedLabelIdx was built for a different timestamp. */
+  private scopedIdSets = new Map<number, Set<string>>();
 
   setProgressCallback(callback: ProgressCallback): void {
     this.onProgress = callback;
@@ -62,6 +70,101 @@ export class CacheManager {
   updateSystemLabelSettings(showStarred: boolean, showImportant: boolean): void {
     this.showStarred = showStarred;
     this.showImportant = showImportant;
+  }
+
+  /** Return the scope timestamp that the current scopedLabelIdx was built for. */
+  getActiveScopeTimestamp(): number | null | undefined {
+    return this.activeScopeTimestamp;
+  }
+
+  /** Clear cached scope state and bump the scope filter generation so any in-flight setScopeFilter calls from before the invalidation bail out. Called by the service worker when the underlying label indexes change (cache complete, backfill, etc.). */
+  clearScopeState(): void {
+    this.scopedLabelIdx = null;
+    this.scopedIdSet = null;
+    this.activeScopeTimestamp = undefined;
+    this.scopeFilterGen++;
+    this.scopedIdSets.clear();
+  }
+
+  /** Set scope filter: fetches scoped message IDs via API and pre-computes filtered label indexes. Pass null to clear. Uses a generation counter to prevent stale in-flight calls from overwriting fresher results. */
+  async setScopeFilter(scopeTimestamp: number | null): Promise<void> {
+    const gen = ++this.scopeFilterGen;
+    if (scopeTimestamp === null) {
+      this.scopedLabelIdx = null;
+      this.scopedIdSet = null;
+      this.activeScopeTimestamp = null;
+      return;
+    }
+    // Don't fetch scope while cache is still building — indexes are incomplete.
+    // After cache completes, pushUpdatedResults will re-apply the scope.
+    if (this.labels.length === 0) return;
+    let showedSpinner = false;
+    try {
+      // Check if we already have scoped IDs for this timestamp
+      const cachedSet = this.scopedIdSets.get(scopeTimestamp);
+      let scopedSet: Set<string>;
+      if (cachedSet) {
+        scopedSet = cachedSet;
+      } else {
+        const dateStr = this.timestampToDateString(scopeTimestamp);
+        showedSpinner = true;
+        this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: 0 });
+        let lastReported = 0;
+        const scopedIds = await fetchScopedMessageIds(dateStr, (count) => { if (count - lastReported >= 1000) { lastReported = count; this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: count }); } });
+        scopedSet = new Set(scopedIds);
+        // Cache per timestamp for reuse. Evict oldest to prevent unbounded growth.
+        const MAX_SCOPED_ID_SETS = 5;
+        if (this.scopedIdSets.size >= MAX_SCOPED_ID_SETS && !this.scopedIdSets.has(scopeTimestamp)) {
+          const oldestKey = this.scopedIdSets.keys().next().value!;
+          this.scopedIdSets.delete(oldestKey);
+        }
+        this.scopedIdSets.set(scopeTimestamp, scopedSet);
+      }
+      if (gen !== this.scopeFilterGen) return;
+
+      // Intersect with each known label index
+      const scopedMap = new Map<string, string[]>();
+      const labels = this.labels;
+      for (const label of labels) {
+        const fullIndex = await db.getMeta<string[]>(`labelIdx:${label.id}`);
+        if (gen !== this.scopeFilterGen) return;
+        if (!fullIndex) continue;
+        const filtered = fullIndex.filter(id => scopedSet.has(id));
+        scopedMap.set(label.id, filtered);
+      }
+      if (gen !== this.scopeFilterGen) return;
+      this.scopedIdSet = scopedSet;
+      this.scopedLabelIdx = scopedMap;
+      this.activeScopeTimestamp = scopeTimestamp;
+    } finally {
+      if (showedSpinner) this.emitProgress({ phase: "scope-done", labelsTotal: 0, labelsDone: 0 });
+    }
+  }
+
+  /** Get label index: returns scoped index when scope is active, or falls back to IndexedDB label index. When expectedScope is provided and doesn't match the active scope (e.g. multi-window race), computes filtered results on the fly from the per-timestamp scoped ID set cache. Falls back to unscoped IndexedDB only if no cached set is available. */
+  async getLabelIndex(labelId: string, expectedScope?: number | null): Promise<string[] | undefined> {
+    if (this.scopedLabelIdx) {
+      if (expectedScope !== undefined && expectedScope !== this.activeScopeTimestamp) {
+        return this.computeFromCachedScope(labelId, expectedScope);
+      }
+      return this.scopedLabelIdx.get(labelId);
+    }
+    if (expectedScope !== undefined && expectedScope !== null) {
+      return this.computeFromCachedScope(labelId, expectedScope);
+    }
+    return db.getMeta<string[]>(`labelIdx:${labelId}`);
+  }
+
+  /** Compute a filtered label index from a per-timestamp cached scoped ID set. Falls back to unscoped IndexedDB if no cached set is available for the given scope. */
+  private async computeFromCachedScope(labelId: string, expectedScope: number | null): Promise<string[] | undefined> {
+    if (expectedScope !== null) {
+      const cachedSet = this.scopedIdSets.get(expectedScope);
+      if (cachedSet) {
+        const fullIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+        return fullIndex ? fullIndex.filter(id => cachedSet.has(id)) : undefined;
+      }
+    }
+    return db.getMeta<string[]>(`labelIdx:${labelId}`);
   }
 
   abort(): void {
@@ -94,7 +197,7 @@ export class CacheManager {
     this.labels = await fetchLabels();
   }
 
-  /** Start the full cache population: Phase 1 (labels) then Phase 2 (dates). */
+  /** Start the full cache population: fetch labels then cross-reference messages. */
   async startFetch(accountPath: string): Promise<void> {
     this.aborted = true;
     // Increment generation BEFORE awaiting the old fetch so the old fetch's finally block
@@ -141,14 +244,14 @@ export class CacheManager {
     const isIncremental = fetchState?.phase === "complete" && fetchState.lastFetchTimestamp !== null;
     const scopeDate = isIncremental ? this.timestampToDateString(fetchState.lastFetchTimestamp!) : undefined;
 
-    this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 });
+    this.emitProgress({ phase: "labels", labelsTotal, labelsDone });
     await db.setMeta("fetchState", { phase: "labels", lastFetchTimestamp: fetchState?.lastFetchTimestamp ?? null });
 
     for (const label of labelsToQuery) {
       // Wait for any priority label processing to finish before continuing
       if (this.priorityBarrier) await this.priorityBarrier;
       if (this.isStale(generation)) return;
-      if (this.processedLabels.has(label.id)) { labelsDone++; this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0 }); continue; }
+      if (this.processedLabels.has(label.id)) { labelsDone++; this.emitProgress({ phase: "labels", labelsTotal, labelsDone }); continue; }
       // Only use incremental scope if the label index already exists; otherwise do a full fetch to build it
       const existingIndex = isIncremental ? await db.getMeta<string[]>(`labelIdx:${label.id}`) : undefined;
       const labelScopeDate = existingIndex && existingIndex.length > 0 ? scopeDate : undefined;
@@ -156,147 +259,125 @@ export class CacheManager {
       await this.crossReferenceLabel(label.id, messageIds);
       this.processedLabels.add(label.id);
       labelsDone++;
-      this.emitProgress({ phase: "labels", labelsTotal, labelsDone, datesTotal: 0, datesDone: 0, currentLabel: label.name });
+      this.emitProgress({ phase: "labels", labelsTotal, labelsDone, currentLabel: label.name });
     }
-
-    if (this.isStale(generation)) return;
-    await this.fetchDates(labelsTotal, generation);
 
     if (this.isStale(generation)) return;
     const now = Date.now();
     await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: now });
-    this.emitProgress({ phase: "complete", labelsTotal, labelsDone: labelsTotal, datesTotal: 0, datesDone: 0 });
-  }
-
-  /** Phase 2: batch-fetch dates for messages that don't have them yet. */
-  private async fetchDates(labelsTotal: number, generation: number): Promise<void> {
-    let datesDone = 0;
-
-    const prevState = await db.getMeta<FetchState>("fetchState");
-    await db.setMeta("fetchState", { phase: "dates", lastFetchTimestamp: prevState?.lastFetchTimestamp ?? null });
-
-    let batch = await db.getMessagesWithoutDates(100);
-    const datesTotal = await db.countMessagesWithoutDates();
-
-    this.emitProgress({ phase: "dates", labelsTotal, labelsDone: labelsTotal, datesTotal, datesDone });
-
-    while (batch.length > 0) {
-      if (this.isStale(generation)) return;
-      const ids = batch.map(m => m.id);
-      const results = await batchFetchDates(ids);
-      const batchMap = new Map(batch.map(m => [m.id, m]));
-      const returnedIds = new Set(results.map(r => r.id));
-      const updates: CacheMessage[] = [];
-      for (const result of results) {
-        const existing = batchMap.get(result.id);
-        if (existing) {
-          updates.push({ ...existing, internalDate: result.internalDate, status: "fetched" });
-        }
-      }
-      // Mark messages not returned by the batch API as inaccessible to prevent re-fetching
-      for (const msg of batch) {
-        if (!returnedIds.has(msg.id)) {
-          updates.push({ ...msg, status: "inaccessible" });
-        }
-      }
-      if (updates.length > 0) await db.putMessages(updates);
-      datesDone += batch.length;
-      this.emitProgress({ phase: "dates", labelsTotal, labelsDone: labelsTotal, datesTotal, datesDone });
-      batch = await db.getMessagesWithoutDates(100);
-    }
+    this.emitProgress({ phase: "complete", labelsTotal, labelsDone: labelsTotal });
   }
 
 
-  /** Get own and inclusive counts for all known labels, filtered by scope. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). */
-  async getLabelCounts(scopeTimestamp: number | null, labelsOverride?: GmailLabel[]): Promise<Record<string, { own: number; inclusive: number }>> {
+  /** Get own and inclusive counts for all known labels. When a scope filter is active, counts come from the pre-computed scopedLabelIdx. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). Pass expectedScope to guard against multi-window races. Snapshots scopedLabelIdx at entry so concurrent setScopeFilter calls from other ports cannot mix scoped/unscoped data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
+  async getLabelCounts(labelsOverride?: GmailLabel[], expectedScope?: number | null): Promise<Record<string, { own: number; inclusive: number }>> {
     const labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
-    const allLabelIds = labels.map(l => l.id);
-    const ownCounts = await db.getFilteredLabelCounts(allLabelIds, scopeTimestamp);
+    // Snapshot scope state to ensure consistent reads throughout the loop
+    const scopeSnapshot = this.scopedLabelIdx;
+    const scopeTimestampSnapshot = this.activeScopeTimestamp;
+    // Check if a cached scoped ID set is available for on-the-fly filtering (multi-window support)
+    const fallbackScopeSet = (expectedScope !== undefined && expectedScope !== null && expectedScope !== scopeTimestampSnapshot) ? this.scopedIdSets.get(expectedScope) ?? null : null;
+    const useScope = (scopeSnapshot !== null && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) || fallbackScopeSet !== null;
+
+    const getIndex = async (labelId: string): Promise<string[] | undefined> => {
+      if (scopeSnapshot && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) {
+        return scopeSnapshot.get(labelId);
+      }
+      if (fallbackScopeSet) {
+        const fullIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+        return fullIndex ? fullIndex.filter(id => fallbackScopeSet.has(id)) : undefined;
+      }
+      return db.getMeta<string[]>(`labelIdx:${labelId}`);
+    };
+
+    // Build own counts from label indexes
+    const ownCounts: Record<string, number> = {};
+    for (const label of labels) {
+      const msgIds = await getIndex(label.id);
+      if (msgIds === undefined) continue;
+      ownCounts[label.id] = msgIds.length;
+    }
 
     const result: Record<string, { own: number; inclusive: number }> = {};
 
     for (const label of labels) {
-      // Skip labels not yet in the cache — no count is better than a wrong (0)
       if (!(label.id in ownCounts)) continue;
       const own = ownCounts[label.id];
 
-      // Find descendants via prefix matching (e.g. "Work/Projects" is a child of "Work")
       const descendants = labels.filter(l => l.id !== label.id && l.name.startsWith(label.name + "/"));
 
       if (descendants.length === 0) {
+        if (useScope && own === 0) continue;
         result[label.id] = { own, inclusive: own };
         continue;
       }
 
-      // Compute inclusive count: union parent + descendant message IDs, deduplicate, then filter
-      const descendantIds = descendants.map(l => l.id);
-      const allIds = [label.id, ...descendantIds];
+      // Compute inclusive count: union parent + descendant message IDs, deduplicate
+      const allIds = [label.id, ...descendants.map(l => l.id)];
       const seenMsgIds = new Set<string>();
-      const allMsgIds: string[] = [];
 
       for (const lid of allIds) {
-        const msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
+        const msgIds = await getIndex(lid);
         if (msgIds) {
-          for (const id of msgIds) {
-            if (!seenMsgIds.has(id)) {
-              seenMsgIds.add(id);
-              allMsgIds.push(id);
-            }
-          }
+          for (const id of msgIds) seenMsgIds.add(id);
         }
       }
 
-      if (allMsgIds.length === 0) {
-        result[label.id] = { own, inclusive: 0 };
-        continue;
-      }
+      const inclusive = seenMsgIds.size;
 
-      const msgMap = await db.getMessagesBatch(allMsgIds);
-      let inclusive = 0;
-      for (const msg of msgMap.values()) {
-        if (scopeTimestamp !== null && (!msg.internalDate || msg.internalDate < scopeTimestamp)) continue;
-        inclusive++;
-      }
-
+      if (useScope && own === 0 && inclusive === 0) continue;
       result[label.id] = { own, inclusive };
     }
 
     return result;
   }
 
-  /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. */
-  async queryLabel(labelId: string, includeChildren: boolean, scopeTimestamp: number | null): Promise<LabelQueryResult> {
+  /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. Uses scoped label indexes when a scope filter is active. Pass expectedScope to guard against multi-window races where another port may have changed the active scope. Snapshots scope state at entry so concurrent setScopeFilter calls cannot mix data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
+  async queryLabel(labelId: string, includeChildren: boolean, expectedScope?: number | null): Promise<LabelQueryResult> {
     const labelIds = this.resolveLabelIds(labelId, includeChildren);
     const seen = new Set<string>();
-    let messages: CacheMessage[] = [];
+    const messages: CacheMessage[] = [];
+    // Snapshot scope state for consistent reads throughout the method
+    const scopeSnapshot = this.scopedLabelIdx;
+    const scopeTimestampSnapshot = this.activeScopeTimestamp;
+    const scopedIdSetSnapshot = this.scopedIdSet;
+    // Check if a cached scoped ID set is available for on-the-fly filtering (multi-window support)
+    const fallbackScopeSet = (expectedScope !== undefined && expectedScope !== null && expectedScope !== scopeTimestampSnapshot) ? this.scopedIdSets.get(expectedScope) ?? null : null;
+
+    const getIndex = async (lid: string): Promise<string[] | undefined> => {
+      if (scopeSnapshot && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) {
+        return scopeSnapshot.get(lid);
+      }
+      if (fallbackScopeSet) {
+        const fullIndex = await db.getMeta<string[]>(`labelIdx:${lid}`);
+        return fullIndex ? fullIndex.filter(id => fallbackScopeSet.has(id)) : undefined;
+      }
+      return db.getMeta<string[]>(`labelIdx:${lid}`);
+    };
 
     for (const lid of labelIds) {
-      // Look up message IDs from label index (O(1) meta read) instead of scanning all messages
-      let msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
+      let msgIds = await getIndex(lid);
 
       // If no index entry or empty index, the label hasn't been cached yet — fetch it now
       if (!msgIds || msgIds.length === 0) {
         await this.prioritizeLabel(lid);
-        msgIds = await db.getMeta<string[]>(`labelIdx:${lid}`);
+        // After prioritize, update our snapshot if scope is active so getIndex reads the new data
+        if (scopeSnapshot && scopedIdSetSnapshot) {
+          const fullIndex = await db.getMeta<string[]>(`labelIdx:${lid}`);
+          if (fullIndex) {
+            scopeSnapshot.set(lid, fullIndex.filter(id => scopedIdSetSnapshot.has(id)));
+          }
+        }
+        msgIds = await getIndex(lid);
       }
 
       if (msgIds) {
-        // Filter to IDs not yet seen, then batch-fetch their records
         const newIds = msgIds.filter(id => !seen.has(id));
         for (const id of newIds) seen.add(id);
         if (newIds.length > 0) {
           const batch = await db.getMessagesBatch(newIds);
           for (const msg of batch.values()) messages.push(msg);
         }
-      }
-    }
-
-    if (scopeTimestamp !== null) {
-      const allHaveDates = messages.every(m => !!m.internalDate);
-      if (allHaveDates) {
-        messages = messages.filter(m => m.internalDate! >= scopeTimestamp);
-      } else {
-        return this.scopeFallback(labelId, includeChildren, scopeTimestamp);
       }
     }
 
@@ -345,42 +426,6 @@ export class CacheManager {
     if (!label) return [labelId];
     const descendants = this.labels.filter(l => l.id !== labelId && l.name.startsWith(label.name + "/"));
     return [labelId, ...descendants.map(l => l.id)];
-  }
-
-  /** Scope fallback: use API to get scoped message IDs for all label IDs, cross-reference with IndexedDB for co-labels. */
-  private async scopeFallback(labelId: string, includeChildren: boolean, scopeTimestamp: number): Promise<LabelQueryResult> {
-    const labelIds = this.resolveLabelIds(labelId, includeChildren);
-    const dateStr = this.timestampToDateString(scopeTimestamp);
-    const seenIds = new Set<string>();
-    const allScopedIds: string[] = [];
-
-    for (const lid of labelIds) {
-      const scopedIds = await fetchLabelMessageIds(lid, dateStr);
-      for (const id of scopedIds) {
-        if (!seenIds.has(id)) {
-          seenIds.add(id);
-          allScopedIds.push(id);
-        }
-      }
-    }
-
-    const msgMap = await db.getMessagesBatch(allScopedIds);
-    const coLabelCounts: Record<string, number> = {};
-    let count = 0;
-
-    for (const msgId of allScopedIds) {
-      const msg = msgMap.get(msgId);
-      if (msg) {
-        count++;
-        for (const lid of msg.labelIds) {
-          if (lid !== labelId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
-        }
-      } else {
-        count++;
-      }
-    }
-
-    return { labelId, count, coLabelCounts };
   }
 
   private timestampToDateString(timestamp: number): string {
@@ -439,13 +484,11 @@ export class CacheManager {
       for (const id of chunk) {
         const existing = existingMap.get(id);
         if (existing) {
-          const needsLabel = !existing.labelIds.includes(labelId);
-          const needsStatusReset = existing.status === "inaccessible";
-          if (needsLabel || needsStatusReset) {
-            updates.push({ ...existing, labelIds: needsLabel ? [...existing.labelIds, labelId] : existing.labelIds, status: needsStatusReset ? "pending" : existing.status });
+          if (!existing.labelIds.includes(labelId)) {
+            updates.push({ ...existing, labelIds: [...existing.labelIds, labelId] });
           }
         } else {
-          updates.push({ id, internalDate: null, labelIds: [labelId], status: "pending" });
+          updates.push({ id, labelIds: [labelId] });
         }
       }
       if (updates.length > 0) await db.putMessages(updates);

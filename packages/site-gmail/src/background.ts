@@ -17,23 +17,54 @@ const cacheManager = new CacheManager();
 let cacheStarted = false;
 let currentAccountPath: string | null = null;
 let cacheGeneration = 0;
+/** Tracks the scope timestamp last applied to the cache manager via setScopeFilter — avoids redundant API calls when scope hasn't changed. undefined = never set. */
+let currentCacheScope: number | null | undefined = undefined;
+/** In-flight ensureScopeFilter promise and its target — lets concurrent callers with the same scope piggyback on one API call instead of duplicating it. */
+let scopeFilterInflight: { target: number | null; promise: Promise<void> } | null = null;
 const CACHE_ALARM_NAME = "cache-keepalive";
+
+/** Monotonically increasing generation — bumped every time we invalidate the cached scope so that in-flight setScopeFilter calls from before the invalidation don't re-set currentCacheScope. */
+let scopeInvalidationGen = 0;
+
+/** Ensure the cache manager's scope filter matches the requested scope. No-op if already set to the same value. Deduplicates concurrent calls for the same scope. */
+async function ensureScopeFilter(scopeTimestamp: number | null): Promise<void> {
+  if (scopeTimestamp === currentCacheScope) return;
+  if (scopeFilterInflight && scopeFilterInflight.target === scopeTimestamp) return scopeFilterInflight.promise;
+  const genAtStart = scopeInvalidationGen;
+  const promise = cacheManager.setScopeFilter(scopeTimestamp).then(() => { if (scopeInvalidationGen === genAtStart && cacheManager.getActiveScopeTimestamp() === scopeTimestamp) currentCacheScope = scopeTimestamp; });
+  scopeFilterInflight = { target: scopeTimestamp, promise };
+  try {
+    await promise;
+  } finally {
+    if (scopeFilterInflight?.promise === promise) scopeFilterInflight = null;
+  }
+}
+
+/** Invalidate the cached scope so the next ensureScopeFilter re-runs setScopeFilter even for the same scope timestamp. Also cancels any in-flight scope filter to prevent it from restoring currentCacheScope, and clears the cache manager's stale scope state so its activeScopeTimestamp cannot trick the .then() guard in ensureScopeFilter. */
+function invalidateCachedScope(): void {
+  currentCacheScope = undefined;
+  scopeInvalidationGen++;
+  scopeFilterInflight = null;
+  cacheManager.clearScopeState();
+}
 
 /** Push updated label result and counts to all connected sidepanels. Each port is queried using its own last selection so multi-window use gets correct results. */
 function pushUpdatedResults(): void {
   for (const [port, state] of portState) {
+    const scopeAtCall = state.lastScopeTimestamp;
+    // Ensure scope filter is applied before querying (e.g. after service worker restart)
+    const scopeReady = ensureScopeFilter(scopeAtCall);
     const sel = state.lastSelection;
     if (sel?.labelId) {
       const { labelId, includeChildren, scopeTimestamp, seq } = sel;
       const myResultGen = ++state.resultGeneration;
-      cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp).then((result) => {
+      scopeReady.then(() => cacheManager.queryLabel(labelId, includeChildren, scopeAtCall)).then((result) => {
         if (state.resultGeneration !== myResultGen) return;
         try { port.postMessage({ type: "labelResult", ...result, seq }); } catch { /* port may be dead */ }
       }).catch(() => {});
     }
-    const scopeAtCall = state.lastScopeTimestamp;
     const myCountsGen = ++state.countsGeneration;
-    cacheManager.getLabelCounts(scopeAtCall).then((counts) => {
+    scopeReady.then(() => cacheManager.getLabelCounts(undefined, scopeAtCall)).then((counts) => {
       // Skip if scope changed or a newer counts query started while in flight
       if (state.lastScopeTimestamp !== scopeAtCall) return;
       if (state.countsGeneration !== myCountsGen) return;
@@ -48,6 +79,9 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
   }
   if (progress.phase === "complete") {
     chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+    // Reset cached scope so ensureScopeFilter re-runs — labels fetched after the
+    // initial setScopeFilter call need to be intersected with the scoped ID set.
+    invalidateCachedScope();
     pushUpdatedResults();
   }
 });
@@ -147,8 +181,11 @@ export async function startCacheIfNeeded(accountPath: string): Promise<void> {
     }
     if (missingLabels.length > 0 && !backfillFailed) {
       for (const [port] of portState) {
-        try { port.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0, datesTotal: 0, datesDone: 0 }); } catch { /* port may be dead */ }
+        try { port.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0 }); } catch { /* port may be dead */ }
       }
+      // Reset cached scope so ensureScopeFilter re-runs — backfilled labels
+      // need to be included in the scoped index.
+      invalidateCachedScope();
       pushUpdatedResults();
     }
     return;
@@ -319,6 +356,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           if (includeChildren && cacheManager.getLabels().length === 0) {
             return { labelId, count: 0, coLabelCounts: {}, error: true } as { labelId: string; count: number; coLabelCounts: Record<string, number>; error: boolean };
           }
+          await ensureScopeFilter(scopeTimestamp);
           return cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp);
         }).then((result) => {
           if (state.resultGeneration !== myResultGen) return;
@@ -365,7 +403,10 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       // Await whenReady() to ensure account setup and label fetch are complete before prioritizing.
       if (cacheStarted) {
         const notify = (): void => {
-          for (const [p] of portState) { try { p.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0, datesTotal: 0, datesDone: 0 }); } catch { /* port may be dead */ } }
+          for (const [p] of portState) { try { p.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0 }); } catch { /* port may be dead */ } }
+          // Reset cached scope so ensureScopeFilter re-runs — the newly prioritized
+          // label needs to be included in the scoped index.
+          invalidateCachedScope();
           pushUpdatedResults();
         };
         cacheManager.whenReady().then(() => {
@@ -376,13 +417,18 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "fetchCounts") {
       const fetchSeq = message.seq;
       state.lastScopeTimestamp = message.scopeTimestamp ?? null;
+      const scopeTs = message.scopeTimestamp ?? null;
       const myCountsGen = ++state.countsGeneration;
-      cacheManager.getLabelCounts(message.scopeTimestamp ?? null).then((counts) => {
+      ensureScopeFilter(scopeTs).then(() => cacheManager.getLabelCounts(undefined, scopeTs)).then((counts) => {
         if (state.countsGeneration !== myCountsGen) return;
         const response: Record<string, unknown> = { type: "countsReady", counts };
         if (fetchSeq !== undefined) response.seq = fetchSeq;
         port.postMessage(response);
-      }).catch(() => { /* counts are optional */ });
+      }).catch(() => {
+        const response: Record<string, unknown> = { type: "countsReady", counts: null };
+        if (fetchSeq !== undefined) response.seq = fetchSeq;
+        try { port.postMessage(response); } catch { /* port may be closed */ }
+      });
     }
   });
 
@@ -515,6 +561,9 @@ export function _resetCacheState(): void {
   cacheStarted = false;
   currentAccountPath = null;
   cacheGeneration = 0;
+  currentCacheScope = undefined;
+  scopeInvalidationGen = 0;
+  scopeFilterInflight = null;
   portState.clear();
 }
 

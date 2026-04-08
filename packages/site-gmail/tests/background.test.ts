@@ -16,6 +16,10 @@ vi.mock("../src/cache-manager.js", () => {
   const mockGetLabels = vi.fn().mockReturnValue([]);
   const mockSetLabels = vi.fn();
   const mockGetLabelCounts = vi.fn().mockResolvedValue({ INBOX: { own: 10, inclusive: 10 } });
+  let activeScopeTimestamp: number | null | undefined = undefined;
+  const mockSetScopeFilter = vi.fn().mockImplementation((ts: number | null) => { activeScopeTimestamp = ts; return Promise.resolve(); });
+  const mockGetActiveScopeTimestamp = vi.fn().mockImplementation(() => activeScopeTimestamp);
+  const mockClearScopeState = vi.fn().mockImplementation(() => { activeScopeTimestamp = undefined; });
   return {
     CacheManager: vi.fn().mockImplementation(() => ({
       startFetch: mockStartFetch,
@@ -27,6 +31,9 @@ vi.mock("../src/cache-manager.js", () => {
       getLabels: mockGetLabels,
       setLabels: mockSetLabels,
       getLabelCounts: mockGetLabelCounts,
+      setScopeFilter: mockSetScopeFilter,
+      getActiveScopeTimestamp: mockGetActiveScopeTimestamp,
+      clearScopeState: mockClearScopeState,
       resetReady: vi.fn(),
       resolveReady: vi.fn(),
       loadLabels: vi.fn().mockResolvedValue(undefined),
@@ -524,9 +531,101 @@ describe("cache-complete re-query", () => {
     progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
     await new Promise(r => setTimeout(r, 0));
 
-    // getLabelCounts should be called with the scoped timestamp, not null
-    expect(cacheManager.getLabelCounts).toHaveBeenCalledWith(scopeTimestamp);
+    // getLabelCounts should be called (scope is set via ensureScopeFilter before the call)
+    expect(cacheManager.getLabelCounts).toHaveBeenCalled();
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
+  });
+});
+
+describe("scope filter propagation", () => {
+  beforeEach(() => {
+    _resetCacheState();
+    vi.clearAllMocks();
+    tabsUpdateMock.mockResolvedValue(undefined);
+  });
+
+  it("selectionChanged with scope triggers setScopeFilter before queryLabel", async () => {
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 3, coLabelCounts: {} });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: "2024/01/01", scopeTimestamp, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
+    expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, scopeTimestamp);
+    // setScopeFilter should be called before queryLabel
+    const setScopeOrder = (cacheManager.setScopeFilter as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const queryOrder = (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(setScopeOrder).toBeLessThan(queryOrder);
+  });
+
+  it("fetchCounts with scope triggers setScopeFilter before getLabelCounts", async () => {
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
+    expect(cacheManager.getLabelCounts).toHaveBeenCalled();
+    // setScopeFilter should be called before getLabelCounts
+    const setScopeOrder = (cacheManager.setScopeFilter as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const countsOrder = (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(setScopeOrder).toBeLessThan(countsOrder);
+  });
+
+  it("same scope does not re-trigger setScopeFilter", async () => {
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
+    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
+    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 3, coLabelCounts: {} });
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    // First call with scope
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: "2024/01/01", scopeTimestamp, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(1);
+
+    // Second call with same scope — should NOT call setScopeFilter again
+    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 2 });
+    await new Promise(r => setTimeout(r, 0));
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(1);
+
+    // Third call with different scope — SHOULD call setScopeFilter
+    const newScope = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    sendMessage({ type: "fetchCounts", scopeTimestamp: newScope, seq: 3 });
+    await new Promise(r => setTimeout(r, 0));
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(2);
+    expect(cacheManager.setScopeFilter).toHaveBeenLastCalledWith(newScope);
+  });
+
+  it("null scope clears the scope filter", async () => {
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
+    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+    await new Promise(r => setTimeout(r, 0));
+    port.postMessage.mockClear();
+
+    // Set a scope
+    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
+    await new Promise(r => setTimeout(r, 0));
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
+
+    // Clear scope with null
+    sendMessage({ type: "fetchCounts", scopeTimestamp: null, seq: 2 });
+    await new Promise(r => setTimeout(r, 0));
+    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(null);
   });
 });
 

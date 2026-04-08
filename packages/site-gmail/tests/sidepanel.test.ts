@@ -42,7 +42,7 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant } = await import("../src/sidepanel.js");
+const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue } = await import("../src/sidepanel.js");
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -85,27 +85,17 @@ describe("handleMessage", () => {
     handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }] });
 
     // Receive cache progress
-    handleMessage({ type: "cacheState", phase: "labels", labelsTotal: 10, labelsDone: 3, datesTotal: 0, datesDone: 0 });
+    handleMessage({ type: "cacheState", phase: "labels", labelsTotal: 10, labelsDone: 3 });
 
     const progress = document.getElementById("cache-progress");
     expect(progress?.innerHTML).toContain("labels 3/10");
-  });
-
-  it("handles cacheState dates phase", () => {
-    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }] });
-
-    handleMessage({ type: "cacheState", phase: "dates", labelsTotal: 10, labelsDone: 10, datesTotal: 500, datesDone: 200 });
-
-    const progress = document.getElementById("cache-progress");
-    expect(progress?.innerHTML).toContain("dates 200/500");
   });
 
   it("handles cacheState complete phase", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }] });
 
-    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
+    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10 });
 
     const progress = document.getElementById("cache-progress");
     expect(progress?.innerHTML).toBe("");
@@ -211,7 +201,7 @@ describe("handleMessage", () => {
     vi.clearAllMocks();
 
     // Cache completes — sidepanel should NOT send selectionChanged (service worker re-queries internally)
-    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
+    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10 });
 
     const selectionMessages = mockPostMessage.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).type === "selectionChanged");
     expect(selectionMessages).toHaveLength(0);
@@ -524,5 +514,136 @@ describe("system labels in label tree", () => {
     const labelIds = Array.from(links ?? []).map((l) => l.getAttribute("data-label-id"));
     // All system labels visible in fixed order
     expect(labelIds).toEqual(["INBOX", "SENT", "STARRED", "IMPORTANT", "Label_1"]);
+  });
+});
+
+describe("hide zero-count labels when scope is active", () => {
+  beforeEach(() => {
+    setupDOM();
+    vi.clearAllMocks();
+    setShowCounts(true);
+  });
+
+  afterEach(() => {
+    setScopeValue("any");
+    setShowCounts(true);
+  });
+
+  it("with scope active, labels absent from labelCounts are hidden", () => {
+    setScopeValue("1m");
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    // Mark cache as complete so filtering is applied (null progress is treated as "building")
+    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 3, labelsDone: 3 });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+      { id: "Label_3", name: "Archive", type: "user" },
+    ];
+    // Only Work and Personal have counts; Archive has zero (omitted by cache manager)
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+      Label_2: { own: 5, inclusive: 5 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    expect(labelIds).toContain("Label_1");
+    expect(labelIds).toContain("Label_2");
+    expect(labelIds).not.toContain("Label_3");
+  });
+
+  it("parent label added via addParentChain when child has count", () => {
+    setScopeValue("1m");
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    // Mark cache as complete so filtering is applied (null progress is treated as "building")
+    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 3, labelsDone: 3 });
+    const labels = [
+      { id: "Label_1", name: "Games", type: "user" },
+      { id: "Label_2", name: "Games/Chess", type: "user" },
+      { id: "Label_3", name: "Work", type: "user" },
+    ];
+    // Only child has count; parent appears via addParentChain
+    const counts = {
+      Label_2: { own: 3, inclusive: 3 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    // Child is in labelCounts, parent added by addParentChain
+    expect(labelIds).toContain("Label_1");
+    expect(labelIds).toContain("Label_2");
+    // Work has no count, should be hidden
+    expect(labelIds).not.toContain("Label_3");
+  });
+
+  it("labels not filtered during cache build even with scope active", () => {
+    setScopeValue("1m");
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    // Simulate cache still building (labels phase)
+    handleMessage({ type: "cacheState", phase: "labels", labelsTotal: 10, labelsDone: 3 });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+      { id: "Label_3", name: "Archive", type: "user" },
+    ];
+    // Only Work has count so far (partial cache); Archive and Personal not yet cached
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    // All labels should remain visible during cache build — uncached != zero count
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    expect(labelIds).toContain("Label_1");
+    expect(labelIds).toContain("Label_2");
+    expect(labelIds).toContain("Label_3");
+  });
+
+  it("labels filtered after cache completes with scope active", () => {
+    setScopeValue("1m");
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    // Cache complete
+    handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10 });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+      { id: "Label_3", name: "Archive", type: "user" },
+    ];
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+      Label_2: { own: 5, inclusive: 5 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    expect(labelIds).toContain("Label_1");
+    expect(labelIds).toContain("Label_2");
+    expect(labelIds).not.toContain("Label_3");
+  });
+
+  it("with scope 'any', all labels shown regardless of labelCounts", () => {
+    setScopeValue("any");
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+      { id: "Label_3", name: "Archive", type: "user" },
+    ];
+    // Even though Archive has no count, scope is "any" so all should be shown
+    const counts = {
+      Label_1: { own: 10, inclusive: 10 },
+      Label_2: { own: 5, inclusive: 5 },
+    };
+    handleMessage({ type: "labelsReady", labels, counts });
+
+    const content = document.getElementById("content");
+    const labelIds = Array.from(content?.querySelectorAll(".label-link") ?? []).map((l) => l.getAttribute("data-label-id"));
+    expect(labelIds).toContain("Label_1");
+    expect(labelIds).toContain("Label_2");
+    expect(labelIds).toContain("Label_3");
   });
 });

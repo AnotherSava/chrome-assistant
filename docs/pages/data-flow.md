@@ -5,7 +5,7 @@
 - **Sidepanel** (`sidepanel.ts`) — UI layer. Expresses user intent via messages. Does not resolve descendants, build URLs, or query the cache directly.
 - **Service Worker** (`background.ts`) — Coordinator. Handles cache queries, Gmail navigation, and pushes results to the sidepanel.
 - **Cache Manager** (`cache-manager.ts`) — Data layer. Fetches and indexes Gmail messages, resolves label descendants, answers label queries.
-- **Gmail API** (`gmail-api.ts`) — Network layer. OAuth2 auth, label fetch, message ID fetch, batch date fetch, search query building.
+- **Gmail API** (`gmail-api.ts`) — Network layer. OAuth2 auth, label fetch, message ID fetch, scope-based message search, search query building.
 - **Cache DB** (`cache-db.ts`) — IndexedDB persistence. Stores messages with label cross-references, fetch state metadata, and label indexes.
 
 ## Message Types (sidepanel → service worker)
@@ -31,7 +31,7 @@
 | `labelsError` | Label fetch failed |
 | `labelResult` | Query result for selected label — carries `labelId`, `count`, `coLabelCounts`, `seq` |
 | `countsReady` | Per-label message counts — carries `counts` map |
-| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, `datesTotal`, `datesDone` |
+| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone` |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
 
 ## Key Flows
@@ -40,7 +40,7 @@
 
 1. User clicks a label in the sidepanel
 2. Sidepanel sends `selectionChanged { labelId, includeChildren, scope, scopeTimestamp, seq }`
-3. Service worker calls `cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp)`
+3. Service worker calls `ensureScopeFilter(scopeTimestamp)` then `cacheManager.queryLabel(labelId, includeChildren)`
 4. Cache manager resolves descendants internally via prefix matching when `includeChildren` is true
 5. Service worker resolves label name(s) from `cacheManager.getLabels()` and builds Gmail URL
 6. Service worker navigates Gmail tab and stores the hash in `lastExtensionNavHash`
@@ -59,6 +59,24 @@
 2. Service worker checks `lastSelection` — if a label is active, re-runs `queryLabel` with stored parameters and pushes updated `labelResult` to all connected sidepanels
 3. Service worker unconditionally pushes `countsReady` to all connected sidepanels (regardless of active label)
 4. Sidepanel does NOT trigger re-queries on cache complete — it only uses `cacheState` for progress bar display
+
+### Scope Search
+
+1. User changes scope (e.g., "3 years ago") in sidepanel
+2. Sidepanel sends `selectionChanged` or `fetchCounts` with `scopeTimestamp`
+3. Service worker calls `cacheManager.setScopeFilter(scopeTimestamp)` (skipped if scope unchanged)
+4. Cache manager calls `fetchScopedMessageIds(dateStr)` — single paginated `messages.list q=after:DATE` call
+5. Cache manager intersects returned IDs with each `labelIdx:*` entry, stores result in `scopedLabelIdx` map
+6. Subsequent `queryLabel` and `getLabelCounts` calls read from `scopedLabelIdx` instead of IndexedDB label indexes
+7. When scope is null ("any"), `scopedLabelIdx` is cleared and queries read directly from IndexedDB
+
+### Zero-Count Label Hiding
+
+1. When scope is active, `getLabelCounts` omits labels where both own and inclusive counts are zero
+2. Sidepanel receives `countsReady` with the filtered `labelCounts` map
+3. In `renderFilteredLabels`, when no label is selected and scope is not "any": filters `cachedLabels` to those present in `labelCounts`
+4. `addParentChain` preserves tree structure — a parent with own=0 stays visible if a child has count>0
+5. When scope is "any", no filtering — all labels shown regardless of count
 
 ### Filters Off (Summary Tab)
 

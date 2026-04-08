@@ -14,8 +14,7 @@ export function openDatabase(indexedDB: IDBFactory = globalThis.indexedDB): Prom
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(MESSAGES_STORE)) {
-        const store = db.createObjectStore(MESSAGES_STORE, { keyPath: "id" });
-        store.createIndex("internalDate", "internalDate", { unique: false });
+        db.createObjectStore(MESSAGES_STORE, { keyPath: "id" });
       }
       if (!db.objectStoreNames.contains(META_STORE)) {
         db.createObjectStore(META_STORE, { keyPath: "key" });
@@ -86,26 +85,6 @@ export async function getMessagesBatch(ids: string[]): Promise<Map<string, Cache
   });
 }
 
-export async function getMessagesByLabel(labelId: string): Promise<CacheMessage[]> {
-  const db = await openDatabase();
-  return new Promise<CacheMessage[]>((resolve, reject) => {
-    const tx = db.transaction(MESSAGES_STORE, "readonly");
-    const store = tx.objectStore(MESSAGES_STORE);
-    const request = store.openCursor();
-    const results: CacheMessage[] = [];
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor) {
-        const msg = cursor.value as CacheMessage;
-        if (msg.labelIds.includes(labelId)) results.push(msg);
-        cursor.continue();
-      } else {
-        resolve(results);
-      }
-    };
-    request.onerror = () => reject(request.error);
-  });
-}
 
 export async function getMeta<T = unknown>(key: string): Promise<T | undefined> {
   const db = await openDatabase();
@@ -116,27 +95,6 @@ export async function getMeta<T = unknown>(key: string): Promise<T | undefined> 
 export async function setMeta(key: string, value: unknown): Promise<void> {
   const db = await openDatabase();
   await withTransaction(db, META_STORE, "readwrite", (store) => store.put({ key, value }));
-}
-
-export async function getMessagesWithoutDates(batchSize: number = 100): Promise<CacheMessage[]> {
-  const db = await openDatabase();
-  return new Promise<CacheMessage[]>((resolve, reject) => {
-    const tx = db.transaction(MESSAGES_STORE, "readonly");
-    const store = tx.objectStore(MESSAGES_STORE);
-    const request = store.openCursor();
-    const results: CacheMessage[] = [];
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor && results.length < batchSize) {
-        const msg = cursor.value as CacheMessage;
-        if (msg.status === "pending" || (!msg.status && msg.internalDate === null)) results.push(msg);
-        cursor.continue();
-      } else {
-        resolve(results);
-      }
-    };
-    request.onerror = () => reject(request.error);
-  });
 }
 
 export async function clearAll(): Promise<void> {
@@ -150,49 +108,8 @@ export async function clearAll(): Promise<void> {
   });
 }
 
-/** Given label IDs, read their labelIdx entries, batch-fetch message records, filter by scope, and return per-label count. */
-export async function getFilteredLabelCounts(labelIds: string[], scopeTimestamp: number | null): Promise<Record<string, number>> {
-  const counts: Record<string, number> = {};
-
-  for (const labelId of labelIds) {
-    const msgIds = await getMeta<string[]>(`labelIdx:${labelId}`);
-    if (!msgIds) continue;
-    if (msgIds.length === 0) { counts[labelId] = 0; continue; }
-
-    const msgMap = await getMessagesBatch(msgIds);
-    let count = 0;
-    for (const msg of msgMap.values()) {
-      if (scopeTimestamp !== null && (!msg.internalDate || msg.internalDate < scopeTimestamp)) continue;
-      count++;
-    }
-    counts[labelId] = count;
-  }
-
-  return counts;
-}
-
 export async function getMessageCount(): Promise<number> {
   const db = await openDatabase();
   return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.count());
 }
 
-export async function countMessagesWithoutDates(): Promise<number> {
-  const db = await openDatabase();
-  return new Promise<number>((resolve, reject) => {
-    const tx = db.transaction(MESSAGES_STORE, "readonly");
-    const store = tx.objectStore(MESSAGES_STORE);
-    const request = store.openCursor();
-    let count = 0;
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor) {
-        const msg = cursor.value as CacheMessage;
-        if (msg.status === "pending" || (!msg.status && msg.internalDate === null)) count++;
-        cursor.continue();
-      } else {
-        resolve(count);
-      }
-    };
-    request.onerror = () => reject(request.error);
-  });
-}

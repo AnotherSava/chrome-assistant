@@ -25,19 +25,26 @@ for (const key of OLD_CACHE_KEYS) localStorage.removeItem(key);
 
 export function scopeToTimestamp(scopeValue: string): number | null {
   if (scopeValue === "any") return null;
-  const now = Date.now();
-  const map: Record<string, () => number> = {
-    "1w": () => now - 7 * 86400000,
-    "2w": () => now - 14 * 86400000,
-    "1m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 1); return d.getTime(); },
-    "2m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 2); return d.getTime(); },
-    "6m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 6); return d.getTime(); },
-    "1y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); return d.getTime(); },
-    "3y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 3); return d.getTime(); },
-    "5y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 5); return d.getTime(); },
+  const now = new Date();
+  const map: Record<string, () => Date> = {
+    "1w": () => new Date(now.getTime() - 7 * 86400000),
+    "2w": () => new Date(now.getTime() - 14 * 86400000),
+    "1m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 1); return d; },
+    "2m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 2); return d; },
+    "6m": () => { const d = new Date(now); d.setMonth(d.getMonth() - 6); return d; },
+    "1y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); return d; },
+    "3y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 3); return d; },
+    "5y": () => { const d = new Date(now); d.setFullYear(d.getFullYear() - 5); return d; },
   };
   const fn = map[scopeValue];
-  return fn ? fn() : null;
+  if (!fn) return null;
+  // Normalize to start-of-day so the timestamp is day-granular — matching the
+  // Gmail `after:YYYY/MM/DD` query.  This ensures the same scope on the same
+  // day always produces the same numeric key, preventing duplicate API calls
+  // and duplicate scopedIdSets entries in the cache manager.
+  const d = fn();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +210,8 @@ const KEY_SHOW_STARRED = "ca_show_starred";
 const KEY_SHOW_IMPORTANT = "ca_show_important";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
+/** Cached scope timestamp — recomputed only when scopeValue changes, so the same value is sent on every message for deduplication in background.ts. */
+let cachedScopeTimestamp: number | null = scopeToTimestamp(scopeValue);
 let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
 let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
 let showCounts: boolean = loadSetting(KEY_SHOW_COUNTS, true);
@@ -263,7 +272,8 @@ function buildDisplayPanel(): void {
     if (showCounts) {
       loadLabels(true);
     } else {
-      labelCounts = null;
+      // Keep labelCounts when scope is active (needed for zero-count label filtering)
+      if (scopeValue === "any") labelCounts = null;
       refreshLabelsIfVisible();
     }
   });
@@ -438,6 +448,10 @@ export function setShowImportant(value: boolean): void {
   if (showImportant) LABELS_HIDDEN.delete("IMPORTANT"); else LABELS_HIDDEN.add("IMPORTANT");
 }
 
+export function setScopeValue(value: string): void {
+  scopeValue = value;
+}
+
 
 function countNodes(node: LabelTreeNode): number {
   return 1 + node.children.reduce((sum, c) => sum + countNodes(c), 0);
@@ -512,12 +526,13 @@ let countsPending = false;
 
 /** Request just label counts from background (no Gmail API call). */
 function requestCounts(): void {
-  if (!activePort || !showCounts) return;
+  if (!activePort) return;
+  if (!showCounts && scopeValue === "any") return;
   if (countsInFlight) { countsPending = true; return; }
   countsInFlight = true;
   countsPending = false;
   fetchCountsSeq++;
-  activePort.postMessage({ type: "fetchCounts", scopeTimestamp: scopeToTimestamp(scopeValue), seq: fetchCountsSeq });
+  activePort.postMessage({ type: "fetchCounts", scopeTimestamp: cachedScopeTimestamp, seq: fetchCountsSeq });
 }
 
 function renderLabelTree(nodes: LabelTreeNode[]): string {
@@ -587,9 +602,13 @@ function setupFilterBar(): void {
   const scopeSelect = document.getElementById("scope-select") as HTMLSelectElement | null;
   scopeSelect?.addEventListener("change", () => {
     scopeValue = scopeSelect.value;
+    cachedScopeTimestamp = scopeToTimestamp(scopeValue);
     saveSetting(KEY_SCOPE_VALUE, scopeValue);
     sendSelectionChanged();
-    if (showCounts) requestCounts();
+    labelCounts = null;
+    if (countsInFlight) fetchCountsSeq++;
+    requestCounts();
+    refreshLabelsIfVisible();
   });
 }
 
@@ -616,7 +635,7 @@ function renderLabels(labels: GmailLabel[]): void {
 // ---------------------------------------------------------------------------
 
 /** Last cache progress pushed from background */
-let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; datesTotal: number; datesDone: number; currentLabel?: string } | null = null;
+let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; currentLabel?: string } | null = null;
 
 /** Last label query result from background */
 let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
@@ -639,7 +658,7 @@ function sendSelectionChanged(): void {
   lastQueryError = false;
   queryLabelSeq++;
   updateCacheProgress();
-  activePort.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: scopeToTimestamp(scopeValue), seq: queryLabelSeq });
+  activePort.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp, seq: queryLabelSeq });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -664,8 +683,17 @@ function renderFilteredLabels(): void {
   if (!cachedLabels) return;
 
   if (!activeLabelId || !lastLabelResult) {
-    // No label selected or no query result yet — show all labels
-    renderLabels(cachedLabels);
+    // No label selected or no query result yet
+    // When scope is active and labelCounts is available, hide zero-count labels
+    const cacheIsBuilding = lastCacheProgress?.phase === "labels";
+    if (scopeValue !== "any" && labelCounts && Object.keys(labelCounts).length > 0 && !cacheIsBuilding) {
+      const visibleIds = new Set(Object.keys(labelCounts));
+      const withParents = addParentChain(visibleIds, cachedLabels);
+      const filtered = cachedLabels.filter(l => withParents.has(l.id));
+      renderLabels(filtered.length > 0 ? filtered : cachedLabels);
+    } else {
+      renderLabels(cachedLabels);
+    }
     return;
   }
 
@@ -695,11 +723,6 @@ function cacheStatusIcon(done: boolean): string {
   return done ? '<span class="cache-done">&#x2714;</span>' : '<span class="cache-spin">&#x25E0;</span>';
 }
 
-function formatCacheStatus(label: string, done: boolean, detail: string | null, count: number | null): string {
-  if (done) return `${label}: ${count ?? 0} emails ${cacheStatusIcon(true)}`;
-  const info = detail ?? "starting...";
-  return `${label}: ${info} ${cacheStatusIcon(false)}`;
-}
 
 function updateCacheProgress(): void {
   const el = document.getElementById("cache-progress");
@@ -709,16 +732,15 @@ function updateCacheProgress(): void {
   if (lastQueryError && activeLabelId) {
     parts.push("query failed — showing unfiltered labels");
   } else if (lastLabelResult && activeLabelId) {
-    parts.push(formatCacheStatus("current", true, null, lastLabelResult.count));
+    parts.push(`current: ${lastLabelResult.count} emails ${cacheStatusIcon(true)}`);
   }
 
-  if (lastCacheProgress) {
-    if (lastCacheProgress.phase === "labels") {
-      const labelName = lastCacheProgress.currentLabel ? ` — ${lastCacheProgress.currentLabel}` : "";
-      parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
-    } else if (lastCacheProgress.phase === "dates") {
-      parts.push(`Background caching: dates ${lastCacheProgress.datesDone}/${lastCacheProgress.datesTotal} ${cacheStatusIcon(false)}`);
-    }
+  if (lastCacheProgress && lastCacheProgress.phase === "labels") {
+    const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
+    parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
+  } else if (lastCacheProgress && lastCacheProgress.phase === "scope") {
+    const count = lastCacheProgress.labelsDone > 0 ? ` ${lastCacheProgress.labelsDone}` : "";
+    parts.push(`Fetching scope${count} ${cacheStatusIcon(false)}`);
   }
 
   el.innerHTML = parts.join(" | ");
@@ -782,7 +804,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; datesTotal?: number; datesDone?: number; currentLabel?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -830,18 +852,32 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     refreshLabelsIfVisible();
     // If a label is selected, send selection to background for query + navigation
     if (activeLabelId) sendSelectionChanged();
-    // Request counts separately (non-blocking)
-    if (showCounts) requestCounts();
+    // Request counts separately (non-blocking) — needed for badge display AND scope-based label filtering
+    if (showCounts || scopeValue !== "any") requestCounts();
   } else if (message.type === "labelsError") {
     if (currentTab === "filters" && onGmailPage && !cachedLabels) {
       showContent('<div class="status">Loading labels...</div>');
       setTimeout(() => { if (!cachedLabels && onGmailPage) loadLabels(true); }, 3000);
     }
-  } else if (message.type === "countsReady" && message.counts) {
-    if (message.seq !== undefined && message.seq !== fetchCountsSeq) return;
+  } else if (message.type === "countsReady") {
+    if (message.seq !== undefined && message.seq !== fetchCountsSeq) {
+      countsInFlight = false;
+      if (countsPending) requestCounts();
+      return;
+    }
     countsInFlight = false;
-    labelCounts = message.counts;
-    updateCountsInPlace();
+    if (message.counts) {
+      labelCounts = message.counts;
+      const cacheIsBuilding = lastCacheProgress?.phase === "labels";
+      if (scopeValue !== "any" && !cacheIsBuilding) {
+        refreshLabelsIfVisible();
+      } else {
+        updateCountsInPlace();
+      }
+    } else {
+      labelCounts = null;
+      refreshLabelsIfVisible();
+    }
     if (countsPending) requestCounts();
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
@@ -853,10 +889,10 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "cacheState") {
     // Cache progress pushed from background
-    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, datesTotal: message.datesTotal ?? 0, datesDone: message.datesDone ?? 0, currentLabel: message.currentLabel };
+    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, currentLabel: message.currentLabel };
     updateCacheProgress();
     // Refresh counts during cache build (completion re-query is handled by service worker)
-    if (message.phase === "labels" && showCounts) {
+    if (message.phase === "labels" && (showCounts || scopeValue !== "any")) {
       requestCounts();
     }
   } else if (message.type === "labelResult" && message.labelId !== undefined) {
@@ -895,6 +931,8 @@ if (chrome.runtime?.connect) {
       chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant }); syncState(); });
       port.onDisconnect.addListener(() => {
         activePort = null;
+        countsInFlight = false;
+        countsPending = false;
         if (!chrome.runtime?.id) return;
         setTimeout(connectToBackground, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);

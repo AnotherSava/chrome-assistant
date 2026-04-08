@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import "fake-indexeddb/auto";
-import { openDatabase, closeDatabase, putMessages, getMessage, getMessagesByLabel, getMeta, setMeta, getMessagesWithoutDates, clearAll, getMessageCount } from "../src/cache-db.js";
+import { openDatabase, closeDatabase, putMessages, getMessage, getMeta, setMeta, clearAll, getMessageCount } from "../src/cache-db.js";
 import type { CacheMessage } from "@core/types.js";
 
 beforeEach(async () => {
@@ -16,13 +16,6 @@ describe("openDatabase", () => {
     expect(db.objectStoreNames.contains("meta")).toBe(true);
   });
 
-  it("creates internalDate index on messages store", async () => {
-    const db = await openDatabase();
-    const tx = db.transaction("messages", "readonly");
-    const store = tx.objectStore("messages");
-    expect(store.indexNames.contains("internalDate")).toBe(true);
-  });
-
   it("returns the same promise on subsequent calls", async () => {
     const p1 = openDatabase();
     const p2 = openDatabase();
@@ -36,8 +29,8 @@ describe("openDatabase", () => {
 describe("putMessages", () => {
   it("inserts messages into the store", async () => {
     const msgs: CacheMessage[] = [
-      { id: "msg1", internalDate: 1700000000000, labelIds: ["INBOX", "Label_1"] },
-      { id: "msg2", internalDate: null, labelIds: ["SENT"] },
+      { id: "msg1", labelIds: ["INBOX", "Label_1"] },
+      { id: "msg2", labelIds: ["SENT"] },
     ];
     await putMessages(msgs);
     const count = await getMessageCount();
@@ -45,12 +38,11 @@ describe("putMessages", () => {
   });
 
   it("upserts messages with the same id", async () => {
-    await putMessages([{ id: "msg1", internalDate: null, labelIds: ["INBOX"] }]);
-    await putMessages([{ id: "msg1", internalDate: 1700000000000, labelIds: ["INBOX", "SENT"] }]);
+    await putMessages([{ id: "msg1", labelIds: ["INBOX"] }]);
+    await putMessages([{ id: "msg1", labelIds: ["INBOX", "SENT"] }]);
     const count = await getMessageCount();
     expect(count).toBe(1);
     const msg = await getMessage("msg1");
-    expect(msg?.internalDate).toBe(1700000000000);
     expect(msg?.labelIds).toEqual(["INBOX", "SENT"]);
   });
 });
@@ -62,30 +54,12 @@ describe("getMessage", () => {
   });
 
   it("returns the stored message", async () => {
-    await putMessages([{ id: "msg1", internalDate: 123, labelIds: ["A"] }]);
+    await putMessages([{ id: "msg1", labelIds: ["A"] }]);
     const msg = await getMessage("msg1");
-    expect(msg).toEqual({ id: "msg1", internalDate: 123, labelIds: ["A"] });
+    expect(msg).toEqual({ id: "msg1", labelIds: ["A"] });
   });
 });
 
-describe("getMessagesByLabel", () => {
-  it("returns only messages with the specified label", async () => {
-    await putMessages([
-      { id: "msg1", internalDate: 100, labelIds: ["INBOX", "Label_1"] },
-      { id: "msg2", internalDate: 200, labelIds: ["SENT"] },
-      { id: "msg3", internalDate: 300, labelIds: ["INBOX", "Label_2"] },
-    ]);
-    const results = await getMessagesByLabel("INBOX");
-    expect(results).toHaveLength(2);
-    expect(results.map((m) => m.id).sort()).toEqual(["msg1", "msg3"]);
-  });
-
-  it("returns empty array when no messages have the label", async () => {
-    await putMessages([{ id: "msg1", internalDate: 100, labelIds: ["INBOX"] }]);
-    const results = await getMessagesByLabel("NONEXISTENT");
-    expect(results).toHaveLength(0);
-  });
-});
 
 describe("getMeta / setMeta", () => {
   it("returns undefined for missing key", async () => {
@@ -114,43 +88,9 @@ describe("getMeta / setMeta", () => {
   });
 });
 
-describe("getMessagesWithoutDates", () => {
-  it("returns only messages with internalDate === null", async () => {
-    await putMessages([
-      { id: "msg1", internalDate: 1700000000000, labelIds: ["INBOX"] },
-      { id: "msg2", internalDate: null, labelIds: ["SENT"] },
-      { id: "msg3", internalDate: null, labelIds: ["INBOX"] },
-      { id: "msg4", internalDate: 1700100000000, labelIds: ["SENT"] },
-    ]);
-    const results = await getMessagesWithoutDates();
-    expect(results).toHaveLength(2);
-    expect(results.every((m) => m.internalDate === null)).toBe(true);
-  });
-
-  it("respects batchSize limit", async () => {
-    const msgs: CacheMessage[] = Array.from({ length: 10 }, (_, i) => ({
-      id: `msg${i}`,
-      internalDate: null,
-      labelIds: ["INBOX"],
-    }));
-    await putMessages(msgs);
-    const results = await getMessagesWithoutDates(3);
-    expect(results).toHaveLength(3);
-  });
-
-  it("returns empty array when all messages have dates", async () => {
-    await putMessages([
-      { id: "msg1", internalDate: 100, labelIds: ["INBOX"] },
-      { id: "msg2", internalDate: 200, labelIds: ["SENT"] },
-    ]);
-    const results = await getMessagesWithoutDates();
-    expect(results).toHaveLength(0);
-  });
-});
-
 describe("clearAll", () => {
   it("removes all messages and meta", async () => {
-    await putMessages([{ id: "msg1", internalDate: 100, labelIds: ["INBOX"] }]);
+    await putMessages([{ id: "msg1", labelIds: ["INBOX"] }]);
     await setMeta("account", "/mail/u/0/");
     await clearAll();
     const count = await getMessageCount();
@@ -168,9 +108,9 @@ describe("getMessageCount", () => {
 
   it("returns correct count after inserts", async () => {
     await putMessages([
-      { id: "msg1", internalDate: 100, labelIds: ["INBOX"] },
-      { id: "msg2", internalDate: 200, labelIds: ["SENT"] },
-      { id: "msg3", internalDate: null, labelIds: ["INBOX"] },
+      { id: "msg1", labelIds: ["INBOX"] },
+      { id: "msg2", labelIds: ["SENT"] },
+      { id: "msg3", labelIds: ["INBOX"] },
     ]);
     const count = await getMessageCount();
     expect(count).toBe(3);
