@@ -6,7 +6,7 @@ import { getMeta } from "./cache-db.js";
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
 interface PortSelection { labelId: string | null; includeChildren: boolean; scopeTimestamp: number | null; seq: number }
-interface PortState { returnToInbox: boolean; onFiltersTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null; lastSelection: PortSelection | null; lastScopeTimestamp: number | null; resultGeneration: number; countsGeneration: number }
+interface PortState { returnToInbox: boolean; onFiltersTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null; lastSelection: PortSelection | null; lastScopeTimestamp: number | null | undefined; resultGeneration: number; countsGeneration: number }
 const portState = new Map<chrome.runtime.Port, PortState>();
 const pendingReturnToInbox = new Map<number, ReturnType<typeof setTimeout>>();
 /** Last hash fragment the extension navigated each tab to via selectionChanged — used to suppress userNavigated for our own navigations. */
@@ -52,19 +52,20 @@ function invalidateCachedScope(): void {
 function pushUpdatedResults(): void {
   for (const [port, state] of portState) {
     const scopeAtCall = state.lastScopeTimestamp;
+    const scopeForApi = scopeAtCall ?? null;
     // Ensure scope filter is applied before querying (e.g. after service worker restart)
-    const scopeReady = ensureScopeFilter(scopeAtCall);
+    const scopeReady = ensureScopeFilter(scopeForApi);
     const sel = state.lastSelection;
     if (sel?.labelId) {
       const { labelId, includeChildren, scopeTimestamp, seq } = sel;
       const myResultGen = ++state.resultGeneration;
-      scopeReady.then(() => cacheManager.queryLabel(labelId, includeChildren, scopeAtCall)).then((result) => {
+      scopeReady.then(() => cacheManager.queryLabel(labelId, includeChildren, scopeForApi)).then((result) => {
         if (state.resultGeneration !== myResultGen) return;
         try { port.postMessage({ type: "labelResult", ...result, seq }); } catch { /* port may be dead */ }
       }).catch(() => {});
     }
     const myCountsGen = ++state.countsGeneration;
-    scopeReady.then(() => cacheManager.getLabelCounts(undefined, scopeAtCall)).then((counts) => {
+    scopeReady.then(() => cacheManager.getLabelCounts(undefined, scopeForApi)).then((counts) => {
       // Skip if scope changed or a newer counts query started while in flight
       if (state.lastScopeTimestamp !== scopeAtCall) return;
       if (state.countsGeneration !== myCountsGen) return;
@@ -83,6 +84,14 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
     // initial setScopeFilter call need to be intersected with the scoped ID set.
     invalidateCachedScope();
     pushUpdatedResults();
+  } else if (progress.phase === "expanding") {
+    // Keep service worker alive during background expansion
+    chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
+    if (progress.labelsTotal === 0) {
+      // Tier completion — push updated counts without invalidating scope
+      // (which would cancel the in-progress expansion).
+      pushUpdatedResults();
+    }
   }
 });
 
@@ -111,9 +120,22 @@ chrome.commands.getAll((commands) => {
   }
 });
 
+/** Get the active scope timestamp from the sidepanel port for a specific window. Falls back to any connected port if no window match. */
+function getScopeForWindow(windowId?: number): number | null | undefined {
+  if (windowId !== undefined) {
+    for (const [, state] of portState) {
+      if (state.windowId === windowId && state.lastScopeTimestamp !== undefined) return state.lastScopeTimestamp;
+    }
+  }
+  for (const [, state] of portState) {
+    if (state.lastScopeTimestamp !== undefined) return state.lastScopeTimestamp;
+  }
+  return undefined;
+}
+
 const CACHE_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes between incremental refreshes
 
-export async function startCacheIfNeeded(accountPath: string): Promise<void> {
+export async function startCacheIfNeeded(accountPath: string, scopeTimestamp?: number | null): Promise<void> {
   if (cacheStarted && currentAccountPath === accountPath) return;
   currentAccountPath = accountPath;
   cacheStarted = true;
@@ -192,7 +214,7 @@ export async function startCacheIfNeeded(accountPath: string): Promise<void> {
   }
   const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
-  cacheManager.startFetch(accountPath).catch((err) => {
+  cacheManager.startFetch(accountPath, scopeTimestamp).catch((err) => {
     console.warn("Cache fetch failed:", err);
     if (gen === cacheGeneration) {
       cacheStarted = false;
@@ -276,7 +298,7 @@ function broadcastToWindow(windowId: number, message: Record<string, unknown>): 
 chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
   if (port.name !== "sidepanel") return;
 
-  const state: PortState = { returnToInbox: true, onFiltersTab: true, gmailTabId: null, gmailTabUrl: null, windowId: null, lastSelection: null, lastScopeTimestamp: null, resultGeneration: 0, countsGeneration: 0 };
+  const state: PortState = { returnToInbox: true, onFiltersTab: true, gmailTabId: null, gmailTabUrl: null, windowId: null, lastSelection: null, lastScopeTimestamp: undefined, resultGeneration: 0, countsGeneration: 0 };
   portState.set(port, state);
 
   // Window ID will be set by the "initWindow" message from the side panel
@@ -284,6 +306,8 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
   port.onMessage.addListener((message: { type: string; mode?: string; labelId?: string; includeChildren?: boolean; scope?: string | null; scopeTimestamp?: number | null; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; seq?: number; showStarred?: boolean; showImportant?: boolean }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
+      // Capture scope from sidepanel's saved setting so the first startCacheIfNeeded uses it
+      if (message.scopeTimestamp !== undefined) state.lastScopeTimestamp = message.scopeTimestamp ?? null;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
         const tab = tabs[0];
         if (!tab?.id || !tab.url) return;
@@ -295,7 +319,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tab.id); }
           const account = gmailAccountPath(tab.url);
           port.postMessage({ type: "resultsReady", accountPath: account });
-          startCacheIfNeeded(account);
+          startCacheIfNeeded(account, getScopeForWindow(message.windowId));
         } else {
           port.postMessage({ type: "notOnGmail" });
         }
@@ -404,6 +428,9 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       if (cacheStarted) {
         const notify = (): void => {
           for (const [p] of portState) { try { p.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0 }); } catch { /* port may be dead */ } }
+          // Do not clear the keepalive alarm here — if a main fetch or background expansion
+          // is still running, clearing it could let the service worker terminate. The progress
+          // callback clears the alarm when the build/expansion actually completes.
           // Reset cached scope so ensureScopeFilter re-runs — the newly prioritized
           // label needs to be included in the scoped index.
           invalidateCachedScope();
@@ -487,7 +514,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         if (!lastHash || (currentHash !== lastHash && !currentHash.startsWith(lastHash + "/"))) {
           broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
         }
-        startCacheIfNeeded(account);
+        startCacheIfNeeded(account, getScopeForWindow(tab.windowId));
       } else {
         updateGmailTab(tab.windowId, null, null);
         broadcastToWindow(tab.windowId, { type: "notOnGmail" });
@@ -509,7 +536,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
       const account = gmailAccountPath(tab.url);
       updateGmailTab(activeInfo.windowId, activeInfo.tabId, tab.url ?? null);
       broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: account });
-      startCacheIfNeeded(account);
+      startCacheIfNeeded(account, getScopeForWindow(activeInfo.windowId));
     } else {
       updateGmailTab(activeInfo.windowId, null, null);
       broadcastToWindow(activeInfo.windowId, { type: "notOnGmail" });

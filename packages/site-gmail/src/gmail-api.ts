@@ -72,13 +72,16 @@ export function buildSearchQuery(labelName: string | string[] | null, scope: str
 
 
 /** Fetch all message IDs for a label, paginating automatically. Uses labelIds API parameter for reliable filtering (avoids search query syntax issues with system/category labels). */
-export async function fetchLabelMessageIds(labelId: string, scopeDate?: string): Promise<string[]> {
+export async function fetchLabelMessageIds(labelId: string, scopeDate?: string, beforeDate?: string): Promise<string[]> {
   const token = await getAuthToken();
   const allIds: string[] = [];
   let pageToken: string | undefined;
   do {
     let path = `/messages?maxResults=500&labelIds=${encodeURIComponent(labelId)}`;
-    if (scopeDate) path += `&q=${encodeURIComponent(`after:${scopeDate}`)}`;
+    const qParts: string[] = [];
+    if (scopeDate) qParts.push(`after:${scopeDate}`);
+    if (beforeDate) qParts.push(`before:${beforeDate}`);
+    if (qParts.length > 0) path += `&q=${encodeURIComponent(qParts.join(" "))}`;
     if (pageToken) path += `&pageToken=${encodeURIComponent(pageToken)}`;
     const data = await gmailFetch<MessagesListResponse>(path, token);
     for (const msg of data.messages ?? []) allIds.push(msg.id);

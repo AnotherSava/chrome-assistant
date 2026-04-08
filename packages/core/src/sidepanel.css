@@ -160,6 +160,7 @@ body {
   animation: cache-rotate 1s linear infinite;
 }
 .cache-done { color: #4a4; }
+.cache-error { color: #c44; cursor: help; }
 @keyframes cache-rotate { to { transform: rotate(360deg); } }
 .filter-item select {
   background: #333;

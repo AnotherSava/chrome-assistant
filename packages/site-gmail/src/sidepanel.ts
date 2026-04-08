@@ -635,7 +635,7 @@ function renderLabels(labels: GmailLabel[]): void {
 // ---------------------------------------------------------------------------
 
 /** Last cache progress pushed from background */
-let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; currentLabel?: string } | null = null;
+let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; currentLabel?: string; error?: string } | null = null;
 
 /** Last label query result from background */
 let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
@@ -738,9 +738,16 @@ function updateCacheProgress(): void {
   if (lastCacheProgress && lastCacheProgress.phase === "labels") {
     const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
     parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
+  } else if (lastCacheProgress && lastCacheProgress.phase === "expanding") {
+    const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
+    parts.push(`Expanding cache: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
   } else if (lastCacheProgress && lastCacheProgress.phase === "scope") {
     const count = lastCacheProgress.labelsDone > 0 ? ` ${lastCacheProgress.labelsDone}` : "";
     parts.push(`Fetching scope${count} ${cacheStatusIcon(false)}`);
+  }
+
+  if (lastCacheProgress?.error) {
+    parts.push(`<span class="cache-error" title="${escapeHtml(lastCacheProgress.error)}">&#x26A0;</span>`);
   }
 
   el.innerHTML = parts.join(" | ");
@@ -804,7 +811,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -889,7 +896,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "cacheState") {
     // Cache progress pushed from background
-    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, currentLabel: message.currentLabel };
+    lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, currentLabel: message.currentLabel, error: message.errorText };
     updateCacheProgress();
     // Refresh counts during cache build (completion re-query is handled by service worker)
     if (message.phase === "labels" && (showCounts || scopeValue !== "any")) {
@@ -928,7 +935,7 @@ if (chrome.runtime?.connect) {
       activePort = port;
       reconnectDelay = 1000;
       port.onMessage.addListener(handleMessage);
-      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant }); syncState(); });
+      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id, scopeTimestamp: cachedScopeTimestamp }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant }); syncState(); });
       port.onDisconnect.addListener(() => {
         activePort = null;
         countsInFlight = false;

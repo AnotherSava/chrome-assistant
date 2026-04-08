@@ -58,6 +58,10 @@ const testLabels: GmailLabel[] = [
 describe("CacheManager", () => {
   let manager: CacheManager;
 
+  afterEach(() => {
+    manager.abort();
+  });
+
   beforeEach(() => {
     manager = new CacheManager();
     mockDb._store.clear();
@@ -160,6 +164,64 @@ describe("CacheManager", () => {
       }
     });
 
+    it("initial build with scope stores scoped label indexes and correct cacheDepth", async () => {
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2"];
+        if (labelId === "SENT") return ["m2"];
+        if (labelId === "Label_1") return ["m1"];
+        if (labelId === "Label_2") return ["m2"];
+        return [];
+      });
+
+      const scopeTimestamp = Date.now() - 365 * 24 * 60 * 60 * 1000; // 1 year ago
+      await manager.startFetch("/mail/u/0/", scopeTimestamp);
+
+      // fetchLabelMessageIds should have been called with the scope date string
+      const calls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call[1]).toBeDefined();
+        expect(call[1]).toMatch(/^\d{4}\/\d{2}\/\d{2}$/);
+      }
+
+      // cacheDepth should be stored normalized to midnight (matching UI scopeToTimestamp behavior)
+      const cacheDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(cacheDepth).toBeDefined();
+      const expectedMidnight = new Date(scopeTimestamp);
+      expectedMidnight.setHours(0, 0, 0, 0);
+      expect(cacheDepth.timestamp).toBe(expectedMidnight.getTime());
+
+      // Label indexes should be stored
+      const inboxIdx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(inboxIdx).toEqual(["m1", "m2"]);
+    });
+
+    it("initial build without scope stores full indexes and cacheDepth null", async () => {
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2"];
+        if (labelId === "SENT") return ["m2", "m3"];
+        if (labelId === "Label_1") return ["m1"];
+        if (labelId === "Label_2") return ["m3"];
+        return [];
+      });
+
+      await manager.startFetch("/mail/u/0/");
+
+      // fetchLabelMessageIds should have been called without scope date (undefined)
+      const calls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call[1]).toBeUndefined();
+      }
+
+      // cacheDepth should be null (full coverage)
+      const cacheDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(cacheDepth).toBeDefined();
+      expect(cacheDepth.timestamp).toBeNull();
+    });
+
     it("can be aborted during label fetch", async () => {
       mockApi.fetchLabels.mockResolvedValue(testLabels);
       let callCount = 0;
@@ -226,7 +288,7 @@ describe("CacheManager", () => {
       // The priority fetch will call fetchLabelMessageIds for the uncached label
       mockApi.fetchLabelMessageIds.mockResolvedValue(["m10", "m11"]);
       const result = await manager.queryLabel("Label_priority", false);
-      expect(mockApi.fetchLabelMessageIds).toHaveBeenCalledWith("Label_priority");
+      expect(mockApi.fetchLabelMessageIds).toHaveBeenCalledWith("Label_priority", undefined);
       expect(result.count).toBe(2);
       // Label index should now be in the DB for subsequent queries
       const labelIdx = mockDb._meta.get("labelIdx:Label_priority") as string[];
@@ -618,16 +680,404 @@ describe("CacheManager", () => {
       expect(counts["Label_1"].own).toBe(1);
     });
 
-    it("multi-window: clearScopeState clears all cached scoped ID sets", async () => {
+    it("narrowing scope within cache depth doesn't trigger per-label API calls", async () => {
+      // Initial build with a 3-year scope sets cacheDepth
+      mockApi.fetchLabels.mockResolvedValue(scopeLabels);
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2", "m3"];
+        if (labelId === "SENT") return ["m2", "m3"];
+        if (labelId === "Label_1") return ["m1", "m2"];
+        if (labelId === "Label_2") return ["m3"];
+        return [];
+      });
+
+      const threeYearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000;
+      const threeYearsAgoMidnight = new Date(threeYearsAgo); threeYearsAgoMidnight.setHours(0, 0, 0, 0);
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/", threeYearsAgo);
+
+      // Stop background expansion so it doesn't interfere with scope test
+      mgr.abort();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Verify cacheDepth was set (normalized to midnight)
+      const cacheDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(cacheDepth.timestamp).toBe(threeYearsAgoMidnight.getTime());
+
+      // Clear call counts from initial build
+      mockApi.fetchLabelMessageIds.mockClear();
+      mockApi.fetchScopedMessageIds.mockResolvedValue(["m2", "m3"]);
+
+      // Narrow scope to 1 year (within cache depth of 3 years)
+      const oneYearAgo = Date.now() - 1 * 365 * 24 * 60 * 60 * 1000;
+      await mgr.setScopeFilter(oneYearAgo);
+
+      // fetchScopedMessageIds should have been called (one API call for the scoped ID set)
+      expect(mockApi.fetchScopedMessageIds).toHaveBeenCalledTimes(1);
+      // fetchLabelMessageIds should NOT have been called (no per-label API calls)
+      expect(mockApi.fetchLabelMessageIds).not.toHaveBeenCalled();
+
+      // Verify results are correctly filtered
+      const counts = await mgr.getLabelCounts();
+      expect(counts["INBOX"].own).toBe(2); // m2, m3
+      expect(counts["Label_1"].own).toBe(1); // m2
+      expect(counts["Label_2"].own).toBe(1); // m3
+    });
+
+    it("multi-window: clearScopeState preserves cached scoped ID sets for reuse", async () => {
       manager.setLabels(scopeLabels);
       mockApi.fetchScopedMessageIds.mockResolvedValue(["m2", "m3"]);
       await manager.setScopeFilter(2000);
 
       manager.clearScopeState();
 
-      // After clear, expectedScope=2000 should fall back to unscoped IndexedDB
+      // After clear, the per-timestamp scoped ID set cache is preserved —
+      // expectedScope=2000 still filters via the cached set (no redundant API call)
       const result = await manager.queryLabel("INBOX", false, 2000);
-      expect(result.count).toBe(3); // All messages — no cached scope available
+      expect(result.count).toBe(2); // m2, m3 — filtered via cached scoped ID set
+    });
+  });
+
+  describe("gap-fill (widening scope)", () => {
+    const scopeLabels: GmailLabel[] = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ];
+
+    it("widening scope triggers per-label gap-fill for missing segment only", async () => {
+      // Initial build with 3-year scope
+      mockApi.fetchLabels.mockResolvedValue(scopeLabels);
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2"];
+        if (labelId === "SENT") return ["m2"];
+        if (labelId === "Label_1") return ["m1"];
+        if (labelId === "Label_2") return ["m2"];
+        return [];
+      });
+
+      const threeYearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000;
+      const threeYearsAgoMidnight = new Date(threeYearsAgo); threeYearsAgoMidnight.setHours(0, 0, 0, 0);
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/", threeYearsAgo);
+
+      // Stop background expansion so it doesn't interfere with gap-fill assertions
+      mgr.abort();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Verify cacheDepth (normalized to midnight)
+      const cacheDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(cacheDepth.timestamp).toBe(threeYearsAgoMidnight.getTime());
+
+      // Clear mocks from initial build
+      mockApi.fetchLabelMessageIds.mockClear();
+
+      // Gap-fill will return new older messages
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m10"]);
+      // Scoped IDs for the 5-year scope
+      mockApi.fetchScopedMessageIds.mockResolvedValue(["m1", "m2", "m10"]);
+
+      const progressUpdates: CacheProgress[] = [];
+      mgr.setProgressCallback(p => progressUpdates.push({ ...p }));
+
+      // Widen scope to 5 years
+      const fiveYearsAgo = Date.now() - 5 * 365 * 24 * 60 * 60 * 1000;
+      const fiveYearsAgoMidnight = new Date(fiveYearsAgo); fiveYearsAgoMidnight.setHours(0, 0, 0, 0);
+      await mgr.setScopeFilter(fiveYearsAgo);
+
+      // Wait for background gap-fill to complete
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // fetchLabelMessageIds should have been called with afterDate and beforeDate for gap-fill
+      const gapFillCalls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(gapFillCalls.length).toBe(scopeLabels.length); // one per label
+      for (const call of gapFillCalls) {
+        // afterDate = 5 years ago, beforeDate = 3 years ago
+        expect(call[1]).toBeDefined(); // afterDate (scopeDate param)
+        expect(call[2]).toBeDefined(); // beforeDate
+      }
+
+      // cacheDepth should be updated to the wider scope (normalized to midnight)
+      const newDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(newDepth.timestamp).toBe(fiveYearsAgoMidnight.getTime());
+
+      // New messages should be merged into label indexes
+      const inboxIdx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(inboxIdx).toContain("m10");
+      expect(inboxIdx).toContain("m1");
+      expect(inboxIdx).toContain("m2");
+
+      // Progress should include "expanding" phase
+      const expandingUpdates = progressUpdates.filter(p => p.phase === "expanding");
+      expect(expandingUpdates.length).toBeGreaterThan(0);
+    });
+
+    it("'any' scope from partial cache triggers backward fill", async () => {
+      // Initial build with 3-year scope
+      mockApi.fetchLabels.mockResolvedValue(scopeLabels);
+      mockApi.fetchLabelMessageIds.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") return ["m1", "m2"];
+        if (labelId === "SENT") return ["m2"];
+        if (labelId === "Label_1") return ["m1"];
+        if (labelId === "Label_2") return ["m2"];
+        return [];
+      });
+
+      const threeYearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000;
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/", threeYearsAgo);
+
+      // Stop background expansion so it doesn't interfere
+      mgr.abort();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Clear mocks
+      mockApi.fetchLabelMessageIds.mockClear();
+      // Gap-fill returns older messages
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m20"]);
+
+      // Select "any" scope (null)
+      await mgr.setScopeFilter(null);
+
+      // Wait for background gap-fill
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // fetchLabelMessageIds should be called with no afterDate but with beforeDate
+      const gapFillCalls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(gapFillCalls.length).toBe(scopeLabels.length);
+      for (const call of gapFillCalls) {
+        expect(call[1]).toBeUndefined(); // no afterDate (fetch all older)
+        expect(call[2]).toBeDefined(); // beforeDate = cacheDepth date
+      }
+
+      // cacheDepth should become null (full coverage)
+      const newDepth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(newDepth.timestamp).toBeNull();
+    });
+
+    it("cacheDepth updated after gap-fill completes", async () => {
+      // Initial build with 1-year scope
+      mockApi.fetchLabels.mockResolvedValue(scopeLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+
+      const oneYearAgo = Date.now() - 365 * 24 * 60 * 60 * 1000;
+      const oneYearAgoMidnight = new Date(oneYearAgo); oneYearAgoMidnight.setHours(0, 0, 0, 0);
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/", oneYearAgo);
+
+      // Stop background expansion so it doesn't interfere
+      mgr.abort();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      let depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBe(oneYearAgoMidnight.getTime());
+
+      // Widen to 3 years
+      mockApi.fetchLabelMessageIds.mockClear();
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      mockApi.fetchScopedMessageIds.mockResolvedValue([]);
+
+      const threeYearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000;
+      const threeYearsAgoMidnight = new Date(threeYearsAgo); threeYearsAgoMidnight.setHours(0, 0, 0, 0);
+      await mgr.setScopeFilter(threeYearsAgo);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBe(threeYearsAgoMidnight.getTime());
+
+      // Widen to "any"
+      mockApi.fetchLabelMessageIds.mockClear();
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+      await mgr.setScopeFilter(null);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBeNull();
+    });
+  });
+
+  describe("incremental refresh", () => {
+    const refreshLabels: GmailLabel[] = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+    ];
+
+    it("fetches only new messages since lastFetchTimestamp", async () => {
+      // Simulate a previous completed fetch
+      const lastFetch = Date.now() - 60 * 60 * 1000; // 1 hour ago
+      mockDb._meta.set("fetchState", { phase: "complete", lastFetchTimestamp: lastFetch });
+      mockDb._meta.set("account", "/mail/u/0/");
+      mockDb._meta.set("cacheDepth", { timestamp: null }); // full coverage
+      // Existing label indexes
+      mockDb._meta.set("labelIdx:INBOX", ["m1", "m2"]);
+      mockDb._meta.set("labelIdx:SENT", ["m2"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+
+      mockApi.fetchLabels.mockResolvedValue(refreshLabels);
+      // Incremental refresh returns new messages only
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m3"]);
+
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/");
+
+      // fetchLabelMessageIds should be called with after:date (from lastFetchTimestamp) and no beforeDate
+      const calls = mockApi.fetchLabelMessageIds.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        // All labels had existing indexes, so all should use the incremental scope date
+        expect(call[1]).toBeDefined(); // afterDate from lastFetchTimestamp
+        expect(call[1]).toMatch(/^\d{4}\/\d{2}\/\d{2}$/);
+        expect(call[2]).toBeUndefined(); // no beforeDate
+      }
+
+      // New messages merged into existing indexes
+      const inboxIdx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(inboxIdx).toContain("m1");
+      expect(inboxIdx).toContain("m2");
+      expect(inboxIdx).toContain("m3");
+    });
+
+    it("does not regress cache depth on incremental refresh", async () => {
+      const threeYearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000;
+      const lastFetch = Date.now() - 60 * 60 * 1000;
+      mockDb._meta.set("fetchState", { phase: "complete", lastFetchTimestamp: lastFetch });
+      mockDb._meta.set("account", "/mail/u/0/");
+      mockDb._meta.set("cacheDepth", { timestamp: threeYearsAgo });
+      mockDb._meta.set("labelIdx:INBOX", ["m1"]);
+      mockDb._meta.set("labelIdx:SENT", ["m1"]);
+      mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+
+      mockApi.fetchLabels.mockResolvedValue(refreshLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue([]);
+
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/");
+
+      // Stop background expansion so it doesn't leak into subsequent tests
+      mgr.abort();
+
+      // cacheDepth should remain at threeYearsAgo, not be overwritten
+      const depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBe(threeYearsAgo);
+    });
+  });
+
+  describe("background expansion", () => {
+    const expandLabels: GmailLabel[] = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "SENT", name: "SENT", type: "system" },
+      { id: "Label_1", name: "Work", type: "user" },
+    ];
+
+    it("deepens cache progressively after initial build", async () => {
+      mockApi.fetchLabels.mockResolvedValue(expandLabels);
+      // Initial build returns some messages
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m1"]);
+
+      // Use a 1-week scope so there are many expansion tiers to go through.
+      // Normalize to midnight to match production behavior (scopeToTimestamp normalizes to start-of-day).
+      const normalizeToMidnight = (ts: number): number => { const d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime(); };
+      const oneWeekAgo = normalizeToMidnight(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const twoWeeksAgo = normalizeToMidnight(Date.now() - 14 * 24 * 60 * 60 * 1000);
+      const mgr = new CacheManager();
+
+      // Track cacheDepth values written during expansion
+      const depthHistory: (number | null)[] = [];
+      const baseSetMeta = (key: string, value: unknown) => { mockDb._meta.set(key, value); };
+      mockDb.setMeta.mockImplementation(async (key: string, value: unknown) => {
+        if (key === "cacheDepth") depthHistory.push((value as { timestamp: number | null }).timestamp);
+        baseSetMeta(key, value);
+      });
+
+      const progressUpdates: CacheProgress[] = [];
+      mgr.setProgressCallback(p => progressUpdates.push({ ...p }));
+
+      await mgr.startFetch("/mail/u/0/", oneWeekAgo);
+
+      // Wait for background expansion to run (it's async)
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Abort to stop expansion so it doesn't leak into subsequent tests
+      mgr.abort();
+
+      // cacheDepth should have been expanded beyond the initial 1-week scope
+      const depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      // Should reach full coverage (null) after walking through all tiers
+      expect(depth.timestamp).toBeNull();
+
+      // Verify progressive stepping: first depth is the initial scope (oneWeekAgo),
+      // subsequent depths form a monotonically decreasing sequence ending with null
+      expect(depthHistory.length).toBeGreaterThan(2);
+      // First entry is the initial scope timestamp
+      expect(depthHistory[0]).toBe(oneWeekAgo);
+      // Second entry should be the next tier (2 weeks), not a distant jump (e.g. 5 years).
+      // Allow 1 second of tolerance for Date.now() drift between test setup and startBackgroundExpansion.
+      expect(depthHistory[1]).toBeLessThanOrEqual(twoWeeksAgo + 1000);
+      expect(depthHistory[1]).toBeGreaterThan(twoWeeksAgo - 24 * 60 * 60 * 1000); // within 1 day of 2 weeks ago
+      // All non-null entries should be monotonically decreasing (progressively older)
+      for (let i = 1; i < depthHistory.length; i++) {
+        if (depthHistory[i] === null) {
+          expect(i).toBe(depthHistory.length - 1); // null should be last
+        } else if (depthHistory[i - 1] !== null) {
+          expect(depthHistory[i]!).toBeLessThan(depthHistory[i - 1]!);
+        }
+      }
+
+      // fetchLabelMessageIds should have been called many times — initial build + expansion tiers
+      const totalCalls = mockApi.fetchLabelMessageIds.mock.calls.length;
+      // Initial build: 3 labels. Expansion: at least 3 more labels for the first tier
+      expect(totalCalls).toBeGreaterThan(expandLabels.length);
+
+      // Progress should include "expanding" phase from gap-fills
+      const expandingUpdates = progressUpdates.filter(p => p.phase === "expanding");
+      expect(expandingUpdates.length).toBeGreaterThan(0);
+    });
+
+    it("does not expand when cache already has full coverage", async () => {
+      mockApi.fetchLabels.mockResolvedValue(expandLabels);
+      mockApi.fetchLabelMessageIds.mockResolvedValue(["m1"]);
+
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/"); // no scope = full coverage
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // cacheDepth should be null (full coverage from the start)
+      const depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBeNull();
+
+      // Only the initial build calls, no expansion
+      expect(mockApi.fetchLabelMessageIds.mock.calls.length).toBe(expandLabels.length);
+    });
+
+    it("is interrupted by a new fetch", async () => {
+      mockApi.fetchLabels.mockResolvedValue(expandLabels);
+      let firstExpansionCalls = 0;
+      let interruptTriggered = false;
+      mockApi.fetchLabelMessageIds.mockImplementation(async () => {
+        if (!interruptTriggered) firstExpansionCalls++;
+        // After initial build completes and first expansion call, start a new fetch
+        if (firstExpansionCalls === expandLabels.length + 1 && !interruptTriggered) {
+          interruptTriggered = true;
+          // Don't await — just trigger to interrupt background expansion
+          mgr.startFetch("/mail/u/0/");
+        }
+        return ["m1"];
+      });
+
+      const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const mgr = new CacheManager();
+      await mgr.startFetch("/mail/u/0/", oneWeekAgo);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      mgr.abort();
+
+      // First expansion should have been interrupted after at most one tier (3 labels).
+      // Initial build = 3 calls, then expansion runs at most one tier before isStale stops it.
+      // Without interruption, the first expansion alone would do 3 * 9 = 27 calls.
+      expect(firstExpansionCalls).toBeLessThanOrEqual(expandLabels.length * 2);
     });
   });
 

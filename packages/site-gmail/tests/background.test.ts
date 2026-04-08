@@ -133,7 +133,7 @@ describe("startCacheIfNeeded", () => {
 
   it("starts cache fetch on first call", async () => {
     await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
     expect(alarmsCreateMock).toHaveBeenCalledWith("cache-keepalive", { periodInMinutes: 0.4 });
   });
 
@@ -147,7 +147,7 @@ describe("startCacheIfNeeded", () => {
     await startCacheIfNeeded("/mail/u/0/");
     await startCacheIfNeeded("/mail/u/1/");
     expect(cacheManager.startFetch).toHaveBeenCalledTimes(2);
-    expect(cacheManager.startFetch).toHaveBeenLastCalledWith("/mail/u/1/");
+    expect(cacheManager.startFetch).toHaveBeenLastCalledWith("/mail/u/1/", undefined);
   });
 
   it("does not skip fetch when switching accounts even if old cache is fresh", async () => {
@@ -165,7 +165,7 @@ describe("startCacheIfNeeded", () => {
 
     // Switch to account 1 — stored account is still "/mail/u/0/", so must NOT skip
     await startCacheIfNeeded("/mail/u/1/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/1/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/1/", undefined);
   });
 
   it("resets cacheStarted when loadLabels fails on skip path", async () => {
@@ -183,7 +183,7 @@ describe("startCacheIfNeeded", () => {
     vi.clearAllMocks();
     getMeta.mockResolvedValue(undefined);
     await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
   });
 
   it("fetches missing system label indexes on skip path when settings are enabled", async () => {
@@ -237,7 +237,7 @@ describe("startCacheIfNeeded", () => {
     getMeta.mockResolvedValue(undefined);
     (cacheManager as unknown as Record<string, unknown>).showStarred = false;
     await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
   });
 
   it("marks processed before resolving readiness gate so syncSettings skips duplicate fetch", async () => {
@@ -274,7 +274,7 @@ describe("startCacheIfNeeded", () => {
     getMeta.mockResolvedValue(undefined);
     (cacheManager as unknown as Record<string, unknown>).showStarred = false;
     await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
   });
 
   it("resolves readiness gate and resets cacheStarted when preflight getMeta throws", async () => {
@@ -286,7 +286,7 @@ describe("startCacheIfNeeded", () => {
     vi.clearAllMocks();
     getMeta.mockResolvedValue(undefined);
     await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/");
+    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
   });
 });
 

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { buildSearchQuery, formatLabelForQuery } from "../src/gmail-api.js";
 
 describe("buildSearchQuery", () => {
@@ -98,6 +98,54 @@ describe("formatLabelForQuery", () => {
 
   it("strips quotes from label names", () => {
     expect(formatLabelForQuery('My "Special" Label')).toBe('"my-special-label"');
+  });
+});
+
+describe("fetchLabelMessageIds", () => {
+  let capturedUrls: string[];
+
+  beforeEach(() => {
+    capturedUrls = [];
+    vi.stubGlobal("chrome", { identity: { getAuthToken: vi.fn().mockResolvedValue({ token: "test-token" }), removeCachedAuthToken: vi.fn() } });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [{ id: "m1" }] }) };
+    }));
+  });
+
+  it("includes both after: and before: in query when scopeDate and beforeDate are set", async () => {
+    const { fetchLabelMessageIds } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIds("INBOX", "2024/01/01", "2024/06/01");
+    expect(capturedUrls.length).toBe(1);
+    const url = capturedUrls[0];
+    const qParam = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+    expect(qParam).toBe("after:2024/01/01 before:2024/06/01");
+  });
+
+  it("includes only after: when only scopeDate is set", async () => {
+    const { fetchLabelMessageIds } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIds("INBOX", "2024/01/01");
+    expect(capturedUrls.length).toBe(1);
+    const url = capturedUrls[0];
+    const qParam = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+    expect(qParam).toBe("after:2024/01/01");
+  });
+
+  it("includes only before: when only beforeDate is set", async () => {
+    const { fetchLabelMessageIds } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIds("INBOX", undefined, "2024/06/01");
+    expect(capturedUrls.length).toBe(1);
+    const url = capturedUrls[0];
+    const qParam = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+    expect(qParam).toBe("before:2024/06/01");
+  });
+
+  it("omits q parameter when neither scopeDate nor beforeDate is set", async () => {
+    const { fetchLabelMessageIds } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIds("INBOX");
+    expect(capturedUrls.length).toBe(1);
+    const url = capturedUrls[0];
+    expect(new URL(url).searchParams.has("q")).toBe(false);
   });
 });
 

@@ -31,7 +31,7 @@
 | `labelsError` | Label fetch failed |
 | `labelResult` | Query result for selected label — carries `labelId`, `count`, `coLabelCounts`, `seq` |
 | `countsReady` | Per-label message counts — carries `counts` map |
-| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone` |
+| `cacheState` | Cache build progress — carries `phase` (`labels` \| `scope` \| `scope-done` \| `expanding` \| `complete`), `labelsTotal`, `labelsDone`, optional `currentLabel` |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
 
 ## Key Flows
@@ -69,6 +69,52 @@
 5. Cache manager intersects returned IDs with each `labelIdx:*` entry, stores result in `scopedLabelIdx` map
 6. Subsequent `queryLabel` and `getLabelCounts` calls read from `scopedLabelIdx` instead of IndexedDB label indexes
 7. When scope is null ("any"), `scopedLabelIdx` is cleared and queries read directly from IndexedDB
+
+### Progressive Cache Deepening
+
+The cache tracks how far back it has fetched via `cacheDepth` metadata in IndexedDB (`{ timestamp: number | null }`, where `null` means full coverage). This enables fast initial loads and incremental expansion.
+
+#### Scoped Initial Build
+
+1. Service worker passes the active `scopeTimestamp` to `cacheManager.startFetch(scopeTimestamp)`
+2. If scope is set, Phase 1 fetches per-label with `after:DATE` — only messages within the time range
+3. On completion, stores `cacheDepth: { timestamp: scopeTimestamp }` in IndexedDB meta
+4. If scope is null, fetches all messages and stores `cacheDepth: { timestamp: null }` (full coverage)
+
+#### Narrowing Scope (Local)
+
+1. User narrows scope (e.g., "3 years" → "1 year") — new scope is within `cacheDepth`
+2. Cache manager fetches scoped ID set via `fetchScopedMessageIds` (one API call)
+3. Intersects with existing `labelIdx:*` entries locally — no per-label API calls needed
+4. Scoped ID sets are cached per-timestamp (up to 5, LRU eviction) for instant switching back
+
+#### Widening Scope (Gap-Fill)
+
+1. User widens scope (e.g., "3 years" → "5 years") — new scope extends beyond `cacheDepth`
+2. Cache manager provides immediate partial results from existing indexes intersected with the new scoped ID set
+3. Background gap-fill fetches the missing segment per-label: `fetchLabelMessageIds(labelId, newScopeDate, cacheDepthDate)` using `after:` and `before:`
+4. New IDs are merged into `labelIdx:*` entries, `cacheDepth` updated on completion
+5. Progress reports "Expanding cache: labels X/Y"
+
+#### "Any" Scope from Partial Cache
+
+1. User selects "any" scope when `cacheDepth` has a timestamp (partial coverage)
+2. Cache manager clears `scopedLabelIdx` for immediate full-index access
+3. Background gap-fill fetches from `cacheDepth` backward using `before:cacheDepthDate` (no `after:`)
+4. On completion, `cacheDepth` set to `null` (full coverage)
+
+#### Background Depth Expansion
+
+1. After initial build and incremental refresh complete, if `cacheDepth` is not null, cache manager starts background expansion
+2. Expansion follows predefined tiers (1w → 2w → 1m → 2m → 6m → 1y → 3y → 5y → all)
+3. Each tier triggers a gap-fill for the missing segment, then advances `cacheDepth`
+4. Expansion is interruptible — any new scope change or abort cancels in-progress expansion
+
+#### Incremental Refresh
+
+1. On subsequent cache runs (10-minute refresh), fetches per-label with `after:lastFetchTimestamp` (no `before:`)
+2. Gets only new messages since last run, within current depth
+3. Does not regress `cacheDepth` — keeps the widest depth achieved
 
 ### Zero-Count Label Hiding
 
