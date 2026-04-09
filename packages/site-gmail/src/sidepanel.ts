@@ -605,10 +605,6 @@ function setupFilterBar(): void {
     cachedScopeTimestamp = scopeToTimestamp(scopeValue);
     saveSetting(KEY_SCOPE_VALUE, scopeValue);
     sendSelectionChanged();
-    labelCounts = null;
-    if (countsInFlight) fetchCountsSeq++;
-    requestCounts();
-    refreshLabelsIfVisible();
   });
 }
 
@@ -719,38 +715,76 @@ function renderFilteredLabels(): void {
   renderLabels(filteredLabels.length > 0 ? filteredLabels : cachedLabels);
 }
 
-function cacheStatusIcon(done: boolean): string {
-  return done ? '<span class="cache-done">&#x2714;</span>' : '<span class="cache-spin">&#x25E0;</span>';
-}
-
-
 function updateCacheProgress(): void {
   const el = document.getElementById("cache-progress");
   if (!el) return;
-  const parts: string[] = [];
+
+  // Build text parts (without icons — icons are persistent elements)
+  const textParts: string[] = [];
+  let showSpinner = false;
+  let showCheck = false;
+  let errorText: string | null = null;
 
   if (lastQueryError && activeLabelId) {
-    parts.push("query failed — showing unfiltered labels");
+    textParts.push("query failed — showing unfiltered labels");
   } else if (lastLabelResult && activeLabelId) {
-    parts.push(`current: ${lastLabelResult.count} emails ${cacheStatusIcon(true)}`);
+    textParts.push(`current: ${lastLabelResult.count} emails`);
+    showCheck = true;
   }
 
   if (lastCacheProgress && lastCacheProgress.phase === "labels") {
     const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
-    parts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
+    textParts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName}`);
+    showSpinner = true;
   } else if (lastCacheProgress && lastCacheProgress.phase === "expanding") {
     const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
-    parts.push(`Expanding cache: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName} ${cacheStatusIcon(false)}`);
+    textParts.push(`Expanding cache: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName}`);
+    showSpinner = true;
   } else if (lastCacheProgress && lastCacheProgress.phase === "scope") {
     const count = lastCacheProgress.labelsDone > 0 ? ` ${lastCacheProgress.labelsDone}` : "";
-    parts.push(`Fetching scope${count} ${cacheStatusIcon(false)}`);
+    textParts.push(`Fetching scope${count}`);
+    showSpinner = true;
   }
 
-  if (lastCacheProgress?.error) {
-    parts.push(`<span class="cache-error" title="${escapeHtml(lastCacheProgress.error)}">&#x26A0;</span>`);
+  if (lastCacheProgress?.error) errorText = lastCacheProgress.error;
+
+  // Update persistent elements instead of replacing innerHTML
+  let textEl = el.querySelector(".cache-text") as HTMLSpanElement | null;
+  let spinEl = el.querySelector(".cache-spin") as HTMLSpanElement | null;
+  let checkEl = el.querySelector(".cache-done") as HTMLSpanElement | null;
+  let errEl = el.querySelector(".cache-error") as HTMLSpanElement | null;
+
+  const text = textParts.join(" | ");
+  if (text) {
+    if (!textEl) { textEl = document.createElement("span"); textEl.className = "cache-text"; el.appendChild(textEl); }
+    textEl.textContent = text;
+  } else if (textEl) {
+    textEl.remove();
   }
 
-  el.innerHTML = parts.join(" | ");
+  if (showSpinner) {
+    if (!spinEl) { spinEl = document.createElement("span"); spinEl.className = "cache-spin"; spinEl.textContent = "\u25E0"; el.appendChild(spinEl); }
+  } else if (spinEl) {
+    spinEl.remove();
+  }
+
+  if (showCheck) {
+    if (!checkEl) { checkEl = document.createElement("span"); checkEl.className = "cache-done"; checkEl.textContent = "\u2714"; el.appendChild(checkEl); }
+  } else if (checkEl) {
+    checkEl.remove();
+  }
+
+  if (errorText) {
+    if (!errEl) { errEl = document.createElement("span"); errEl.className = "cache-error"; errEl.textContent = "\u26A0"; el.appendChild(errEl); }
+    errEl.title = errorText;
+  } else if (errEl) {
+    errEl.remove();
+  }
+
+  // Clear everything if no content
+  if (!text && !showSpinner && !showCheck && !errorText) {
+    el.textContent = "";
+  }
 }
 
 function refreshLabelsIfVisible(): void {
@@ -881,10 +915,8 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
       } else {
         updateCountsInPlace();
       }
-    } else {
-      labelCounts = null;
-      refreshLabelsIfVisible();
     }
+    // When counts is null (scope not ready), keep old labelCounts — don't flash all labels
     if (countsPending) requestCounts();
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary

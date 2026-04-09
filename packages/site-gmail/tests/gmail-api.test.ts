@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { buildSearchQuery, formatLabelForQuery } from "../src/gmail-api.js";
+import { buildSearchQuery, formatLabelForQuery, type PageResult } from "../src/gmail-api.js";
 
 describe("buildSearchQuery", () => {
   it("returns empty string with no filters", () => {
@@ -146,6 +146,112 @@ describe("fetchLabelMessageIds", () => {
     expect(capturedUrls.length).toBe(1);
     const url = capturedUrls[0];
     expect(new URL(url).searchParams.has("q")).toBe(false);
+  });
+});
+
+describe("fetchLabelMessageIdsPage", () => {
+  let capturedUrls: string[];
+
+  beforeEach(() => {
+    capturedUrls = [];
+    vi.stubGlobal("chrome", { identity: { getAuthToken: vi.fn().mockResolvedValue({ token: "test-token" }), removeCachedAuthToken: vi.fn() } });
+  });
+
+  it("returns ids and nextPageToken from a single page", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [{ id: "m1" }, { id: "m2" }], nextPageToken: "tok2" }) };
+    }));
+    const { fetchLabelMessageIdsPage } = await import("../src/gmail-api.js");
+    const result: PageResult = await fetchLabelMessageIdsPage("INBOX");
+    expect(result.ids).toEqual(["m1", "m2"]);
+    expect(result.nextPageToken).toBe("tok2");
+    expect(capturedUrls.length).toBe(1);
+  });
+
+  it("returns null nextPageToken when no more pages", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ messages: [{ id: "m1" }] }) })));
+    const { fetchLabelMessageIdsPage } = await import("../src/gmail-api.js");
+    const result = await fetchLabelMessageIdsPage("INBOX");
+    expect(result.nextPageToken).toBeNull();
+  });
+
+  it("passes pageToken when provided", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    }));
+    const { fetchLabelMessageIdsPage } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIdsPage("INBOX", "page2");
+    const url = capturedUrls[0];
+    expect(url).toContain("pageToken=page2");
+  });
+
+  it("includes scopeDate and beforeDate in query", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    }));
+    const { fetchLabelMessageIdsPage } = await import("../src/gmail-api.js");
+    await fetchLabelMessageIdsPage("Label_1", undefined, "2024/01/01", "2024/06/01");
+    const qParam = decodeURIComponent(new URL(capturedUrls[0]).searchParams.get("q") ?? "");
+    expect(qParam).toBe("after:2024/01/01 before:2024/06/01");
+  });
+
+  it("returns empty ids when no messages", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) })));
+    const { fetchLabelMessageIdsPage } = await import("../src/gmail-api.js");
+    const result = await fetchLabelMessageIdsPage("INBOX");
+    expect(result.ids).toEqual([]);
+    expect(result.nextPageToken).toBeNull();
+  });
+});
+
+describe("fetchScopedMessageIdsPage", () => {
+  let capturedUrls: string[];
+
+  beforeEach(() => {
+    capturedUrls = [];
+    vi.stubGlobal("chrome", { identity: { getAuthToken: vi.fn().mockResolvedValue({ token: "test-token" }), removeCachedAuthToken: vi.fn() } });
+  });
+
+  it("returns ids and nextPageToken from a single page", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [{ id: "s1" }, { id: "s2" }], nextPageToken: "stok2" }) };
+    }));
+    const { fetchScopedMessageIdsPage } = await import("../src/gmail-api.js");
+    const result = await fetchScopedMessageIdsPage("2024/01/01");
+    expect(result.ids).toEqual(["s1", "s2"]);
+    expect(result.nextPageToken).toBe("stok2");
+  });
+
+  it("includes after:scopeDate in query", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    }));
+    const { fetchScopedMessageIdsPage } = await import("../src/gmail-api.js");
+    await fetchScopedMessageIdsPage("2024/03/15");
+    const qParam = decodeURIComponent(new URL(capturedUrls[0]).searchParams.get("q") ?? "");
+    expect(qParam).toBe("after:2024/03/15");
+  });
+
+  it("passes pageToken when provided", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      capturedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    }));
+    const { fetchScopedMessageIdsPage } = await import("../src/gmail-api.js");
+    await fetchScopedMessageIdsPage("2024/01/01", "nextPage");
+    expect(capturedUrls[0]).toContain("pageToken=nextPage");
+  });
+
+  it("returns null nextPageToken when no more pages", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ messages: [{ id: "s1" }] }) })));
+    const { fetchScopedMessageIdsPage } = await import("../src/gmail-api.js");
+    const result = await fetchScopedMessageIdsPage("2024/01/01");
+    expect(result.nextPageToken).toBeNull();
   });
 });
 

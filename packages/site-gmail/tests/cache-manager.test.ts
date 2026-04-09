@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CacheManager, type CacheProgress } from "../src/cache-manager.js";
+import { CacheManager, type CacheProgress, type FilterConfig, type OrchestratorAction } from "../src/cache-manager.js";
 import type { CacheMessage, GmailLabel } from "@core/types.js";
 
 // Mock cache-db
@@ -26,6 +26,8 @@ vi.mock("../src/gmail-api.js", () => ({
   fetchLabels: vi.fn(),
   fetchLabelMessageIds: vi.fn(),
   fetchScopedMessageIds: vi.fn(),
+  fetchLabelMessageIdsPage: vi.fn(),
+  fetchScopedMessageIdsPage: vi.fn(),
 }));
 
 import * as dbMock from "../src/cache-db.js";
@@ -46,6 +48,8 @@ const mockApi = apiMock as unknown as {
   fetchLabels: ReturnType<typeof vi.fn>;
   fetchLabelMessageIds: ReturnType<typeof vi.fn>;
   fetchScopedMessageIds: ReturnType<typeof vi.fn>;
+  fetchLabelMessageIdsPage: ReturnType<typeof vi.fn>;
+  fetchScopedMessageIdsPage: ReturnType<typeof vi.fn>;
 };
 
 const testLabels: GmailLabel[] = [
@@ -724,17 +728,17 @@ describe("CacheManager", () => {
       expect(counts["Label_2"].own).toBe(1); // m3
     });
 
-    it("multi-window: clearScopeState preserves cached scoped ID sets for reuse", async () => {
+    it("multi-window: clearScopeState invalidates cached scoped ID sets", async () => {
       manager.setLabels(scopeLabels);
       mockApi.fetchScopedMessageIds.mockResolvedValue(["m2", "m3"]);
       await manager.setScopeFilter(2000);
 
       manager.clearScopeState();
 
-      // After clear, the per-timestamp scoped ID set cache is preserved —
-      // expectedScope=2000 still filters via the cached set (no redundant API call)
+      // After clear, the per-timestamp scoped ID set cache is also cleared —
+      // expectedScope=2000 falls through to unscoped DB read (scope data may be stale)
       const result = await manager.queryLabel("INBOX", false, 2000);
-      expect(result.count).toBe(2); // m2, m3 — filtered via cached scoped ID set
+      expect(result.count).toBe(3); // m1, m2, m3 — unscoped (scoped ID set was cleared)
     });
   });
 
@@ -1124,6 +1128,810 @@ describe("CacheManager", () => {
       expect(labelUpdates[0].labelsDone).toBe(0);
       expect(labelUpdates[1].labelsDone).toBe(1);
       expect(labelUpdates[2].labelsDone).toBe(2);
+    });
+  });
+
+  describe("orchestrator decide()", () => {
+    it("returns empty when labels not loaded", () => {
+      const actions = manager.decide();
+      expect(actions).toHaveLength(0);
+    });
+
+    it("returns fetch-label for initial cache build when no filter set", () => {
+      manager.setLabels(testLabels);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("fetch-label");
+      expect(actions[0].labelId).toBe("INBOX");
+    });
+
+    it("returns fetch-label for selected label as priority 2", () => {
+      manager.setLabels(testLabels);
+      manager.setFilterConfig({ labelId: "Label_1", includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("fetch-label");
+      expect(actions[0].labelId).toBe("Label_1");
+    });
+
+    it("returns fetch-scope as priority 1 when scope timestamp set and not cached", () => {
+      manager.setLabels(testLabels);
+      manager.setFilterConfig({ labelId: "Label_1", includeChildren: false, scopeTimestamp: 1000 });
+      const actions = manager.decide();
+      // fetch-scope is priority 1, so it should come first
+      expect(actions[0].type).toBe("fetch-scope");
+      expect(actions[0].scopeDate).toBeDefined();
+    });
+
+    it("skips fetch-scope when scoped ID set already cached", () => {
+      manager.setLabels(testLabels);
+      // Manually seed the scoped ID set cache
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(1000, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: "Label_1", includeChildren: false, scopeTimestamp: 1000 });
+      const actions = manager.decide();
+      // Should skip scope and go to selected label
+      expect(actions[0].type).toBe("fetch-label");
+      expect(actions[0].labelId).toBe("Label_1");
+    });
+
+    it("skips processed labels in initial build", () => {
+      manager.setLabels(testLabels);
+      manager.markProcessed("INBOX");
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions[0].labelId).toBe("SENT");
+    });
+
+    it("returns empty when all labels processed and no scope needed", () => {
+      manager.setLabels(testLabels);
+      for (const l of testLabels) manager.markProcessed(l.id);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(0);
+    });
+
+    it("uses continuation page token for in-progress label fetch", () => {
+      manager.setLabels(testLabels);
+      manager.setFilterConfig({ labelId: "INBOX", includeChildren: false, scopeTimestamp: null });
+      // Manually set a continuation for INBOX
+      (manager as unknown as { continuations: Map<string, unknown> }).continuations.set("fetch-label:INBOX", { type: "fetch-label", labelId: "INBOX", nextPageToken: "token123" });
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("fetch-label");
+      expect(actions[0].labelId).toBe("INBOX");
+      expect(actions[0].pageToken).toBe("token123");
+    });
+
+    it("uses continuation page token for in-progress scope fetch", () => {
+      manager.setLabels(testLabels);
+      const scopeTs = 1000;
+      const scopeDate = (manager as unknown as { timestampToDateString: (ts: number) => string }).timestampToDateString(scopeTs);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
+      // Manually set a continuation for scope fetch
+      (manager as unknown as { continuations: Map<string, unknown> }).continuations.set("fetch-scope:", { type: "fetch-scope", nextPageToken: "scopeToken", scopeDate });
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("fetch-scope");
+      expect(actions[0].pageToken).toBe("scopeToken");
+    });
+
+    it("enforces no two pages for same label with concurrency > 1", () => {
+      manager.setLabels(testLabels);
+      // Filter selects INBOX which is also first in initial build
+      manager.setFilterConfig({ labelId: "INBOX", includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide(2);
+      // Only one INBOX action, second action should be a different label
+      const inboxActions = actions.filter(a => a.labelId === "INBOX");
+      expect(inboxActions).toHaveLength(1);
+      if (actions.length > 1) {
+        expect(actions[1].labelId).not.toBe("INBOX");
+        expect(actions[1].labelId).toBe("SENT");
+      }
+    });
+
+    it("returns multiple actions for different labels with concurrency > 1", () => {
+      manager.setLabels(testLabels);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide(3);
+      expect(actions.length).toBe(3);
+      const labelIds = actions.map(a => a.labelId);
+      expect(new Set(labelIds).size).toBe(3); // all different labels
+    });
+
+    it("includes scopeDate in fetch-label when scope timestamp set", () => {
+      manager.setLabels(testLabels);
+      // Seed scoped IDs so scope fetch is skipped
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(5000, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: 5000 });
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("fetch-label");
+      expect(actions[0].scopeDate).toBeDefined();
+    });
+
+    it("clears stale scope continuation when scope timestamp changes", () => {
+      manager.setLabels(testLabels);
+      // Use timestamps far enough apart to produce different date strings
+      const oldTs = new Date("2024-01-15").getTime();
+      const newTs = new Date("2024-06-15").getTime();
+      const oldScopeDate = (manager as unknown as { timestampToDateString: (ts: number) => string }).timestampToDateString(oldTs);
+      (manager as unknown as { continuations: Map<string, unknown> }).continuations.set("fetch-scope:", { type: "fetch-scope", nextPageToken: "oldToken", scopeDate: oldScopeDate });
+      // Change to different scope
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: newTs });
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("fetch-scope");
+      expect(actions[0].pageToken).toBeUndefined(); // stale continuation cleared
+    });
+
+    it("fetches requested scope from multi-window ports when filterConfig scope is already cached", () => {
+      manager.setLabels(testLabels);
+      const filterScopeTs = 1000;
+      const requestedTs = 2000;
+      // Seed filterConfig scope as already cached
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(filterScopeTs, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: filterScopeTs });
+      // Request a different scope (simulating a second window)
+      manager.requestScopeFetch(requestedTs);
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("fetch-scope");
+      expect(actions[0].scopeTimestamp).toBe(requestedTs);
+    });
+
+    it("requestScopeFetch is no-op when scope already cached", () => {
+      manager.setLabels(testLabels);
+      const ts = 3000;
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(ts, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: ts });
+      manager.requestScopeFetch(ts);
+      const actions = manager.decide();
+      // No fetch-scope action since both filterConfig scope and requested scope are cached
+      expect(actions.every(a => a.type !== "fetch-scope")).toBe(true);
+    });
+  });
+
+  describe("orchestrator executeAction()", () => {
+    beforeEach(() => {
+      manager.setLabels(testLabels);
+    });
+
+    it("fetch-label stores results and marks processed on last page", async () => {
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1", "m2"], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
+
+      // Label should be marked as processed
+      expect((manager as unknown as { processedLabels: Set<string> }).processedLabels.has("INBOX")).toBe(true);
+      // Messages should be stored
+      const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(idx).toEqual(["m1", "m2"]);
+    });
+
+    it("fetch-label creates continuation on intermediate page", async () => {
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: "page2" });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
+
+      // Should NOT be marked as processed
+      expect((manager as unknown as { processedLabels: Set<string> }).processedLabels.has("INBOX")).toBe(false);
+      // Continuation should exist
+      const conts = (manager as unknown as { continuations: Map<string, { nextPageToken: string }> }).continuations;
+      expect(conts.get("fetch-label:INBOX")?.nextPageToken).toBe("page2");
+    });
+
+    it("fetch-label merges pages into existing index", async () => {
+      // First page
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: "page2" });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
+      // Second page
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m2"], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX", pageToken: "page2" });
+
+      const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(idx).toContain("m1");
+      expect(idx).toContain("m2");
+    });
+
+    it("fetch-scope accumulates IDs across pages and caches on completion", async () => {
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: 5000 });
+      // First page
+      mockApi.fetchScopedMessageIdsPage.mockResolvedValue({ ids: ["m1", "m2"], nextPageToken: "page2" });
+      await manager.executeAction({ type: "fetch-scope", scopeDate: "1970/01/01" });
+      // Should have continuation
+      const conts = (manager as unknown as { continuations: Map<string, { nextPageToken: string }> }).continuations;
+      expect(conts.has("fetch-scope:")).toBe(true);
+
+      // Second page
+      mockApi.fetchScopedMessageIdsPage.mockResolvedValue({ ids: ["m3"], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-scope", scopeDate: "1970/01/01", pageToken: "page2" });
+
+      // Scoped ID set should be cached
+      const scopedIdSets = (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets;
+      expect(scopedIdSets.has(5000)).toBe(true);
+      expect(scopedIdSets.get(5000)!.size).toBe(3);
+      // Continuation should be cleared
+      expect(conts.has("fetch-scope:")).toBe(false);
+    });
+
+    it("fetch-label passes scopeDate and beforeDate to API", async () => {
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: [], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX", scopeDate: "2025/01/01", beforeDate: "2025/06/01" });
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledWith("INBOX", undefined, "2025/01/01", "2025/06/01");
+    });
+  });
+
+  describe("orchestrator loop", () => {
+    afterEach(() => {
+      manager.stop();
+    });
+
+    it("processes all labels then sleeps", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+
+      const startPromise = manager.start();
+      // Wait for loop to process and sleep
+      await new Promise(r => setTimeout(r, 50));
+      manager.stop();
+      await startPromise;
+
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledTimes(1);
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledWith("INBOX", undefined, undefined, undefined);
+      expect((manager as unknown as { processedLabels: Set<string> }).processedLabels.has("INBOX")).toBe(true);
+    });
+
+    it("second start() stops previous loop and restarts", async () => {
+      mockApi.fetchLabels.mockResolvedValue([]);
+      const p1 = manager.start();
+      await new Promise(r => setTimeout(r, 20));
+      // Second start stops the first loop and starts a new one
+      const p2 = manager.start();
+      await new Promise(r => setTimeout(r, 20));
+      manager.stop();
+      await p1;
+      await p2;
+      // fetchLabels called twice — once per start
+      expect(mockApi.fetchLabels).toHaveBeenCalledTimes(2);
+    });
+
+    it("wakes from sleep when setFilterConfig is called", async () => {
+      // Start with all labels processed so loop sleeps
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      manager.markProcessed("INBOX");
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m10"], nextPageToken: null });
+
+      const startPromise = manager.start();
+      await new Promise(r => setTimeout(r, 20)); // loop should be sleeping
+
+      // Add a new unprocessed label by changing filter to an uncached label
+      manager.setLabels([...singleLabel, { id: "Label_1", name: "Work", type: "user" }]);
+      manager.setFilterConfig({ labelId: "Label_1", includeChildren: false, scopeTimestamp: null });
+
+      await new Promise(r => setTimeout(r, 50));
+      manager.stop();
+      await startPromise;
+
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledWith("Label_1", undefined, undefined, undefined);
+    });
+
+    it("handles priority change mid-pagination", async () => {
+      mockApi.fetchLabels.mockResolvedValue(testLabels);
+      let inboxCalls = 0;
+      mockApi.fetchLabelMessageIdsPage.mockImplementation(async (labelId: string) => {
+        if (labelId === "INBOX") {
+          inboxCalls++;
+          if (inboxCalls === 1) {
+            // During first INBOX page, change filter to prioritize Label_1
+            manager.setFilterConfig({ labelId: "Label_1", includeChildren: false, scopeTimestamp: null });
+            return { ids: ["m1"], nextPageToken: "page2" };
+          }
+          return { ids: ["m2"], nextPageToken: null };
+        }
+        return { ids: ["m3"], nextPageToken: null };
+      });
+
+      manager.setFilterConfig({ labelId: "INBOX", includeChildren: false, scopeTimestamp: null });
+      const startPromise = manager.start();
+
+      await new Promise(r => setTimeout(r, 100));
+      manager.stop();
+      await startPromise;
+
+      // Label_1 should have been fetched (priority 2 after filter change)
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledWith("Label_1", undefined, undefined, undefined);
+    });
+
+    it("multi-page fetch uses continuation tokens", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      let callCount = 0;
+      mockApi.fetchLabelMessageIdsPage.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) return { ids: ["m1"], nextPageToken: "page2" };
+        if (callCount === 2) return { ids: ["m2"], nextPageToken: "page3" };
+        return { ids: ["m3"], nextPageToken: null };
+      });
+
+      const startPromise = manager.start();
+      await new Promise(r => setTimeout(r, 100));
+      manager.stop();
+      await startPromise;
+
+      expect(callCount).toBe(3);
+      // Second call should use page token from first
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenNthCalledWith(2, "INBOX", "page2", undefined, undefined);
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenNthCalledWith(3, "INBOX", "page3", undefined, undefined);
+    });
+  });
+
+  describe("orchestrator setFilterConfig()", () => {
+    it("stores config and it is retrievable", () => {
+      const config: FilterConfig = { labelId: "INBOX", includeChildren: true, scopeTimestamp: 5000 };
+      manager.setFilterConfig(config);
+      expect(manager.getFilterConfig()).toEqual(config);
+    });
+
+    it("makes a defensive copy", () => {
+      const config: FilterConfig = { labelId: "INBOX", includeChildren: false, scopeTimestamp: null };
+      manager.setFilterConfig(config);
+      config.labelId = "SENT"; // mutate original
+      expect(manager.getFilterConfig().labelId).toBe("INBOX");
+    });
+  });
+
+  describe("orchestrator gap-fill-label", () => {
+    beforeEach(() => {
+      manager.setLabels(testLabels);
+      for (const l of testLabels) manager.markProcessed(l.id);
+    });
+
+    it("decide returns gap-fill-label when scope is wider than cache depth", () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      // Seed scoped ID set so scope fetch (priority 1) is skipped
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("gap-fill-label");
+      expect(actions[0].labelId).toBe("INBOX");
+      expect(actions[0].scopeDate).toBeDefined();
+      expect(actions[0].beforeDate).toBeDefined();
+    });
+
+    it("decide does not return gap-fill when scope is within cache depth", () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const oneYearAgo = new Date("2025-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(oneYearAgo, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: oneYearAgo });
+      const actions = manager.decide();
+      // Should not be gap-fill since scope is narrower than depth
+      expect(actions.every(a => a.type !== "gap-fill-label")).toBe(true);
+    });
+
+    it("decide does not return gap-fill when depth is null (full coverage)", () => {
+      manager.setCacheDepthTimestamp(null);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: new Date("2021-04-08").getTime() });
+      const actions = manager.decide();
+      expect(actions.every(a => a.type !== "gap-fill-label")).toBe(true);
+    });
+
+    it("decide resets gap-fill progress when scope changes", () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      const sevenYearsAgo = new Date("2019-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set());
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(sevenYearsAgo, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      // Manually mark some labels as gap-fill processed
+      (manager as unknown as { gapFillProcessedLabels: Set<string> }).gapFillProcessedLabels.add("INBOX");
+      (manager as unknown as { gapFillProcessedLabels: Set<string> }).gapFillProcessedLabels.add("SENT");
+      // Change scope — should reset gap-fill progress
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: sevenYearsAgo });
+      const actions = manager.decide();
+      // INBOX and SENT should be eligible again
+      expect(actions[0].type).toBe("gap-fill-label");
+      expect(actions[0].labelId).toBe("INBOX");
+    });
+
+    it("executeAction gap-fill-label stores results and updates depth when all labels done", async () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      const fiveYearsAgoMidnight = new Date(fiveYearsAgo); fiveYearsAgoMidnight.setHours(0, 0, 0, 0);
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      // Initialize gapFillConfig via decide()
+      manager.decide();
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m10"], nextPageToken: null });
+      // Execute gap-fill for each label
+      for (const label of testLabels) {
+        await manager.executeAction({ type: "gap-fill-label", labelId: label.id, scopeDate: "2021/04/08", beforeDate: "2023/04/08" });
+      }
+
+      // cacheDepth should be updated to scope timestamp
+      expect(manager.getCacheDepthTimestamp()).toBe(fiveYearsAgoMidnight.getTime());
+      const depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBe(fiveYearsAgoMidnight.getTime());
+      // Message should be stored
+      const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(idx).toContain("m10");
+    });
+
+    it("executeAction gap-fill-label creates continuation on intermediate page", async () => {
+      const scopeTs = new Date("2021-04-08").getTime();
+      manager.setCacheDepthTimestamp(new Date("2023-04-08").getTime());
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(scopeTs, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
+      manager.decide();
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m10"], nextPageToken: "gapPage2" });
+      await manager.executeAction({ type: "gap-fill-label", labelId: "INBOX", scopeDate: "2021/04/08", beforeDate: "2023/04/08" });
+
+      const conts = (manager as unknown as { continuations: Map<string, { nextPageToken: string }> }).continuations;
+      expect(conts.get("gap-fill-label:INBOX")?.nextPageToken).toBe("gapPage2");
+    });
+
+    it("decide uses continuation token for in-progress gap-fill", () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      // Initialize gap-fill config
+      manager.decide();
+      // Set continuation
+      const afterDate = (manager as unknown as { timestampToDateString: (ts: number) => string }).timestampToDateString(fiveYearsAgo);
+      (manager as unknown as { continuations: Map<string, unknown> }).continuations.set("gap-fill-label:INBOX", { type: "gap-fill-label", labelId: "INBOX", nextPageToken: "gapToken", scopeDate: afterDate, beforeDate: "2023/04/08" });
+      const actions = manager.decide();
+      expect(actions[0].type).toBe("gap-fill-label");
+      expect(actions[0].pageToken).toBe("gapToken");
+    });
+
+    it("gap-fill uses widest scope from scopedIdSets even after requestedScopes is cleared", () => {
+      // Simulate: global filterConfig has a narrow scope (T1), but a secondary window
+      // previously requested a wider scope (T2) that was fetched and is now only in scopedIdSets.
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      const sevenYearsAgo = new Date("2019-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      // Global filter uses the narrow scope (fiveYearsAgo)
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set(["m1"]));
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      // Secondary window's wider scope was fetched — it's in scopedIdSets but NOT in requestedScopes
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(sevenYearsAgo, new Set(["m2"]));
+      // requestedScopes is empty (cleared after fetch) — this is the bug scenario
+      (manager as unknown as { requestedScopes: Set<number> }).requestedScopes.clear();
+
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("gap-fill-label");
+      // Gap-fill should target the wider scope (sevenYearsAgo), not just fiveYearsAgo
+      // The date comes from timestampToDateString which normalizes to midnight UTC;
+      // verify it targets the wider scope, not the narrow one (2021/...)
+      expect(actions[0].scopeDate!.startsWith("2019/")).toBe(true);
+    });
+  });
+
+  describe("orchestrator expand-label", () => {
+    beforeEach(() => {
+      manager.setLabels(testLabels);
+      for (const l of testLabels) manager.markProcessed(l.id);
+    });
+
+    it("decide returns expand-label when depth is partial and no gap-fill needed", () => {
+      const oneWeekAgo = new Date("2026-04-01").getTime();
+      manager.setCacheDepthTimestamp(oneWeekAgo);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("expand-label");
+      expect(actions[0].labelId).toBe("INBOX");
+      expect(actions[0].beforeDate).toBeDefined();
+    });
+
+    it("decide does not return expand-label when depth is null (full coverage)", () => {
+      manager.setCacheDepthTimestamp(null);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions.every(a => a.type !== "expand-label")).toBe(true);
+    });
+
+    it("decide does not return expand-label when gap-fill is needed", () => {
+      const threeYearsAgo = new Date("2023-04-08").getTime();
+      const fiveYearsAgo = new Date("2021-04-08").getTime();
+      manager.setCacheDepthTimestamp(threeYearsAgo);
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(fiveYearsAgo, new Set());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: fiveYearsAgo });
+      const actions = manager.decide();
+      // Should get gap-fill, not expand
+      expect(actions[0].type).toBe("gap-fill-label");
+    });
+
+    it("executeAction expand-label updates depth and resets when tier complete", async () => {
+      const oneWeekAgo = new Date("2026-04-01").getTime();
+      manager.setCacheDepthTimestamp(oneWeekAgo);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      // Initialize expansion target via decide()
+      manager.decide();
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m20"], nextPageToken: null });
+      // Execute expand for each label
+      for (const label of testLabels) {
+        await manager.executeAction({ type: "expand-label", labelId: label.id, scopeDate: "2026/03/25", beforeDate: "2026/04/01" });
+      }
+
+      // cacheDepth should have changed (expanded to a wider tier)
+      const newDepth = manager.getCacheDepthTimestamp();
+      expect(newDepth).not.toBe(oneWeekAgo);
+      // Expansion processed labels should be reset for next tier
+      expect((manager as unknown as { expansionProcessedLabels: Set<string> }).expansionProcessedLabels.size).toBe(0);
+      // currentExpansionTarget should be reset
+      expect((manager as unknown as { currentExpansionTarget: number | null | undefined }).currentExpansionTarget).toBeUndefined();
+    });
+
+    it("executeAction expand-label creates continuation on intermediate page", async () => {
+      manager.setCacheDepthTimestamp(new Date("2026-04-01").getTime());
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      manager.decide();
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m20"], nextPageToken: "expPage2" });
+      await manager.executeAction({ type: "expand-label", labelId: "INBOX", scopeDate: "2026/03/25", beforeDate: "2026/04/01" });
+
+      const conts = (manager as unknown as { continuations: Map<string, { nextPageToken: string }> }).continuations;
+      expect(conts.get("expand-label:INBOX")?.nextPageToken).toBe("expPage2");
+    });
+
+    it("expansion reaches null (full coverage) on last tier", async () => {
+      // Set depth to a very old date so nextExpansionTier returns null
+      const tenYearsAgo = new Date("2016-04-08").getTime();
+      manager.setCacheDepthTimestamp(tenYearsAgo);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      manager.decide();
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: [], nextPageToken: null });
+      for (const label of testLabels) {
+        await manager.executeAction({ type: "expand-label", labelId: label.id, scopeDate: undefined, beforeDate: "2016/04/08" });
+      }
+
+      expect(manager.getCacheDepthTimestamp()).toBeNull();
+      const depth = mockDb._meta.get("cacheDepth") as { timestamp: number | null };
+      expect(depth.timestamp).toBeNull();
+    });
+  });
+
+  describe("orchestrator refresh-label", () => {
+    beforeEach(() => {
+      manager.setLabels(testLabels);
+      for (const l of testLabels) manager.markProcessed(l.id);
+    });
+
+    it("decide returns refresh-label when cache is stale", () => {
+      manager.setCacheDepthTimestamp(null); // full coverage
+      const twentyMinutesAgo = Date.now() - 20 * 60 * 1000;
+      manager.setLastRefreshTimestamp(twentyMinutesAgo);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(1);
+      expect(actions[0].type).toBe("refresh-label");
+      expect(actions[0].labelId).toBe("INBOX");
+      expect(actions[0].scopeDate).toBeDefined();
+    });
+
+    it("decide does not return refresh-label when cache is fresh", () => {
+      manager.setCacheDepthTimestamp(null);
+      manager.setLastRefreshTimestamp(Date.now() - 5 * 60 * 1000); // 5 min ago
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      expect(actions).toHaveLength(0);
+    });
+
+    it("decide does not return refresh-label when expansion is needed", () => {
+      const oneWeekAgo = new Date("2026-04-01").getTime();
+      manager.setCacheDepthTimestamp(oneWeekAgo); // partial depth
+      manager.setLastRefreshTimestamp(Date.now() - 20 * 60 * 1000); // stale
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+      const actions = manager.decide();
+      // Should get expand, not refresh
+      expect(actions[0].type).toBe("expand-label");
+    });
+
+    it("executeAction refresh-label stores results and updates lastRefreshTimestamp when all done", async () => {
+      manager.setCacheDepthTimestamp(null);
+      const oldTimestamp = Date.now() - 20 * 60 * 1000;
+      manager.setLastRefreshTimestamp(oldTimestamp);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m30"], nextPageToken: null });
+      for (const label of testLabels) {
+        await manager.executeAction({ type: "refresh-label", labelId: label.id, scopeDate: "2026/04/07" });
+      }
+
+      // lastRefreshTimestamp should be updated
+      expect(manager.getLastRefreshTimestamp()).toBeGreaterThan(oldTimestamp);
+      // fetchState should be updated in IndexedDB
+      const fetchState = mockDb._meta.get("fetchState") as { phase: string; lastFetchTimestamp: number };
+      expect(fetchState.phase).toBe("complete");
+      expect(fetchState.lastFetchTimestamp).toBeGreaterThan(oldTimestamp);
+      // Messages should be stored
+      const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
+      expect(idx).toContain("m30");
+    });
+
+    it("executeAction refresh-label creates continuation on intermediate page", async () => {
+      manager.setCacheDepthTimestamp(null);
+      manager.setLastRefreshTimestamp(Date.now() - 20 * 60 * 1000);
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m30"], nextPageToken: "refPage2" });
+      await manager.executeAction({ type: "refresh-label", labelId: "INBOX", scopeDate: "2026/04/07" });
+
+      const conts = (manager as unknown as { continuations: Map<string, { nextPageToken: string }> }).continuations;
+      expect(conts.get("refresh-label:INBOX")?.nextPageToken).toBe("refPage2");
+    });
+  });
+
+  describe("orchestrator initial build completion", () => {
+    it("fetch-label sets cacheDepthTimestamp and lastRefreshTimestamp when all labels done", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      manager.setLabels(singleLabel);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
+
+      expect(manager.getCacheDepthTimestamp()).toBeNull(); // null scope = full coverage
+      expect(manager.getLastRefreshTimestamp()).toBeGreaterThan(0);
+      const fetchState = mockDb._meta.get("fetchState") as { phase: string; lastFetchTimestamp: number };
+      expect(fetchState.phase).toBe("complete");
+    });
+
+    it("fetch-label sets cacheDepthTimestamp from scope when all labels done with scope", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      manager.setLabels(singleLabel);
+      const scopeTs = new Date("2025-04-08").getTime();
+      const scopeMidnight = new Date(scopeTs); scopeMidnight.setHours(0, 0, 0, 0);
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+      await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
+
+      expect(manager.getCacheDepthTimestamp()).toBe(scopeMidnight.getTime());
+    });
+  });
+
+  describe("orchestrator progress reporting", () => {
+    afterEach(() => {
+      manager.stop();
+    });
+
+    it("emits labels progress during initial cache build", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      const startPromise = manager.start();
+      await new Promise(r => setTimeout(r, 50));
+      manager.stop();
+      await startPromise;
+
+      const labelUpdates = updates.filter(p => p.phase === "labels");
+      expect(labelUpdates.length).toBeGreaterThanOrEqual(1);
+      // After processing INBOX, we should see it in progress
+      const withLabel = labelUpdates.find(p => p.currentLabel === "INBOX");
+      expect(withLabel).toBeDefined();
+      expect(withLabel!.labelsDone).toBe(1);
+      expect(withLabel!.labelsTotal).toBe(1);
+    });
+
+    it("emits scope progress during scope fetch", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      manager.markProcessed("INBOX");
+
+      // Scope fetch with 2 pages
+      let scopeCalls = 0;
+      mockApi.fetchScopedMessageIdsPage.mockImplementation(async () => {
+        scopeCalls++;
+        if (scopeCalls === 1) return { ids: ["s1", "s2"], nextPageToken: "sp2" };
+        return { ids: ["s3"], nextPageToken: null };
+      });
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: [], nextPageToken: null });
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      const scopeTs = new Date("2025-06-01").getTime();
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
+
+      const startPromise = manager.start();
+      await new Promise(r => setTimeout(r, 100));
+      manager.stop();
+      await startPromise;
+
+      const scopeUpdates = updates.filter(p => p.phase === "scope");
+      expect(scopeUpdates.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("emits expanding progress during gap-fill", async () => {
+      manager.setLabels(testLabels);
+      // All labels already processed, depth is partial, scope wider than depth
+      for (const l of testLabels) manager.markProcessed(l.id);
+      const depthTs = new Date("2025-03-01").getTime();
+      manager.setCacheDepthTimestamp(depthTs);
+      manager.setLastRefreshTimestamp(Date.now());
+      const scopeTs = new Date("2025-01-01").getTime();
+      manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
+
+      // Need scoped ID set to exist so decide() doesn't trigger fetch-scope
+      (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(scopeTs, new Set(["m1"]));
+
+      mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: [], nextPageToken: null });
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      // Run one decide + execute cycle
+      const actions = manager.decide();
+      expect(actions.length).toBeGreaterThan(0);
+      expect(actions[0].type).toBe("gap-fill-label");
+      await manager.executeAction(actions[0]);
+
+      // Manually emit progress as the loop would
+      (manager as unknown as { emitOrchestratorProgress: (a: unknown) => void }).emitOrchestratorProgress(actions[0]);
+
+      const expandingUpdates = updates.filter(p => p.phase === "expanding");
+      expect(expandingUpdates.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("emits complete when idle", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      manager.markProcessed("INBOX");
+      manager.setLastRefreshTimestamp(Date.now());
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      const startPromise = manager.start();
+      await new Promise(r => setTimeout(r, 50));
+      manager.stop();
+      await startPromise;
+
+      const completeUpdates = updates.filter(p => p.phase === "complete");
+      expect(completeUpdates.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("emits error on API failure and recovers", async () => {
+      const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
+      mockApi.fetchLabels.mockResolvedValue(singleLabel);
+
+      let callCount = 0;
+      mockApi.fetchLabelMessageIdsPage.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) throw new Error("rate limit");
+        return { ids: ["m1"], nextPageToken: null };
+      });
+
+      const updates: CacheProgress[] = [];
+      manager.setProgressCallback(p => updates.push({ ...p }));
+
+      const startPromise = manager.start();
+      // Wait for error + backoff (1s) + retry + completion
+      await new Promise(r => setTimeout(r, 1500));
+      manager.stop();
+      await startPromise;
+
+      // Should have an error progress
+      const errorUpdates = updates.filter(p => p.errorText);
+      expect(errorUpdates.length).toBeGreaterThanOrEqual(1);
+      expect(errorUpdates[0].errorText).toContain("rate limit");
+
+      // Should have recovered and processed INBOX
+      expect(callCount).toBeGreaterThanOrEqual(2);
     });
   });
 });

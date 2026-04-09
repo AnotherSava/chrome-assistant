@@ -1,44 +1,41 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock cache-db module — getMeta returns null (no prior fetch state) by default
-vi.mock("../src/cache-db.js", () => ({
-  getMeta: vi.fn().mockResolvedValue(undefined),
-}));
-
 // Mock cache-manager module before background.ts imports it
 vi.mock("../src/cache-manager.js", () => {
-  const mockStartFetch = vi.fn().mockResolvedValue(undefined);
+  const mockStart = vi.fn().mockResolvedValue(undefined);
+  const mockStop = vi.fn();
+  const mockIsOrchestratorRunning = vi.fn().mockReturnValue(false);
+  const mockSetFilterConfig = vi.fn();
+  const mockGetFilterConfig = vi.fn().mockReturnValue({ labelId: null, includeChildren: false, scopeTimestamp: null });
+  const mockWakeOrchestrator = vi.fn();
   const mockQueryLabel = vi.fn().mockResolvedValue({ labelId: "INBOX", count: 5, coLabelCounts: { STARRED: 1 } });
-  const mockAbort = vi.fn();
-  const mockSetProgressCallback = vi.fn();
-  const mockUpdateSystemLabelSettings = vi.fn();
-  const mockPrioritizeLabel = vi.fn().mockResolvedValue(undefined);
+  const mockGetLabelCounts = vi.fn().mockResolvedValue({ INBOX: { own: 10, inclusive: 10 } });
   const mockGetLabels = vi.fn().mockReturnValue([]);
   const mockSetLabels = vi.fn();
-  const mockGetLabelCounts = vi.fn().mockResolvedValue({ INBOX: { own: 10, inclusive: 10 } });
-  let activeScopeTimestamp: number | null | undefined = undefined;
-  const mockSetScopeFilter = vi.fn().mockImplementation((ts: number | null) => { activeScopeTimestamp = ts; return Promise.resolve(); });
-  const mockGetActiveScopeTimestamp = vi.fn().mockImplementation(() => activeScopeTimestamp);
-  const mockClearScopeState = vi.fn().mockImplementation(() => { activeScopeTimestamp = undefined; });
+  const mockSetProgressCallback = vi.fn();
+  const mockUpdateSystemLabelSettings = vi.fn();
+  const mockWhenReady = vi.fn().mockResolvedValue(undefined);
+  const mockLoadLabels = vi.fn().mockResolvedValue(undefined);
+  const mockWaitForScopeReady = vi.fn().mockResolvedValue(true);
+  const mockRequestScopeFetch = vi.fn();
   return {
     CacheManager: vi.fn().mockImplementation(() => ({
-      startFetch: mockStartFetch,
+      start: mockStart,
+      stop: mockStop,
+      isOrchestratorRunning: mockIsOrchestratorRunning,
+      setFilterConfig: mockSetFilterConfig,
+      getFilterConfig: mockGetFilterConfig,
+      wakeOrchestrator: mockWakeOrchestrator,
       queryLabel: mockQueryLabel,
-      abort: mockAbort,
-      setProgressCallback: mockSetProgressCallback,
-      updateSystemLabelSettings: mockUpdateSystemLabelSettings,
-      prioritizeLabel: mockPrioritizeLabel,
+      getLabelCounts: mockGetLabelCounts,
       getLabels: mockGetLabels,
       setLabels: mockSetLabels,
-      getLabelCounts: mockGetLabelCounts,
-      setScopeFilter: mockSetScopeFilter,
-      getActiveScopeTimestamp: mockGetActiveScopeTimestamp,
-      clearScopeState: mockClearScopeState,
-      resetReady: vi.fn(),
-      resolveReady: vi.fn(),
-      loadLabels: vi.fn().mockResolvedValue(undefined),
-      whenReady: vi.fn().mockResolvedValue(undefined),
-      markProcessed: vi.fn(),
+      setProgressCallback: mockSetProgressCallback,
+      updateSystemLabelSettings: mockUpdateSystemLabelSettings,
+      whenReady: mockWhenReady,
+      loadLabels: mockLoadLabels,
+      waitForScopeReady: mockWaitForScopeReady,
+      requestScopeFetch: mockRequestScopeFetch,
       showStarred: false,
       showImportant: false,
     })),
@@ -59,11 +56,17 @@ const tabsUpdateMock = vi.fn().mockResolvedValue(undefined);
   runtime: { onConnect: { addListener: (cb: (port: unknown) => void) => { onConnectListener = cb; } } },
   tabs: { onUpdated: { addListener: noop }, onActivated: { addListener: noop }, query: vi.fn(), update: tabsUpdateMock, get: vi.fn() },
   identity: { getAuthToken: noop, removeCachedAuthToken: noop },
-  alarms: { create: alarmsCreateMock, clear: alarmsClearMock, onAlarm: { addListener: noop } },
+  alarms: { create: alarmsCreateMock, clear: alarmsClearMock, get: vi.fn().mockResolvedValue(undefined), onAlarm: { addListener: noop } },
 };
 
-const { getMeta } = await import("../src/cache-db.js") as unknown as { getMeta: ReturnType<typeof vi.fn> };
-const { buildGmailUrl, startCacheIfNeeded, _resetCacheState, cacheManager } = await import("../src/background.js");
+const { buildGmailUrl, startOrchestrator, _resetCacheState, cacheManager } = await import("../src/background.js");
+
+/** Flush microtask queue and one macrotask — repeat to handle promise chains added by waitForScopeReady. */
+async function flush(ticks = 3): Promise<void> {
+  for (let i = 0; i < ticks; i++) {
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
 
 // Capture the progress callback registered at module load time (before any clearAllMocks)
 const progressCallback = (cacheManager.setProgressCallback as ReturnType<typeof vi.fn>).mock.calls[0][0] as (progress: Record<string, unknown>) => void;
@@ -125,168 +128,46 @@ describe("buildGmailUrl", () => {
   });
 });
 
-describe("startCacheIfNeeded", () => {
+describe("startOrchestrator", () => {
   beforeEach(() => {
     _resetCacheState();
     vi.clearAllMocks();
   });
 
-  it("starts cache fetch on first call", async () => {
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
+  it("starts orchestrator on first call", () => {
+    startOrchestrator("/mail/u/0/");
+    expect(cacheManager.start).toHaveBeenCalledWith("/mail/u/0/");
     expect(alarmsCreateMock).toHaveBeenCalledWith("cache-keepalive", { periodInMinutes: 0.4 });
   });
 
-  it("does not restart cache for same account", async () => {
-    await startCacheIfNeeded("/mail/u/0/");
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledTimes(1);
+  it("does not restart for same account when already running", () => {
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    startOrchestrator("/mail/u/0/");
+    expect(cacheManager.start).toHaveBeenCalledTimes(1);
+    // Simulate orchestrator now running
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    startOrchestrator("/mail/u/0/");
+    expect(cacheManager.start).toHaveBeenCalledTimes(1);
   });
 
-  it("restarts cache on account change", async () => {
-    await startCacheIfNeeded("/mail/u/0/");
-    await startCacheIfNeeded("/mail/u/1/");
-    expect(cacheManager.startFetch).toHaveBeenCalledTimes(2);
-    expect(cacheManager.startFetch).toHaveBeenLastCalledWith("/mail/u/1/", undefined);
+  it("restarts on account change", () => {
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    startOrchestrator("/mail/u/0/");
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    startOrchestrator("/mail/u/1/");
+    // start() internally handles stopping the previous loop
+    expect(cacheManager.start).toHaveBeenCalledWith("/mail/u/1/");
   });
 
-  it("does not skip fetch when switching accounts even if old cache is fresh", async () => {
-    // First call for account 0 — simulate fresh cache in IndexedDB for account 0
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      return Promise.resolve(undefined);
-    });
-    await startCacheIfNeeded("/mail/u/0/");
-    // Fresh cache for same account — should skip (no startFetch) but still load labels
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    expect(cacheManager.loadLabels).toHaveBeenCalled();
-
-    // Switch to account 1 — stored account is still "/mail/u/0/", so must NOT skip
-    await startCacheIfNeeded("/mail/u/1/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/1/", undefined);
+  it("sets initial filter config when scope is provided", () => {
+    const scope = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    startOrchestrator("/mail/u/0/", scope);
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: false, scopeTimestamp: scope });
   });
 
-  it("resets cacheStarted when loadLabels fails on skip path", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      return Promise.resolve(undefined);
-    });
-    (cacheManager.loadLabels as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("auth failure"));
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.resolveReady).toHaveBeenCalled();
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    // cacheStarted should be reset so a subsequent call retries
-    vi.clearAllMocks();
-    getMeta.mockResolvedValue(undefined);
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
-  });
-
-  it("fetches missing system label indexes on skip path when settings are enabled", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      // STARRED index does not exist — should trigger prioritizeLabel
-      if (key === "labelIdx:STARRED") return Promise.resolve(null);
-      return Promise.resolve(undefined);
-    });
-    (cacheManager as unknown as Record<string, unknown>).showStarred = true;
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    expect(cacheManager.prioritizeLabel).toHaveBeenCalledWith("STARRED");
-    (cacheManager as unknown as Record<string, unknown>).showStarred = false;
-  });
-
-  it("does not fetch system label indexes on skip path when indexes already exist", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      if (key === "labelIdx:STARRED") return Promise.resolve(["msg2"]);
-      return Promise.resolve(undefined);
-    });
-    (cacheManager as unknown as Record<string, unknown>).showStarred = true;
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    expect(cacheManager.prioritizeLabel).not.toHaveBeenCalled();
-    // Existing index should be marked as processed to prevent duplicate fetch from syncSettings
-    expect(cacheManager.markProcessed).toHaveBeenCalledWith("STARRED");
-    (cacheManager as unknown as Record<string, unknown>).showStarred = false;
-  });
-
-  it("resets cacheStarted when skip-path backfill fails so next call retries", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      // STARRED index missing — triggers backfill
-      if (key === "labelIdx:STARRED") return Promise.resolve(null);
-      return Promise.resolve(undefined);
-    });
-    (cacheManager as unknown as Record<string, unknown>).showStarred = true;
-    (cacheManager.prioritizeLabel as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("network error"));
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.prioritizeLabel).toHaveBeenCalledWith("STARRED");
-    // cacheStarted should be reset so the next call retries
-    vi.clearAllMocks();
-    getMeta.mockResolvedValue(undefined);
-    (cacheManager as unknown as Record<string, unknown>).showStarred = false;
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
-  });
-
-  it("marks processed before resolving readiness gate so syncSettings skips duplicate fetch", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      if (key === "labelIdx:STARRED") return Promise.resolve(["msg2"]);
-      return Promise.resolve(undefined);
-    });
-    (cacheManager as unknown as Record<string, unknown>).showStarred = true;
-    const callOrder: string[] = [];
-    (cacheManager.markProcessed as ReturnType<typeof vi.fn>).mockImplementation(() => { callOrder.push("markProcessed"); });
-    (cacheManager.resolveReady as ReturnType<typeof vi.fn>).mockImplementation(() => { callOrder.push("resolveReady"); });
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(callOrder.indexOf("markProcessed")).toBeLessThan(callOrder.indexOf("resolveReady"));
-    (cacheManager as unknown as Record<string, unknown>).showStarred = false;
-  });
-
-  it("resets cacheStarted when skip-path label index check fails", async () => {
-    getMeta.mockImplementation((key: string) => {
-      if (key === "account") return Promise.resolve("/mail/u/0/");
-      if (key === "fetchState") return Promise.resolve({ phase: "complete", lastFetchTimestamp: Date.now() });
-      if (key === "labelIdx:INBOX") return Promise.resolve(["msg1"]);
-      if (key === "labelIdx:STARRED") return Promise.reject(new Error("IndexedDB read error"));
-      return Promise.resolve(undefined);
-    });
-    (cacheManager as unknown as Record<string, unknown>).showStarred = true;
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.resolveReady).toHaveBeenCalled();
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    // cacheStarted should be reset so a subsequent call retries
-    vi.clearAllMocks();
-    getMeta.mockResolvedValue(undefined);
-    (cacheManager as unknown as Record<string, unknown>).showStarred = false;
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
-  });
-
-  it("resolves readiness gate and resets cacheStarted when preflight getMeta throws", async () => {
-    getMeta.mockRejectedValueOnce(new Error("IndexedDB unavailable"));
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.resolveReady).toHaveBeenCalled();
-    expect(cacheManager.startFetch).not.toHaveBeenCalled();
-    // cacheStarted should be reset so a subsequent call retries
-    vi.clearAllMocks();
-    getMeta.mockResolvedValue(undefined);
-    await startCacheIfNeeded("/mail/u/0/");
-    expect(cacheManager.startFetch).toHaveBeenCalledWith("/mail/u/0/", undefined);
+  it("does not set filter config when scope is undefined", () => {
+    startOrchestrator("/mail/u/0/");
+    expect(cacheManager.setFilterConfig).not.toHaveBeenCalled();
   });
 });
 
@@ -317,18 +198,18 @@ describe("selectionChanged handler", () => {
     tabsUpdateMock.mockResolvedValue(undefined);
   });
 
-  it("selectionChanged with labelId triggers query + navigation + labelResult response", async () => {
+  it("selectionChanged with labelId triggers setFilterConfig + query + navigation + labelResult response", async () => {
     const labels = [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Work/Projects", type: "user" }];
     (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
     (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 3, coLabelCounts: { INBOX: 2 } });
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
-    // Wait for initWindow to complete
     await new Promise(r => setTimeout(r, 0));
     port.postMessage.mockClear();
 
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
 
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: false, scopeTimestamp: null });
     expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, null);
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("label") });
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 3, seq: 1 }));
@@ -342,6 +223,7 @@ describe("selectionChanged handler", () => {
     sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: null, scopeTimestamp: null, seq: 2 });
     await new Promise(r => setTimeout(r, 0));
 
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: false, scopeTimestamp: null });
     expect(cacheManager.queryLabel).not.toHaveBeenCalled();
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: "https://mail.google.com/mail/u/0/#all" });
     expect(port.postMessage).toHaveBeenCalledWith({ type: "labelResult", labelId: null, count: 0, coLabelCounts: {}, seq: 2 });
@@ -358,7 +240,6 @@ describe("selectionChanged handler", () => {
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: true, scope: null, scopeTimestamp: null, seq: 3 });
     await new Promise(r => setTimeout(r, 0));
 
-    // URL should contain both label names in an OR query
     const url = tabsUpdateMock.mock.calls[0][1].url as string;
     expect(url).toContain("search");
     expect(url).toContain("work");
@@ -377,14 +258,12 @@ describe("selectionChanged handler", () => {
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 5 });
     await new Promise(r => setTimeout(r, 0));
 
-    // Navigation should still happen despite query failure
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("work") });
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", error: true, seq: 5 }));
   });
 
   it("selectionChanged recovers labels via loadLabels when getLabels returns empty", async () => {
     const labels = [{ id: "Label_1", name: "Work", type: "user" }];
-    // Initially empty (simulating prior fetchLabels failure), then populated after loadLabels
     (cacheManager.getLabels as ReturnType<typeof vi.fn>)
       .mockReturnValueOnce([])
       .mockReturnValue(labels);
@@ -396,16 +275,14 @@ describe("selectionChanged handler", () => {
     tabsUpdateMock.mockClear();
 
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 10 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
 
     expect(cacheManager.loadLabels).toHaveBeenCalled();
-    // Navigation should use the recovered label name, not fall back to #all
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("work") });
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 2, seq: 10 }));
   });
 
   it("selectionChanged returns error when label recovery fails and includeChildren is true", async () => {
-    // getLabels returns empty even after loadLabels attempt (simulating persistent failure)
     (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue([]);
     (cacheManager.loadLabels as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("network error"));
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
@@ -417,11 +294,8 @@ describe("selectionChanged handler", () => {
     await new Promise(r => setTimeout(r, 0));
 
     expect(cacheManager.loadLabels).toHaveBeenCalled();
-    // Navigation should be skipped (label can't be resolved)
     expect(tabsUpdateMock).not.toHaveBeenCalled();
-    // queryLabel should NOT be called — descendant resolution would silently degrade
     expect(cacheManager.queryLabel).not.toHaveBeenCalled();
-    // Should return error result instead of degraded counts
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 0, error: true, seq: 11 }));
   });
 
@@ -472,22 +346,17 @@ describe("cache-complete re-query", () => {
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    // Send selectionChanged to store the last selection
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
     port.postMessage.mockClear();
     (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockClear();
 
-    // Simulate cache completion via the progress callback captured at module load
     (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 15, coLabelCounts: { INBOX: 8 } });
-    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
-    await new Promise(r => setTimeout(r, 0));
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10 });
+    await flush();
 
-    // Should re-query with stored selection parameters
     expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, null);
-    // Should push updated labelResult to sidepanel with seq from last selection
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "labelResult", labelId: "Label_1", count: 15, seq: 1 }));
-    // Should push updated countsReady
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
   });
 
@@ -497,54 +366,47 @@ describe("cache-complete re-query", () => {
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    // Send selectionChanged with null to deselect
     sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
     port.postMessage.mockClear();
     (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockClear();
 
-    // Simulate cache completion via the progress callback captured at module load
-    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
-    await new Promise(r => setTimeout(r, 0));
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10 });
+    await flush();
 
-    // Should NOT re-query (no active label)
     expect(cacheManager.queryLabel).not.toHaveBeenCalled();
-    // Should still push countsReady
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
   });
 
   it("uses scope from fetchCounts when cache completes with no prior selectionChanged", async () => {
-    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000; // 1 month ago
+    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
     (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
 
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    // Sidepanel sends fetchCounts with scope (no selectionChanged sent because no active label)
     sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
     port.postMessage.mockClear();
     (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockClear();
     (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 8, inclusive: 8 } });
 
-    // Simulate cache completion — pushUpdatedResults should use the scope from fetchCounts
-    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10, datesTotal: 0, datesDone: 0 });
-    await new Promise(r => setTimeout(r, 0));
+    progressCallback({ phase: "complete", labelsTotal: 10, labelsDone: 10 });
+    await flush();
 
-    // getLabelCounts should be called (scope is set via ensureScopeFilter before the call)
     expect(cacheManager.getLabelCounts).toHaveBeenCalled();
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "countsReady" }));
   });
 });
 
-describe("scope filter propagation", () => {
+describe("orchestrator filter config propagation", () => {
   beforeEach(() => {
     _resetCacheState();
     vi.clearAllMocks();
     tabsUpdateMock.mockResolvedValue(undefined);
   });
 
-  it("selectionChanged with scope triggers setScopeFilter before queryLabel", async () => {
+  it("selectionChanged with scope sets filter config with scope", async () => {
     const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
     const labels = [{ id: "Label_1", name: "Work", type: "user" }];
     (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
@@ -554,17 +416,13 @@ describe("scope filter propagation", () => {
     port.postMessage.mockClear();
 
     sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: "2024/01/01", scopeTimestamp, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
 
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: false, scopeTimestamp });
     expect(cacheManager.queryLabel).toHaveBeenCalledWith("Label_1", false, scopeTimestamp);
-    // setScopeFilter should be called before queryLabel
-    const setScopeOrder = (cacheManager.setScopeFilter as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    const queryOrder = (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    expect(setScopeOrder).toBeLessThan(queryOrder);
   });
 
-  it("fetchCounts with scope triggers setScopeFilter before getLabelCounts", async () => {
+  it("fetchCounts with scope updates filter config", async () => {
     const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
     (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
@@ -572,60 +430,43 @@ describe("scope filter propagation", () => {
     port.postMessage.mockClear();
 
     sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
+    await flush();
 
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
-    expect(cacheManager.getLabelCounts).toHaveBeenCalled();
-    // setScopeFilter should be called before getLabelCounts
-    const setScopeOrder = (cacheManager.setScopeFilter as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    const countsOrder = (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    expect(setScopeOrder).toBeLessThan(countsOrder);
+    expect(cacheManager.setFilterConfig).toHaveBeenCalled();
+    expect(cacheManager.getLabelCounts).toHaveBeenCalledWith(undefined, scopeTimestamp);
   });
 
-  it("same scope does not re-trigger setScopeFilter", async () => {
-    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    const labels = [{ id: "Label_1", name: "Work", type: "user" }];
-    (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
-    (cacheManager.queryLabel as ReturnType<typeof vi.fn>).mockResolvedValue({ labelId: "Label_1", count: 3, coLabelCounts: {} });
-    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
-    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+  it("syncSettings updates system label settings and wakes orchestrator", async () => {
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
-    port.postMessage.mockClear();
 
-    // First call with scope
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: "2024/01/01", scopeTimestamp, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(1);
+    sendMessage({ type: "syncSettings", showStarred: true, showImportant: false });
 
-    // Second call with same scope — should NOT call setScopeFilter again
-    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 2 });
-    await new Promise(r => setTimeout(r, 0));
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(1);
-
-    // Third call with different scope — SHOULD call setScopeFilter
-    const newScope = Date.now() - 60 * 24 * 60 * 60 * 1000;
-    sendMessage({ type: "fetchCounts", scopeTimestamp: newScope, seq: 3 });
-    await new Promise(r => setTimeout(r, 0));
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledTimes(2);
-    expect(cacheManager.setScopeFilter).toHaveBeenLastCalledWith(newScope);
+    expect(cacheManager.updateSystemLabelSettings).toHaveBeenCalledWith(true, false);
+    expect(cacheManager.wakeOrchestrator).toHaveBeenCalled();
   });
 
-  it("null scope clears the scope filter", async () => {
-    const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    (cacheManager.getLabelCounts as ReturnType<typeof vi.fn>).mockResolvedValue({ INBOX: { own: 5, inclusive: 5 } });
-    const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
+  it("syncSettings does not wake orchestrator when not running", async () => {
+    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
-    port.postMessage.mockClear();
 
-    // Set a scope
-    sendMessage({ type: "fetchCounts", scopeTimestamp, seq: 1 });
-    await new Promise(r => setTimeout(r, 0));
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(scopeTimestamp);
+    sendMessage({ type: "syncSettings", showStarred: true, showImportant: false });
 
-    // Clear scope with null
-    sendMessage({ type: "fetchCounts", scopeTimestamp: null, seq: 2 });
-    await new Promise(r => setTimeout(r, 0));
-    expect(cacheManager.setScopeFilter).toHaveBeenCalledWith(null);
+    expect(cacheManager.updateSystemLabelSettings).toHaveBeenCalledWith(true, false);
+    expect(cacheManager.wakeOrchestrator).not.toHaveBeenCalled();
   });
 });
 
+describe("_resetCacheState", () => {
+  it("stops orchestrator and clears state", () => {
+    startOrchestrator("/mail/u/0/");
+    _resetCacheState();
+    expect(cacheManager.stop).toHaveBeenCalled();
+    // Starting again should work (not be blocked by stale state)
+    vi.clearAllMocks();
+    startOrchestrator("/mail/u/0/");
+    expect(cacheManager.start).toHaveBeenCalledWith("/mail/u/0/");
+  });
+});

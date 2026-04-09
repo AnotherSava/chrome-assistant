@@ -36,22 +36,19 @@
 
 ## Key Flows
 
-### Label Selection
+### Filter Change
 
-1. User clicks a label in the sidepanel
+All user-initiated filter changes follow the same flow. The user may click a label, deselect one, change scope, or toggle include-children — the sidepanel expresses the new filter state and the service worker + orchestrator handle the rest.
+
+1. User changes filter criteria in the sidepanel
 2. Sidepanel sends `selectionChanged { labelId, includeChildren, scope, scopeTimestamp, seq }`
-3. Service worker calls `ensureScopeFilter(scopeTimestamp)` then `cacheManager.queryLabel(labelId, includeChildren)`
-4. Cache manager resolves descendants internally via prefix matching when `includeChildren` is true
-5. Service worker resolves label name(s) from `cacheManager.getLabels()` and builds Gmail URL
-6. Service worker navigates Gmail tab and stores the hash in `lastExtensionNavHash`
-7. Service worker responds with `labelResult { labelId, count, coLabelCounts, seq }`
-
-### Label Deselection
-
-1. User clicks the active label to deselect
-2. Sidepanel sends `selectionChanged { labelId: null, includeChildren, scope, scopeTimestamp, seq }`
-3. Service worker navigates Gmail to `#all` (or scoped search if scope is set)
-4. Service worker responds with empty `labelResult { labelId: null, count: 0, coLabelCounts: {}, seq }`
+3. Service worker calls `cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp })` — wakes the orchestrator loop
+4. Service worker also calls `cacheManager.queryLabel()` for immediate results and navigates Gmail (NOTE: future refactor will remove this — the cache manager will push results via callback when ready, eliminating the separate query call)
+5. Cache manager resolves descendants internally via prefix matching when `includeChildren` is true
+6. Service worker resolves label name(s) from `cacheManager.getLabels()` and builds Gmail URL
+7. Service worker navigates Gmail tab and stores hash in `lastExtensionNavHash`
+8. Service worker responds with `labelResult` (NOTE: future refactor will replace this request/response with push-based updates from the cache manager)
+9. The orchestrator re-evaluates priorities via `decide()` — may fetch scoped IDs, missing label indexes, or gap-fill data as needed
 
 ### Cache Complete Re-query
 
@@ -60,61 +57,34 @@
 3. Service worker unconditionally pushes `countsReady` to all connected sidepanels (regardless of active label)
 4. Sidepanel does NOT trigger re-queries on cache complete — it only uses `cacheState` for progress bar display
 
-### Scope Search
+### Cache Orchestrator
 
-1. User changes scope (e.g., "3 years ago") in sidepanel
-2. Sidepanel sends `selectionChanged` or `fetchCounts` with `scopeTimestamp`
-3. Service worker calls `cacheManager.setScopeFilter(scopeTimestamp)` (skipped if scope unchanged)
-4. Cache manager calls `fetchScopedMessageIds(dateStr)` — single paginated `messages.list q=after:DATE` call
-5. Cache manager intersects returned IDs with each `labelIdx:*` entry, stores result in `scopedLabelIdx` map
-6. Subsequent `queryLabel` and `getLabelCounts` calls read from `scopedLabelIdx` instead of IndexedDB label indexes
-7. When scope is null ("any"), `scopedLabelIdx` is cleared and queries read directly from IndexedDB
+The cache manager uses a single orchestrator loop that fetches one page at a time, stores results, then calls `decide()` to determine what to do next. No concurrent API calls (default concurrency=1), no generation counters, no race conditions.
 
-### Progressive Cache Deepening
+The orchestrator is driven by `setFilterConfig()` signals from the service worker. When the user changes label selection, scope, or include-children, the service worker calls `setFilterConfig()` which wakes the orchestrator loop. The `decide()` function examines the filter config and cache state to determine the next action.
+
+#### Priority Order (decide)
+
+1. `fetch-scope` — user has a scope but scoped ID set not yet fetched
+2. `fetch-label` — user selected a label not yet in cache
+3. `fetch-label` (initial build) — labels not yet fully indexed, page at a time
+4. `gap-fill-label` — user widened scope beyond cache depth, fetch missing segment per-label
+5. `expand-label` — background depth expansion through tiers (1w → 2w → 1m → 2m → 6m → 1y → 3y → 5y → all)
+6. `refresh-label` — cache stale (>10 min), fetch new messages per-label since lastFetchTimestamp
+7. Idle — everything cached and fresh, sleep until signaled
+
+Each iteration: `decide()` → execute action (one API page) → store results → loop back. Priority changes take effect on the next iteration — the current page finishes, then `decide()` naturally picks the new priority.
+
+#### Progressive Cache Deepening
 
 The cache tracks how far back it has fetched via `cacheDepth` metadata in IndexedDB (`{ timestamp: number | null }`, where `null` means full coverage). This enables fast initial loads and incremental expansion.
 
-#### Scoped Initial Build
-
-1. Service worker passes the active `scopeTimestamp` to `cacheManager.startFetch(scopeTimestamp)`
-2. If scope is set, Phase 1 fetches per-label with `after:DATE` — only messages within the time range
-3. On completion, stores `cacheDepth: { timestamp: scopeTimestamp }` in IndexedDB meta
-4. If scope is null, fetches all messages and stores `cacheDepth: { timestamp: null }` (full coverage)
-
-#### Narrowing Scope (Local)
-
-1. User narrows scope (e.g., "3 years" → "1 year") — new scope is within `cacheDepth`
-2. Cache manager fetches scoped ID set via `fetchScopedMessageIds` (one API call)
-3. Intersects with existing `labelIdx:*` entries locally — no per-label API calls needed
-4. Scoped ID sets are cached per-timestamp (up to 5, LRU eviction) for instant switching back
-
-#### Widening Scope (Gap-Fill)
-
-1. User widens scope (e.g., "3 years" → "5 years") — new scope extends beyond `cacheDepth`
-2. Cache manager provides immediate partial results from existing indexes intersected with the new scoped ID set
-3. Background gap-fill fetches the missing segment per-label: `fetchLabelMessageIds(labelId, newScopeDate, cacheDepthDate)` using `after:` and `before:`
-4. New IDs are merged into `labelIdx:*` entries, `cacheDepth` updated on completion
-5. Progress reports "Expanding cache: labels X/Y"
-
-#### "Any" Scope from Partial Cache
-
-1. User selects "any" scope when `cacheDepth` has a timestamp (partial coverage)
-2. Cache manager clears `scopedLabelIdx` for immediate full-index access
-3. Background gap-fill fetches from `cacheDepth` backward using `before:cacheDepthDate` (no `after:`)
-4. On completion, `cacheDepth` set to `null` (full coverage)
-
-#### Background Depth Expansion
-
-1. After initial build and incremental refresh complete, if `cacheDepth` is not null, cache manager starts background expansion
-2. Expansion follows predefined tiers (1w → 2w → 1m → 2m → 6m → 1y → 3y → 5y → all)
-3. Each tier triggers a gap-fill for the missing segment, then advances `cacheDepth`
-4. Expansion is interruptible — any new scope change or abort cancels in-progress expansion
-
-#### Incremental Refresh
-
-1. On subsequent cache runs (10-minute refresh), fetches per-label with `after:lastFetchTimestamp` (no `before:`)
-2. Gets only new messages since last run, within current depth
-3. Does not regress `cacheDepth` — keeps the widest depth achieved
+- Scoped initial build: `start(accountPath)` with a scope fetches per-label with `after:DATE`, stores `cacheDepth: { timestamp: scopeTimestamp }`
+- Narrowing scope: new scope is within `cacheDepth` — orchestrator fetches scoped IDs (one paginated fetch) and intersects locally. Scoped ID sets are cached per-timestamp for instant switching.
+- Widening scope: `decide()` returns `gap-fill-label` actions to fetch the missing segment per-label using `after:` and `before:`. `cacheDepth` updated when all labels complete.
+- "Any" scope from partial cache: gap-fill fetches from `cacheDepth` backward using `before:cacheDepthDate`. On completion, `cacheDepth` set to `null`.
+- Background expansion: after initial build, `decide()` returns `expand-label` actions through predefined tiers. Each tier gap-fills all labels, then advances `cacheDepth`. Interruptible — higher-priority actions take precedence.
+- Incremental refresh: `decide()` returns `refresh-label` actions fetching per-label with `after:lastFetchTimestamp`. Does not regress `cacheDepth`.
 
 ### Zero-Count Label Hiding
 

@@ -1,7 +1,6 @@
 import type { PinMode } from "@core/types.js";
 import { fetchLabels, type GmailLabel, buildSearchQuery } from "./gmail-api.js";
 import { CacheManager, type CacheProgress } from "./cache-manager.js";
-import { getMeta } from "./cache-db.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
@@ -14,59 +13,41 @@ const lastExtensionNavHash = new Map<number, string>();
 let pinMode: PinMode = "pinned";
 
 const cacheManager = new CacheManager();
-let cacheStarted = false;
 let currentAccountPath: string | null = null;
-let cacheGeneration = 0;
-/** Tracks the scope timestamp last applied to the cache manager via setScopeFilter — avoids redundant API calls when scope hasn't changed. undefined = never set. */
-let currentCacheScope: number | null | undefined = undefined;
-/** In-flight ensureScopeFilter promise and its target — lets concurrent callers with the same scope piggyback on one API call instead of duplicating it. */
-let scopeFilterInflight: { target: number | null; promise: Promise<void> } | null = null;
 const CACHE_ALARM_NAME = "cache-keepalive";
-
-/** Monotonically increasing generation — bumped every time we invalidate the cached scope so that in-flight setScopeFilter calls from before the invalidation don't re-set currentCacheScope. */
-let scopeInvalidationGen = 0;
-
-/** Ensure the cache manager's scope filter matches the requested scope. No-op if already set to the same value. Deduplicates concurrent calls for the same scope. */
-async function ensureScopeFilter(scopeTimestamp: number | null): Promise<void> {
-  if (scopeTimestamp === currentCacheScope) return;
-  if (scopeFilterInflight && scopeFilterInflight.target === scopeTimestamp) return scopeFilterInflight.promise;
-  const genAtStart = scopeInvalidationGen;
-  const promise = cacheManager.setScopeFilter(scopeTimestamp).then(() => { if (scopeInvalidationGen === genAtStart && cacheManager.getActiveScopeTimestamp() === scopeTimestamp) currentCacheScope = scopeTimestamp; });
-  scopeFilterInflight = { target: scopeTimestamp, promise };
-  try {
-    await promise;
-  } finally {
-    if (scopeFilterInflight?.promise === promise) scopeFilterInflight = null;
-  }
-}
-
-/** Invalidate the cached scope so the next ensureScopeFilter re-runs setScopeFilter even for the same scope timestamp. Also cancels any in-flight scope filter to prevent it from restoring currentCacheScope, and clears the cache manager's stale scope state so its activeScopeTimestamp cannot trick the .then() guard in ensureScopeFilter. */
-function invalidateCachedScope(): void {
-  currentCacheScope = undefined;
-  scopeInvalidationGen++;
-  scopeFilterInflight = null;
-  cacheManager.clearScopeState();
-}
 
 /** Push updated label result and counts to all connected sidepanels. Each port is queried using its own last selection so multi-window use gets correct results. */
 function pushUpdatedResults(): void {
+  // Ensure the orchestrator will fetch all scope timestamps needed by connected ports,
+  // not just the global filterConfig scope (fixes multi-window post-refresh starvation).
+  for (const [, s] of portState) {
+    const ts = s.lastSelection?.scopeTimestamp ?? s.lastScopeTimestamp;
+    if (ts !== null && ts !== undefined) cacheManager.requestScopeFetch(ts);
+  }
   for (const [port, state] of portState) {
-    const scopeAtCall = state.lastScopeTimestamp;
-    const scopeForApi = scopeAtCall ?? null;
-    // Ensure scope filter is applied before querying (e.g. after service worker restart)
-    const scopeReady = ensureScopeFilter(scopeForApi);
     const sel = state.lastSelection;
     if (sel?.labelId) {
       const { labelId, includeChildren, scopeTimestamp, seq } = sel;
       const myResultGen = ++state.resultGeneration;
-      scopeReady.then(() => cacheManager.queryLabel(labelId, includeChildren, scopeForApi)).then((result) => {
+      cacheManager.waitForScopeReady(scopeTimestamp).then((scopeReady) => {
+        if (!scopeReady) return Promise.resolve(undefined);
+        if (state.resultGeneration !== myResultGen) return Promise.resolve(undefined);
+        return cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp);
+      }).then((result) => {
+        if (!result) return;
         if (state.resultGeneration !== myResultGen) return;
         try { port.postMessage({ type: "labelResult", ...result, seq }); } catch { /* port may be dead */ }
       }).catch(() => {});
     }
+    const scopeAtCall = state.lastScopeTimestamp;
+    const scopeForApi = scopeAtCall ?? null;
     const myCountsGen = ++state.countsGeneration;
-    scopeReady.then(() => cacheManager.getLabelCounts(undefined, scopeForApi)).then((counts) => {
-      // Skip if scope changed or a newer counts query started while in flight
+    cacheManager.waitForScopeReady(scopeForApi).then((scopeReady) => {
+      if (!scopeReady && scopeForApi !== null) return Promise.resolve(null);
+      if (state.lastScopeTimestamp !== scopeAtCall) return Promise.resolve(null);
+      if (state.countsGeneration !== myCountsGen) return Promise.resolve(null);
+      return cacheManager.getLabelCounts(undefined, scopeForApi);
+    }).then((counts) => {
       if (state.lastScopeTimestamp !== scopeAtCall) return;
       if (state.countsGeneration !== myCountsGen) return;
       try { port.postMessage({ type: "countsReady", counts }); } catch { /* port may be dead */ }
@@ -79,26 +60,44 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
     try { port.postMessage({ type: "cacheState", ...progress }); } catch { /* port may be dead */ }
   }
   if (progress.phase === "complete") {
-    chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
-    // Reset cached scope so ensureScopeFilter re-runs — labels fetched after the
-    // initial setScopeFilter call need to be intersected with the scoped ID set.
-    invalidateCachedScope();
+    // Schedule a future wake-up for incremental refresh — only if no alarm is already pending
+    chrome.alarms.get(CACHE_ALARM_NAME).then(existing => {
+      if (!existing) chrome.alarms.create(CACHE_ALARM_NAME, { delayInMinutes: 11 });
+    }).catch(() => {});
+    pushUpdatedResults();
+  } else if (progress.phase === "labels") {
+    // Push results as each label is indexed so the sidepanel shows counts
+    // progressively during the initial build (especially for the selected label)
     pushUpdatedResults();
   } else if (progress.phase === "expanding") {
     // Keep service worker alive during background expansion
     chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
     if (progress.labelsTotal === 0) {
-      // Tier completion — push updated counts without invalidating scope
-      // (which would cancel the in-progress expansion).
+      // Tier completion — push updated counts
       pushUpdatedResults();
     }
   }
 });
 
-// Keep service worker alive during active cache fetch
+// Keep service worker alive during active cache fetch; restart orchestrator after SW suspension
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === CACHE_ALARM_NAME) {
-    // No-op — alarm firing keeps the SW alive
+    if (cacheManager.isOrchestratorRunning()) {
+      // Orchestrator is active — just wake it (keeps SW alive during expansion/refresh)
+      cacheManager.wakeOrchestrator();
+    } else {
+      // Service worker was suspended and restarted — restore account and restart orchestrator
+      chrome.storage.session.get(["accountPath", "showStarred", "showImportant"], (result) => {
+        if (result.accountPath) {
+          // Restore system label settings before starting so buildLabelQueryList() includes them
+          if (result.showStarred || result.showImportant) {
+            cacheManager.showStarred = !!result.showStarred;
+            cacheManager.showImportant = !!result.showImportant;
+          }
+          startOrchestrator(result.accountPath, getScopeForWindow());
+        }
+      });
+    }
   }
 });
 
@@ -133,93 +132,21 @@ function getScopeForWindow(windowId?: number): number | null | undefined {
   return undefined;
 }
 
-const CACHE_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes between incremental refreshes
-
-export async function startCacheIfNeeded(accountPath: string, scopeTimestamp?: number | null): Promise<void> {
-  if (cacheStarted && currentAccountPath === accountPath) return;
+/** Start the orchestrator for a Gmail account. Idempotent — if already running for the same account, does nothing. On account change, stops and restarts. */
+export function startOrchestrator(accountPath: string, scopeTimestamp?: number | null): void {
+  if (cacheManager.isOrchestratorRunning() && currentAccountPath === accountPath) return;
   currentAccountPath = accountPath;
-  cacheStarted = true;
-  // Create the readiness gate synchronously before any awaits so that syncSettings
-  // callers block on whenReady() even during the metadata check below.
-  cacheManager.resetReady();
-  // Check if cache was recently completed — skip if within refresh interval.
-  // Wrapped in try-catch so a preflight failure resolves the readiness gate and resets cacheStarted
-  // instead of leaving the worker wedged (gate pending, cacheStarted true, future starts short-circuit).
-  let skipFetch = false;
-  try {
-    // Only consider skipping if the cached data belongs to the same account;
-    // otherwise startFetch must run to clear stale data and set the new account.
-    const storedAccount = await getMeta<string>("account");
-    if (storedAccount === accountPath) {
-      const fetchState = await getMeta<{ phase: string; lastFetchTimestamp: number | null }>("fetchState");
-      if (fetchState?.phase === "complete" && fetchState.lastFetchTimestamp && Date.now() - fetchState.lastFetchTimestamp < CACHE_REFRESH_INTERVAL) {
-        // Verify label indexes exist — cache might predate the index feature
-        const hasIndex = await getMeta<string[]>("labelIdx:INBOX");
-        if (hasIndex) { skipFetch = true; }
-      }
-    }
-  } catch (err) {
-    console.warn("Cache preflight check failed:", err);
-    cacheManager.resolveReady();
-    cacheStarted = false;
-    return;
+  // Persist account path so the alarm handler can restart after SW suspension
+  chrome.storage.session.set({ accountPath });
+  // Set initial filter config from scope before starting so decide() knows about it
+  if (scopeTimestamp !== undefined) {
+    cacheManager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTimestamp ?? null });
   }
-  if (skipFetch) {
-    // Populate in-memory labels so getLabelCounts works after service worker restart.
-    // If loadLabels fails (e.g. transient auth/network error), reset cacheStarted so
-    // the next call retries instead of short-circuiting with empty labels.
-    try {
-      await cacheManager.loadLabels();
-    } catch {
-      cacheManager.resolveReady();
-      cacheStarted = false;
-      return;
-    }
-    // Mark existing system label indexes as processed BEFORE resolveReady so that
-    // syncSettings callers unblocked by whenReady() see them and skip prioritizeLabel.
-    // Also collect missing labels for backfill after resolveReady.
-    const missingLabels: string[] = [];
-    try {
-      for (const [labelId, enabled] of [["STARRED", cacheManager.showStarred], ["IMPORTANT", cacheManager.showImportant]] as const) {
-        if (!enabled) continue;
-        if (await getMeta<string[]>(`labelIdx:${labelId}`)) { cacheManager.markProcessed(labelId); } else { missingLabels.push(labelId); }
-      }
-    } catch {
-      cacheManager.resolveReady();
-      cacheStarted = false;
-      return;
-    }
-    cacheManager.resolveReady();
-    // Fetch missing system label indexes — the cache may predate the user enabling these labels.
-    // This runs after resolveReady so syncSettings callers are unblocked.
-    let backfillFailed = false;
-    for (const labelId of missingLabels) {
-      await cacheManager.prioritizeLabel(labelId).catch(() => { backfillFailed = true; });
-    }
-    // If backfill failed, reset cacheStarted so the next startCacheIfNeeded retries
-    // instead of leaving the label uncached for the worker's lifetime.
-    if (backfillFailed) {
-      cacheStarted = false;
-    }
-    if (missingLabels.length > 0 && !backfillFailed) {
-      for (const [port] of portState) {
-        try { port.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0 }); } catch { /* port may be dead */ }
-      }
-      // Reset cached scope so ensureScopeFilter re-runs — backfilled labels
-      // need to be included in the scoped index.
-      invalidateCachedScope();
-      pushUpdatedResults();
-    }
-    return;
-  }
-  const gen = ++cacheGeneration;
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
-  cacheManager.startFetch(accountPath, scopeTimestamp).catch((err) => {
-    console.warn("Cache fetch failed:", err);
-    if (gen === cacheGeneration) {
-      cacheStarted = false;
-      chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
-    }
+  cacheManager.start(accountPath).catch((err) => {
+    console.warn("Orchestrator start failed:", err);
+    currentAccountPath = null;
+    chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
   });
 }
 
@@ -306,7 +233,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
   port.onMessage.addListener((message: { type: string; mode?: string; labelId?: string; includeChildren?: boolean; scope?: string | null; scopeTimestamp?: number | null; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; seq?: number; showStarred?: boolean; showImportant?: boolean }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
-      // Capture scope from sidepanel's saved setting so the first startCacheIfNeeded uses it
+      // Capture scope from sidepanel's saved setting so the first orchestrator start uses it
       if (message.scopeTimestamp !== undefined) state.lastScopeTimestamp = message.scopeTimestamp ?? null;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
         const tab = tabs[0];
@@ -319,7 +246,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tab.id); }
           const account = gmailAccountPath(tab.url);
           port.postMessage({ type: "resultsReady", accountPath: account });
-          startCacheIfNeeded(account, getScopeForWindow(message.windowId));
+          startOrchestrator(account, getScopeForWindow(message.windowId));
         } else {
           port.postMessage({ type: "notOnGmail" });
         }
@@ -332,6 +259,8 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       const scope = message.scope ?? null;
       state.lastSelection = { labelId, includeChildren, scopeTimestamp, seq: seq ?? 0 };
       state.lastScopeTimestamp = scopeTimestamp;
+      // Update orchestrator filter config — wakes it to fetch what's needed
+      cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp });
       if (labelId === null) {
         // Deselection: navigate to #all (or scoped search) and respond with empty result
         if (state.gmailTabId !== null && state.gmailTabUrl) {
@@ -343,25 +272,17 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         port.postMessage({ type: "labelResult", labelId: null, count: 0, coLabelCounts: {}, seq });
       } else {
         // Selection: await cache readiness, navigate Gmail, query cache, respond with result
-        // Navigation is decoupled from the query so a transient IndexedDB failure doesn't
-        // prevent the user's label selection from being reflected in Gmail.
         const selectionSeq = seq ?? 0;
         const myResultGen = ++state.resultGeneration;
         cacheManager.whenReady().then(async () => {
-          // Skip navigation if a newer selectionChanged has superseded this one
           if (state.lastSelection?.seq !== selectionSeq) return;
           if (state.gmailTabId !== null && state.gmailTabUrl) {
             let labels = cacheManager.getLabels();
-            // If labels are empty (e.g. prior fetchLabels failure), attempt recovery so
-            // Gmail navigation can resolve the label name instead of falling back to #all.
             if (labels.length === 0) {
               try { await cacheManager.loadLabels(); labels = cacheManager.getLabels(); } catch { /* keep empty — navigation will gracefully fall back */ }
             }
-            // Re-check after async loadLabels — a newer selection may have arrived
             if (state.lastSelection?.seq !== selectionSeq) return;
             const label = labels.find(l => l.id === labelId);
-            // Skip navigation if the label can't be resolved — navigating to #all
-            // would desync the sidepanel (which shows the label as selected) from Gmail.
             if (label) {
               let labelName: string | string[] = label.name;
               if (includeChildren) {
@@ -374,13 +295,12 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
               chrome.tabs.update(state.gmailTabId, { url });
             }
           }
-          // If labels are still unavailable after recovery and includeChildren is requested,
-          // descendant resolution would silently degrade to root-only. Return an error so the
-          // sidepanel knows the result is incomplete rather than showing misleading counts.
           if (includeChildren && cacheManager.getLabels().length === 0) {
             return { labelId, count: 0, coLabelCounts: {}, error: true } as { labelId: string; count: number; coLabelCounts: Record<string, number>; error: boolean };
           }
-          await ensureScopeFilter(scopeTimestamp);
+          const scopeReady = await cacheManager.waitForScopeReady(scopeTimestamp);
+          if (!scopeReady) return { labelId, count: 0, coLabelCounts: {}, error: true } as { labelId: string; count: number; coLabelCounts: Record<string, number>; error: boolean };
+          if (state.lastSelection?.seq !== selectionSeq) return undefined;
           return cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp);
         }).then((result) => {
           if (state.resultGeneration !== myResultGen) return;
@@ -408,53 +328,40 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
     } else if (message.type === "fetchLabels") {
       const fetchSeq = message.seq;
       fetchLabels().then((labels) => {
-        // Keep cache manager's label list in sync so selectionChanged can resolve
-        // label names for navigation and descendant resolution even after renames/creates.
         cacheManager.setLabels(labels);
         const response: Record<string, unknown> = { type: "labelsReady", labels };
         if (fetchSeq !== undefined) response.seq = fetchSeq;
         port.postMessage(response);
       }).catch(() => { port.postMessage({ type: "labelsError" }); });
     } else if (message.type === "syncSettings") {
-      const prevStarred = cacheManager.showStarred;
-      const prevImportant = cacheManager.showImportant;
       const showStarred = !!message.showStarred;
       const showImportant = !!message.showImportant;
       cacheManager.updateSystemLabelSettings(showStarred, showImportant);
-      // On-demand fetch only when transitioning from off to on AND cache is already initialized.
-      // On service worker restart, cacheStarted is false so we skip here — startFetch will include
-      // the labels via buildLabelQueryList since updateSystemLabelSettings was already called.
-      // Await whenReady() to ensure account setup and label fetch are complete before prioritizing.
-      if (cacheStarted) {
-        const notify = (): void => {
-          for (const [p] of portState) { try { p.postMessage({ type: "cacheState", phase: "complete", labelsTotal: 0, labelsDone: 0 }); } catch { /* port may be dead */ } }
-          // Do not clear the keepalive alarm here — if a main fetch or background expansion
-          // is still running, clearing it could let the service worker terminate. The progress
-          // callback clears the alarm when the build/expansion actually completes.
-          // Reset cached scope so ensureScopeFilter re-runs — the newly prioritized
-          // label needs to be included in the scoped index.
-          invalidateCachedScope();
-          pushUpdatedResults();
-        };
-        cacheManager.whenReady().then(() => {
-          if (showStarred && !prevStarred) cacheManager.prioritizeLabel("STARRED").then(notify).catch(() => {});
-          if (showImportant && !prevImportant) cacheManager.prioritizeLabel("IMPORTANT").then(notify).catch(() => {});
-        }).catch(() => {});
+      // Wake the orchestrator so it can fetch newly enabled system labels
+      if (cacheManager.isOrchestratorRunning()) {
+        cacheManager.wakeOrchestrator();
       }
     } else if (message.type === "fetchCounts") {
       const fetchSeq = message.seq;
       state.lastScopeTimestamp = message.scopeTimestamp ?? null;
       const scopeTs = message.scopeTimestamp ?? null;
+      // Update orchestrator filter config for scope changes
+      cacheManager.setFilterConfig({ ...cacheManager.getFilterConfig(), scopeTimestamp: scopeTs });
       const myCountsGen = ++state.countsGeneration;
-      ensureScopeFilter(scopeTs).then(() => cacheManager.getLabelCounts(undefined, scopeTs)).then((counts) => {
-        if (state.countsGeneration !== myCountsGen) return;
+      const sendCountsReady = (counts: Record<string, { own: number; inclusive: number }> | null): void => {
         const response: Record<string, unknown> = { type: "countsReady", counts };
         if (fetchSeq !== undefined) response.seq = fetchSeq;
-        port.postMessage(response);
-      }).catch(() => {
-        const response: Record<string, unknown> = { type: "countsReady", counts: null };
-        if (fetchSeq !== undefined) response.seq = fetchSeq;
         try { port.postMessage(response); } catch { /* port may be closed */ }
+      };
+      cacheManager.waitForScopeReady(scopeTs).then((scopeReady) => {
+        if (!scopeReady && scopeTs !== null) return Promise.resolve(null);
+        if (state.countsGeneration !== myCountsGen) return Promise.resolve(null);
+        return cacheManager.getLabelCounts(undefined, scopeTs);
+      }).then((counts) => {
+        if (state.countsGeneration !== myCountsGen) return;
+        sendCountsReady(counts);
+      }).catch(() => {
+        sendCountsReady(null);
       });
     }
   });
@@ -481,7 +388,6 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (tab.windowId === undefined) return;
   // Cancel pending return-to-inbox if the tab navigated (user moved elsewhere during the delay)
-  // This must run even when no panels are open, since the pending timeout was set on disconnect.
   if (changeInfo.url !== undefined) {
     const pending = pendingReturnToInbox.get(tabId);
     if (pending !== undefined) { clearTimeout(pending); pendingReturnToInbox.delete(tabId); }
@@ -497,24 +403,20 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       lastExtensionNavHash.delete(tabId);
       if (tab.windowId !== undefined) broadcastToWindow(tab.windowId, { type: "userNavigated" });
     }
-    // Non-list-view URLs (opening an email) don't clear lastExtensionNavHash,
-    // so "back" to the original search still matches and won't trigger userNavigated.
   }
   if (portState.size === 0) return;
   if (changeInfo.status === "complete") {
-    // Only react if this tab is the active tab in its window
     const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
     if (activeTab?.id === tabId) {
       if (isGmail(tab.url)) {
         const account = gmailAccountPath(tab.url);
         updateGmailTab(tab.windowId, tabId, tab.url ?? null);
-        // Skip resultsReady for extension-initiated navigation — sidepanel already has the correct state
         const currentHash = urlHash(tab.url ?? "");
         const lastHash = lastExtensionNavHash.get(tabId);
         if (!lastHash || (currentHash !== lastHash && !currentHash.startsWith(lastHash + "/"))) {
           broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
         }
-        startCacheIfNeeded(account, getScopeForWindow(tab.windowId));
+        startOrchestrator(account, getScopeForWindow(tab.windowId));
       } else {
         updateGmailTab(tab.windowId, null, null);
         broadcastToWindow(tab.windowId, { type: "notOnGmail" });
@@ -536,7 +438,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
       const account = gmailAccountPath(tab.url);
       updateGmailTab(activeInfo.windowId, activeInfo.tabId, tab.url ?? null);
       broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: account });
-      startCacheIfNeeded(account, getScopeForWindow(activeInfo.windowId));
+      startOrchestrator(account, getScopeForWindow(activeInfo.windowId));
     } else {
       updateGmailTab(activeInfo.windowId, null, null);
       broadcastToWindow(activeInfo.windowId, { type: "notOnGmail" });
@@ -566,7 +468,6 @@ function hasPortForWindow(windowId: number): boolean {
 }
 
 // Toggle side panel: close if open in this window, open if closed.
-// sidePanel.open() must be called synchronously during the user gesture — no await before it.
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   if (tab.windowId !== undefined && hasPortForWindow(tab.windowId)) {
@@ -585,13 +486,10 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 /** Exported for testing — reset cache state */
 export function _resetCacheState(): void {
-  cacheStarted = false;
+  cacheManager.stop();
   currentAccountPath = null;
-  cacheGeneration = 0;
-  currentCacheScope = undefined;
-  scopeInvalidationGen = 0;
-  scopeFilterInflight = null;
   portState.clear();
+  chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
 }
 
 /** Exported for testing — access the cache manager instance */

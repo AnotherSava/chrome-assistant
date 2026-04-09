@@ -157,6 +157,7 @@ body {
 .cache-spin {
   display: inline-block;
   color: #c90;
+  margin-left: 4px;
   animation: cache-rotate 1s linear infinite;
 }
 .cache-done { color: #4a4; }
