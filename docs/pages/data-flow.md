@@ -3,8 +3,8 @@
 ## Components
 
 - **Sidepanel** (`sidepanel.ts`) — UI layer. Expresses user intent via messages. Does not resolve descendants, build URLs, or query the cache directly.
-- **Service Worker** (`background.ts`) — Coordinator. Handles cache queries, Gmail navigation, and pushes results to the sidepanel.
-- **Cache Manager** (`cache-manager.ts`) — Data layer. Fetches and indexes Gmail messages, resolves label descendants, answers label queries.
+- **Service Worker** (`background.ts`) — Coordinator. Handles Gmail navigation and relays pushed results to the sidepanel.
+- **Cache Manager** (`cache-manager.ts`) — Data layer. Fetches and indexes Gmail messages, resolves label descendants, pushes results via callback when data is available.
 - **Gmail API** (`gmail-api.ts`) — Network layer. OAuth2 auth, label fetch, message ID fetch, scope-based message search, search query building.
 - **Cache DB** (`cache-db.ts`) — IndexedDB persistence. Stores messages with label cross-references, fetch state metadata, and label indexes.
 
@@ -13,10 +13,9 @@
 | Message | Purpose |
 |---------|---------|
 | `initWindow` | Sidepanel opened — sends windowId so service worker can track which Gmail tab belongs to which panel |
-| `selectionChanged` | User selected/deselected a label, changed scope, or toggled include-children. Carries `{ labelId, includeChildren, scope, scopeTimestamp, seq }`. Service worker queries cache and navigates Gmail. |
+| `selectionChanged` | User selected/deselected a label, changed scope, or toggled include-children. Carries `{ labelId, includeChildren, scope, scopeTimestamp }`. Service worker navigates Gmail and calls `setFilterConfig`. |
 | `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching to Summary tab with return-to-inbox enabled) |
 | `fetchLabels` | Request Gmail label list (used on first load and account switch) |
-| `fetchCounts` | Request per-label message counts from cache |
 | `syncSettings` | Push display settings (showStarred, showImportant) to service worker |
 | `syncState` | Push UI state (returnToInbox, onFiltersTab) to service worker |
 | `setPinMode` | Change pin mode (pinned vs autohide-site) |
@@ -29,33 +28,29 @@
 | `notOnGmail` | Active tab is not Gmail |
 | `labelsReady` | Label list fetched — carries `labels` array |
 | `labelsError` | Label fetch failed |
-| `labelResult` | Query result for selected label — carries `labelId`, `count`, `coLabelCounts`, `seq` |
-| `countsReady` | Per-label message counts — carries `counts` map |
-| `cacheState` | Cache build progress — carries `phase` (`labels` \| `scope` \| `scope-done` \| `expanding` \| `complete`), `labelsTotal`, `labelsDone`, optional `currentLabel` |
+| `filterResults` | Pushed results from cache manager — carries `labelId`, `count`, `coLabelCounts`, `counts`, `filterConfig` |
+| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching message IDs per label, building `labelIdx:*` indexes), `scope` (fetching scoped message ID set via paginated `messages.list after:DATE`), `scope-done` (scope fetch complete), `expanding` (gap-fill for widened scope or background depth expansion through tiers), `complete` (all work done, cache idle) |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
 
 ## Key Flows
 
 ### Filter Change
 
-All user-initiated filter changes follow the same flow. The user may click a label, deselect one, change scope, or toggle include-children — the sidepanel expresses the new filter state and the service worker + orchestrator handle the rest.
+All user-initiated filter changes follow the same flow. The user may click a label, deselect one, change scope, or toggle include-children — the sidepanel expresses the new filter state and the service worker + cache manager handle the rest.
 
-1. User changes filter criteria in the sidepanel
-2. Sidepanel sends `selectionChanged { labelId, includeChildren, scope, scopeTimestamp, seq }`
-3. Service worker calls `cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp })` — wakes the orchestrator loop
-4. Service worker also calls `cacheManager.queryLabel()` for immediate results and navigates Gmail (NOTE: future refactor will remove this — the cache manager will push results via callback when ready, eliminating the separate query call)
-5. Cache manager resolves descendants internally via prefix matching when `includeChildren` is true
-6. Service worker resolves label name(s) from `cacheManager.getLabels()` and builds Gmail URL
-7. Service worker navigates Gmail tab and stores hash in `lastExtensionNavHash`
-8. Service worker responds with `labelResult` (NOTE: future refactor will replace this request/response with push-based updates from the cache manager)
-9. The orchestrator re-evaluates priorities via `decide()` — may fetch scoped IDs, missing label indexes, or gap-fill data as needed
+1. User changes filter criteria in the sidepanel (clicks label, changes scope, toggles include-children)
+2. Sidepanel sends `selectionChanged { labelId, includeChildren, scope }`
+3. Service worker navigates Gmail immediately (resolves label names, builds URL, updates tab)
+4. Service worker calls `cacheManager.setFilterConfig({ labelId, includeChildren, scope })`
+5. Cache manager pushes results via registered callback whenever data is available:
+   - Immediately if data is cached (label indexes exist for the requested scope)
+   - During initial build, `setFilterConfig` pushes labels with empty counts (clears stale data); the orchestrator then pushes progressively after each label is indexed
+   - After orchestrator fetches missing label/scope data
+   - Again when cache completes, gap-fill finishes, or expansion adds data
+6. Service worker relays each push as `filterResults` to sidepanel
+7. Sidepanel renders whatever arrives — progressively accurate counts
 
-### Cache Complete Re-query
-
-1. Cache manager finishes building and fires `cacheState { phase: "complete" }` via progress callback
-2. Service worker checks `lastSelection` — if a label is active, re-runs `queryLabel` with stored parameters and pushes updated `labelResult` to all connected sidepanels
-3. Service worker unconditionally pushes `countsReady` to all connected sidepanels (regardless of active label)
-4. Sidepanel does NOT trigger re-queries on cache complete — it only uses `cacheState` for progress bar display
+No request/response. No seq correlation. Staleness handled by filter config comparison in push callback.
 
 ### Cache Orchestrator
 
@@ -88,11 +83,12 @@ The cache tracks how far back it has fetched via `cacheDepth` metadata in Indexe
 
 ### Zero-Count Label Hiding
 
-1. When scope is active, `getLabelCounts` omits labels where both own and inclusive counts are zero
-2. Sidepanel receives `countsReady` with the filtered `labelCounts` map
-3. In `renderFilteredLabels`, when no label is selected and scope is not "any": filters `cachedLabels` to those present in `labelCounts`
-4. `addParentChain` preserves tree structure — a parent with own=0 stays visible if a child has count>0
+1. `getLabelCounts` includes all indexed labels — zero-count entries have `{ own: 0, inclusive: 0 }`, labels not yet indexed are absent from the map
+2. Sidepanel receives `filterResults` with the full `counts` map
+3. In `renderFilteredLabels`, when no label is selected, scope is not "any", and cache build is complete: hides labels with explicit zero counts (own=0 AND inclusive=0). Labels absent from `counts` (not yet indexed) remain visible.
+4. A parent with own=0 but inclusive>0 stays visible (descendants have messages)
 5. When scope is "any", no filtering — all labels shown regardless of count
+6. During initial build (phase is not "complete" or "expanding"), no filtering — all labels shown
 
 ### Filters Off (Summary Tab)
 

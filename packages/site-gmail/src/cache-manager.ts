@@ -1,4 +1,4 @@
-import type { CacheMessage, GmailLabel } from "@core/types.js";
+import type { GmailLabel } from "@core/types.js";
 import * as db from "./cache-db.js";
 import { fetchLabels, fetchLabelMessageIds, fetchScopedMessageIds, fetchLabelMessageIdsPage, fetchScopedMessageIdsPage } from "./gmail-api.js";
 
@@ -41,13 +41,24 @@ export interface LabelQueryResult {
 
 export type ProgressCallback = (progress: CacheProgress) => void;
 
+export interface ResultPush {
+  labelId: string | null;
+  count: number;
+  coLabelCounts: Record<string, number>;
+  counts: Record<string, { own: number; inclusive: number }>;
+  filterConfig: FilterConfig;
+  partial: boolean;
+}
+
+export type ResultCallback = (result: ResultPush) => void;
+
 export interface FilterConfig {
   labelId: string | null;
   includeChildren: boolean;
   scopeTimestamp: number | null;
 }
 
-export type OrchestratorActionType = "fetch-scope" | "fetch-label" | "gap-fill-label" | "expand-label" | "refresh-label";
+export type OrchestratorActionType = "fetch-scope" | "fetch-label" | "refresh-label";
 
 export interface OrchestratorAction {
   type: OrchestratorActionType;
@@ -57,6 +68,8 @@ export interface OrchestratorAction {
   beforeDate?: string;
   /** The scope timestamp this action targets — used to store results in scopedIdSets under the correct key (needed when fetching a requested scope that differs from filterConfig.scopeTimestamp). */
   scopeTimestamp?: number;
+  /** Segment index for parallel scope fetches — each date-range segment gets its own continuation key. */
+  segmentId?: number;
 }
 
 interface Continuation {
@@ -75,11 +88,16 @@ interface FetchState {
 export class CacheManager {
   private labels: GmailLabel[] = [];
   private onProgress: ProgressCallback | null = null;
+  private onResult: ResultCallback | null = null;
+  /** Generation counter for pushResults — incremented on each call so stale async completions are discarded. */
+  private pushGeneration = 0;
   private aborted = false;
   private fetchGeneration = 0;
   private activeFetch: Promise<void> | null = null;
   /** Labels already processed (by priority or main loop) — skipped by main loop. */
   private processedLabels = new Set<string>();
+  /** In-memory accumulator for multi-page fetch-label — accumulates message IDs per label, writes to IndexedDB only when the label is complete (all pages fetched). Avoids expensive per-page read+merge+write cycles. */
+  private labelIdAccumulator = new Map<string, string[]>();
   /** Resolves when a priority label finishes; main loop awaits this between iterations. */
   private priorityBarrier: Promise<void> | null = null;
   private priorityResolve: (() => void) | null = null;
@@ -98,7 +116,7 @@ export class CacheManager {
   private scopeFilterGen = 0;
   /** Per-timestamp cache of scoped ID sets — enables correct on-the-fly intersection when multiple windows use different scopes and the active scopedLabelIdx was built for a different timestamp. */
   private scopedIdSets = new Map<number, Set<string>>();
-  /** Monotonically increasing generation for gap-fill — prevents stale gap-fills from writing results after a newer scope change. */
+  /** Monotonically increasing generation for gap-fill — prevents stale gap-fills from writing results after a newer scope change. (Still used by legacy startGapFill/runGapFill paths.) */
   private gapFillGen = 0;
 
   // --- Orchestrator state ---
@@ -107,7 +125,7 @@ export class CacheManager {
   /** Whether the orchestrator loop is running. */
   private orchestratorRunning = false;
   /** Number of parallel API calls the orchestrator may issue per iteration. */
-  private orchestratorConcurrency = 1;
+  private orchestratorConcurrency = 10;
   /** In-progress pagination state, keyed by action type + label ID. */
   private continuations = new Map<string, Continuation>();
   /** Wake resolver for the orchestrator's idle sleep. */
@@ -116,37 +134,109 @@ export class CacheManager {
   private loopPromise: Promise<void> | null = null;
   /** Monotonic counter to detect stale start() calls — prevents concurrent loops when start() is called during async setup. */
   private startGeneration = 0;
-  /** Accumulator for multi-page scope fetch. */
-  private scopeAccumulator: string[] = [];
+  /** Per-scope accumulators for multi-page scope fetches — keyed by scope timestamp so concurrent scope fetches don't mix their IDs. */
+  private scopeAccumulators = new Map<number, string[]>();
+  /** Tracks how many segments are pending per scope — keyed by scope timestamp. When it reaches 0, the scope is complete. */
+  private scopeSegmentsPending = new Map<number, number>();
+  /** Per-scope start times for logging — keyed by scope timestamp. */
+  private scopeStartTimes = new Map<number, number>();
   /** In-memory mirror of cacheDepth from IndexedDB. undefined = not yet determined. */
   private cacheDepthTimestamp: number | null | undefined = undefined;
   /** In-memory mirror of lastFetchTimestamp from fetchState. */
   private lastRefreshTimestamp: number | null = null;
-  /** Configuration for current gap-fill cycle. null = no gap-fill in progress. */
-  private gapFillConfig: { afterDate: string; beforeDate: string; targetTimestamp: number | null } | null = null;
-  /** Labels that completed gap-fill in the current cycle. */
-  private gapFillProcessedLabels = new Set<string>();
-  /** Target timestamp for the current expansion tier. undefined = not computed yet. */
-  private currentExpansionTarget: number | null | undefined = undefined;
-  /** Labels that completed expansion in the current tier. */
-  private expansionProcessedLabels = new Set<string>();
   /** Whether the last emitted progress was "complete" — prevents redundant re-emission on idle wakes. */
   private lastProgressWasComplete = false;
   /** Labels that completed refresh in the current cycle. */
   private refreshProcessedLabels = new Set<string>();
+  /** Accumulates all message IDs fetched during the current refresh cycle — used to update cached scoped ID sets. */
+  private refreshedIds = new Set<string>();
   /** Additional scope timestamps requested by ports (multi-window) that the orchestrator should fetch even if they differ from the global filterConfig.scopeTimestamp. Entries are removed once the scope is fetched. */
   private requestedScopes = new Set<number>();
   /** Resolve function for the error backoff sleep — called by stop() to interrupt backoff. */
   private errorBackoffResolve: (() => void) | null = null;
   /** Timeout ID for the error backoff timer — cleared by stop() to prevent stale callbacks from nulling a future errorBackoffResolve. */
   private errorBackoffTimeout: ReturnType<typeof setTimeout> | undefined = undefined;
-  /** Tracks the most restrictive (shallowest) scope timestamp used across labels during the initial build. Used to correctly set cacheDepthTimestamp when the build completes even if the user changed scope mid-build. undefined = not yet tracking, null = some label used no scope (all time). */
-  private initialBuildNarrowestScope: number | null | undefined = undefined;
+  /** Start time of the current orchestrator operation (for logging). */
+  private operationStartTime: number | null = null;
+  /** Type of the current orchestrator operation (for logging). */
+  private operationStartType: string | null = null;
+  /** Description of the current orchestrator operation (for logging). */
+  private operationDescription: string | null = null;
   /** Staleness threshold for incremental refresh (10 minutes). */
   private static readonly REFRESH_STALE_MS = 10 * 60 * 1000;
 
+  private static formatTime(ts: number): string {
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+  }
+
+  /** Split a date range into N segments for parallel fetching. Returns array of { scopeDate, beforeDate } pairs. */
+  private splitScopeIntoSegments(fromTimestamp: number, toTimestamp: number, segments: number): { scopeDate: string; beforeDate: string }[] {
+    const span = toTimestamp - fromTimestamp;
+    const segmentSize = Math.ceil(span / segments);
+    const result: { scopeDate: string; beforeDate: string }[] = [];
+    for (let i = 0; i < segments; i++) {
+      const segStart = fromTimestamp + i * segmentSize;
+      const segEnd = Math.min(fromTimestamp + (i + 1) * segmentSize, toTimestamp);
+      if (segStart >= toTimestamp) break;
+      result.push({ scopeDate: this.timestampToDateString(segStart), beforeDate: this.timestampToDateString(segEnd) });
+    }
+    return result;
+  }
+
+  private static formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m${s % 60}s`;
+  }
+
+  private static formatDate(ts: number | null): string {
+    if (ts === null) return "all time";
+    return new Date(ts).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  }
+
+  private logOperationStart(type: string, description: string): void {
+    this.operationStartTime = Date.now();
+    this.operationStartType = type;
+    this.operationDescription = description;
+    console.log(`[cache] ${description} — started at ${CacheManager.formatTime(this.operationStartTime)}`);
+  }
+
+  private describeOperation(action: OrchestratorAction): string {
+    const labels = this.buildLabelQueryList();
+    const labelCount = labels.length;
+    switch (action.type) {
+      case "fetch-scope": {
+        const date = action.scopeDate ?? "?";
+        return `Fetching scoped message IDs (after ${date})`;
+      }
+      case "fetch-label": {
+        return `Fetching emails per label (${labelCount} labels, all time)`;
+      }
+      case "refresh-label": {
+        const since = action.scopeDate ?? "?";
+        return `Refreshing cache (${labelCount} labels, since ${since})`;
+      }
+    }
+  }
+
+  private logOperationEnd(): void {
+    if (!this.operationDescription) return;
+    const now = Date.now();
+    const duration = this.operationStartTime !== null ? CacheManager.formatDuration(now - this.operationStartTime) : "?";
+    console.log(`[cache] ${this.operationDescription} — finished at ${CacheManager.formatTime(now)}, took ${duration}`);
+    this.operationStartTime = null;
+    this.operationStartType = null;
+    this.operationDescription = null;
+  }
+
   setProgressCallback(callback: ProgressCallback): void {
     this.onProgress = callback;
+  }
+
+  setResultCallback(callback: ResultCallback): void {
+    this.onResult = callback;
   }
 
   /** Get the current in-memory label list (used by the service worker to resolve label names). */
@@ -201,7 +291,7 @@ export class CacheManager {
       return;
     }
     // Don't fetch scope while cache is still building — indexes are incomplete.
-    // After cache completes, pushUpdatedResults will re-apply the scope.
+    // After cache completes, pushResults will re-apply the scope.
     if (this.labels.length === 0) return;
     let showedSpinner = false;
     try {
@@ -218,7 +308,7 @@ export class CacheManager {
         const scopedIds = await fetchScopedMessageIds(dateStr, (count) => { if (count - lastReported >= 1000) { lastReported = count; this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: count }); } });
         scopedSet = new Set(scopedIds);
         // Cache per timestamp for reuse. Evict oldest to prevent unbounded growth.
-        const MAX_SCOPED_ID_SETS = 5;
+        const MAX_SCOPED_ID_SETS = 16;
         if (this.scopedIdSets.size >= MAX_SCOPED_ID_SETS && !this.scopedIdSets.has(scopeTimestamp)) {
           const oldestKey = this.scopedIdSets.keys().next().value!;
           this.scopedIdSets.delete(oldestKey);
@@ -278,7 +368,7 @@ export class CacheManager {
       if (generation !== this.gapFillGen) return;
       const messageIds = await fetchLabelMessageIds(label.id, afterDate, beforeDate);
       if (generation !== this.gapFillGen) return;
-      await this.crossReferenceLabel(label.id, messageIds, () => generation !== this.gapFillGen);
+      await this.crossReferenceLabel(label.id, messageIds);
       if (generation !== this.gapFillGen) return;
       labelsDone++;
       this.emitProgress({ phase: "expanding", labelsTotal, labelsDone, currentLabel: label.name });
@@ -368,11 +458,13 @@ export class CacheManager {
 
   // --- Orchestrator methods ---
 
-  /** Update the filter configuration and wake the orchestrator if idle. */
-  setFilterConfig(config: FilterConfig): void {
+  /** Update the filter configuration and wake the orchestrator if idle. Pushes results immediately if data is already cached unless skipPush is true (used during account switches to avoid emitting stale data). */
+  setFilterConfig(config: FilterConfig, skipPush?: boolean): void {
     this.filterConfig = { ...config };
     this.lastProgressWasComplete = false;
     this.wakeOrchestrator();
+    // Fire-and-forget push — if data is cached, the callback fires immediately
+    if (!skipPush) this.pushResults();
   }
 
   /** Get the current filter configuration. */
@@ -400,6 +492,12 @@ export class CacheManager {
     return this.lastRefreshTimestamp;
   }
 
+
+  /** Set the API concurrency level for the orchestrator. */
+  setConcurrency(value: number): void {
+    this.orchestratorConcurrency = value;
+  }
+
   /** Wake the orchestrator loop from idle sleep. */
   wakeOrchestrator(): void {
     if (this.orchestratorWakeResolve) {
@@ -409,27 +507,17 @@ export class CacheManager {
     }
   }
 
-  /** Request the orchestrator to fetch a scope timestamp (used by multi-window pushUpdatedResults to ensure all active scopes are fetched, not just the global filterConfig scope). No-op if the scope is already cached. Wakes the orchestrator. */
+  /** Check whether a given scope timestamp has been fetched and is available for queries. Returns true when scopeTimestamp is null (no scope needed) or when the scope's ID set is cached. */
+  isScopeReady(scopeTimestamp: number | null): boolean {
+    if (scopeTimestamp === null) return true;
+    return this.scopedIdSets.has(scopeTimestamp);
+  }
+
+  /** Request the orchestrator to fetch a scope timestamp (ensures the given scope is fetched, not just the global filterConfig scope). No-op if the scope is already cached. Wakes the orchestrator. */
   requestScopeFetch(scopeTimestamp: number): void {
     if (this.scopedIdSets.has(scopeTimestamp)) return;
     this.requestedScopes.add(scopeTimestamp);
     this.wakeOrchestrator();
-  }
-
-  /** Wait until the scoped ID set for the given timestamp is available (fetched by the orchestrator). Returns true if the scope is ready, false if the wait timed out or the orchestrator stopped before the scope was available. Resolves immediately with true if the set already exists or if scopeTimestamp is null. Times out after 30 seconds to prevent indefinite hangs. */
-  waitForScopeReady(scopeTimestamp: number | null): Promise<boolean> {
-    if (scopeTimestamp === null || this.scopedIdSets.has(scopeTimestamp)) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      const timeout = setTimeout(() => { if (!settled) { settled = true; resolve(false); } }, 30_000);
-      const check = (): void => {
-        if (settled) return;
-        if (this.scopedIdSets.has(scopeTimestamp)) { settled = true; clearTimeout(timeout); resolve(true); return; }
-        if (!this.orchestratorRunning) { settled = true; clearTimeout(timeout); resolve(false); return; }
-        setTimeout(check, 50);
-      };
-      check();
-    });
   }
 
   /** Sleep until woken by setFilterConfig() or wakeOrchestrator(). */
@@ -439,18 +527,6 @@ export class CacheManager {
 
   private continuationKey(type: OrchestratorActionType, labelId?: string): string {
     return `${type}:${labelId ?? ""}`;
-  }
-
-  /** Return the widest (oldest / smallest timestamp) scope across the global filterConfig, pending requestedScopes, and already-fetched scopedIdSets. Fetched scopes are removed from requestedScopes but retained in scopedIdSets, so we must check both to ensure gap-fill covers the widest scope any window has used. */
-  private widestActiveScope(): number | null {
-    let widest = this.filterConfig.scopeTimestamp;
-    for (const ts of this.requestedScopes) {
-      if (widest === null || ts < widest) widest = ts;
-    }
-    for (const ts of this.scopedIdSets.keys()) {
-      if (widest === null || ts < widest) widest = ts;
-    }
-    return widest;
   }
 
   /** Return the next requested scope timestamp that isn't already cached, or null if none. */
@@ -478,56 +554,64 @@ export class CacheManager {
     };
 
     // Priority 1: Scoped IDs needed — user has scope active but we don't have the scoped ID set.
-    // Also check requestedScopes from multi-window ports that need scopes other than the global filterConfig scope.
+    // Split large scope fetches into parallel date-range segments for faster completion.
     const neededScope = this.filterConfig.scopeTimestamp !== null && !this.scopedIdSets.has(this.filterConfig.scopeTimestamp) ? this.filterConfig.scopeTimestamp : this.nextRequestedScope();
     if (neededScope !== null) {
-      const scopeDate = this.timestampToDateString(neededScope);
-      const key = this.continuationKey("fetch-scope");
-      const cont = this.continuations.get(key);
-      if (cont && cont.scopeDate === scopeDate) {
-        tryAdd({ type: "fetch-scope", pageToken: cont.nextPageToken, scopeDate, scopeTimestamp: neededScope });
-      } else {
-        if (cont) { this.continuations.delete(key); this.scopeAccumulator = []; }
-        tryAdd({ type: "fetch-scope", scopeDate, scopeTimestamp: neededScope });
+      const scopeKey = neededScope;
+      // Check if segments are already in progress (have continuations or pending count)
+      if (this.scopeSegmentsPending.has(scopeKey)) {
+        // Resume in-progress segments
+        for (const [contKey, cont] of this.continuations) {
+          if (actions.length >= concurrency) break;
+          if (contKey.startsWith(`fetch-scope:${scopeKey}:`)) {
+            tryAdd({ type: "fetch-scope", pageToken: cont.nextPageToken as string, scopeDate: cont.scopeDate as string, beforeDate: cont.beforeDate as string | undefined, scopeTimestamp: neededScope, segmentId: parseInt(contKey.split(":")[2]) });
+          }
+        }
+      } else if (!this.scopeAccumulators.has(scopeKey)) {
+        // Start new scope fetch — log start time
+        const now = Date.now();
+        this.scopeStartTimes.set(scopeKey, now);
+        console.log(`[cache] Fetching scope ${CacheManager.formatDate(neededScope)} — started at ${CacheManager.formatTime(now)}`);
+        const span = now - neededScope;
+        const segmentCount = Math.min(concurrency, Math.max(1, Math.ceil(span / (7 * 24 * 60 * 60 * 1000)))); // at least 1 week per segment
+        if (segmentCount > 1) {
+          const segments = this.splitScopeIntoSegments(neededScope, now, segmentCount);
+          this.scopeSegmentsPending.set(scopeKey, segments.length);
+          for (let i = 0; i < segments.length; i++) {
+            if (actions.length >= concurrency) break;
+            tryAdd({ type: "fetch-scope", scopeDate: segments[i].scopeDate, beforeDate: segments[i].beforeDate, scopeTimestamp: neededScope, segmentId: i });
+          }
+        } else {
+          // Short scope — single fetch, no segmentation
+          tryAdd({ type: "fetch-scope", scopeDate: this.timestampToDateString(neededScope), scopeTimestamp: neededScope });
+        }
       }
     }
 
     // Priority 2: Selected label missing — user selected a label but it's not cached
-    // When cache depth is already established (post-initial-build), use it so the new label
-    // gets the same coverage as existing labels. Otherwise use the UI scope for fast results.
     if (this.filterConfig.labelId !== null && !this.processedLabels.has(this.filterConfig.labelId)) {
       const labelId = this.filterConfig.labelId;
       const key = this.continuationKey("fetch-label", labelId);
       const cont = this.continuations.get(key);
-      const selectedLabelScopeTs = this.cacheDepthTimestamp !== undefined ? this.cacheDepthTimestamp : this.filterConfig.scopeTimestamp;
-      const scopeDate = selectedLabelScopeTs !== null ? this.timestampToDateString(selectedLabelScopeTs) : undefined;
-      if (cont && cont.scopeDate === scopeDate) {
-        tryAdd({ type: "fetch-label", labelId, pageToken: cont.nextPageToken, scopeDate });
+      if (cont) {
+        tryAdd({ type: "fetch-label", labelId, pageToken: cont.nextPageToken });
       } else {
-        if (cont) this.continuations.delete(key);
-        tryAdd({ type: "fetch-label", labelId, scopeDate });
+        tryAdd({ type: "fetch-label", labelId });
       }
     }
 
     // Priority 3: Initial cache build — labels not yet fully indexed
     const queryList = this.buildLabelQueryList();
-    // When cache depth is already established (e.g. a new label was enabled after initial build),
-    // fetch to the existing depth so the new label matches other labels' coverage.
-    // When depth is null (full history), fetch without scope restriction.
-    // During the first build (cacheDepthTimestamp === undefined), use the UI scope.
-    const initialBuildScopeTs = this.cacheDepthTimestamp !== undefined ? this.cacheDepthTimestamp : this.filterConfig.scopeTimestamp;
-    const scopeDate = initialBuildScopeTs !== null ? this.timestampToDateString(initialBuildScopeTs) : undefined;
     for (const label of queryList) {
       if (actions.length >= concurrency) break;
       if (this.processedLabels.has(label.id)) continue;
       if (usedLabels.has(label.id)) continue;
       const key = this.continuationKey("fetch-label", label.id);
       const cont = this.continuations.get(key);
-      if (cont && cont.scopeDate === scopeDate) {
-        tryAdd({ type: "fetch-label", labelId: label.id, pageToken: cont.nextPageToken, scopeDate });
+      if (cont) {
+        tryAdd({ type: "fetch-label", labelId: label.id, pageToken: cont.nextPageToken });
       } else {
-        if (cont) this.continuations.delete(key);
-        tryAdd({ type: "fetch-label", labelId: label.id, scopeDate });
+        tryAdd({ type: "fetch-label", labelId: label.id });
       }
     }
 
@@ -535,57 +619,31 @@ export class CacheManager {
     const initialBuildComplete = queryList.every(l => this.processedLabels.has(l.id));
     if (!initialBuildComplete || actions.length > 0) return actions;
 
-    // Priority 4: Gap-fill — scope wider than cache depth
-    // Use the widest (oldest) scope across the global filter and all requested scopes
-    // so secondary windows also get gap-fill, not just the global filter's window.
-    const gapFillScope = this.widestActiveScope();
-    if (this.cacheDepthTimestamp !== undefined && this.cacheDepthTimestamp !== null && gapFillScope !== null && gapFillScope < this.cacheDepthTimestamp) {
-      const afterDate = this.timestampToDateString(gapFillScope);
-      const beforeDate = this.timestampToDateString(this.cacheDepthTimestamp);
-      const targetTimestamp = this.normalizeToMidnight(gapFillScope);
-      if (!this.gapFillConfig || this.gapFillConfig.afterDate !== afterDate || this.gapFillConfig.beforeDate !== beforeDate) {
-        this.gapFillConfig = { afterDate, beforeDate, targetTimestamp };
-        this.gapFillProcessedLabels.clear();
-        for (const [k] of this.continuations) { if (k.startsWith("gap-fill-label:")) this.continuations.delete(k); }
-      }
-      for (const label of queryList) {
+    // Priority 4: Background scope expansion — pre-fetch wider scoped ID sets through tiers
+    // Only expand when a scope is active and the initial build completed through executeAction
+    // (cacheDepthTimestamp !== undefined means the build set it to null on completion)
+    if (this.filterConfig.scopeTimestamp !== null && this.cacheDepthTimestamp !== undefined) {
+      const tiers = expansionTierTimestamps(new Date());
+      for (const tier of tiers) {
         if (actions.length >= concurrency) break;
-        if (this.gapFillProcessedLabels.has(label.id)) continue;
-        if (usedLabels.has(label.id)) continue;
-        const key = this.continuationKey("gap-fill-label", label.id);
+        if (this.scopedIdSets.has(tier)) continue;
+        const scopeDate = this.timestampToDateString(tier);
+        const key = this.continuationKey("fetch-scope", String(tier));
         const cont = this.continuations.get(key);
         if (cont) {
-          tryAdd({ type: "gap-fill-label", labelId: label.id, pageToken: cont.nextPageToken, scopeDate: afterDate, beforeDate });
+          tryAdd({ type: "fetch-scope", pageToken: cont.nextPageToken, scopeDate, scopeTimestamp: tier });
         } else {
-          tryAdd({ type: "gap-fill-label", labelId: label.id, scopeDate: afterDate, beforeDate });
+          if (!this.scopeStartTimes.has(tier)) {
+            this.scopeStartTimes.set(tier, Date.now());
+            console.log(`[cache] Fetching scope ${CacheManager.formatDate(tier)} — started at ${CacheManager.formatTime(Date.now())}`);
+          }
+          tryAdd({ type: "fetch-scope", scopeDate, scopeTimestamp: tier });
         }
       }
       if (actions.length > 0) return actions;
     }
 
-    // Priority 5: Background expansion — depth is partial, progressively deepen
-    if (this.cacheDepthTimestamp !== undefined && this.cacheDepthTimestamp !== null) {
-      if (this.currentExpansionTarget === undefined) {
-        this.currentExpansionTarget = this.nextExpansionTier(this.cacheDepthTimestamp, new Date());
-      }
-      const afterDate = this.currentExpansionTarget !== null ? this.timestampToDateString(this.currentExpansionTarget) : undefined;
-      const beforeDate = this.timestampToDateString(this.cacheDepthTimestamp);
-      for (const label of queryList) {
-        if (actions.length >= concurrency) break;
-        if (this.expansionProcessedLabels.has(label.id)) continue;
-        if (usedLabels.has(label.id)) continue;
-        const key = this.continuationKey("expand-label", label.id);
-        const cont = this.continuations.get(key);
-        if (cont) {
-          tryAdd({ type: "expand-label", labelId: label.id, pageToken: cont.nextPageToken, scopeDate: afterDate, beforeDate });
-        } else {
-          tryAdd({ type: "expand-label", labelId: label.id, scopeDate: afterDate, beforeDate });
-        }
-      }
-      if (actions.length > 0) return actions;
-    }
-
-    // Priority 6: Incremental refresh — cache is complete but stale
+    // Priority 5: Incremental refresh — cache is complete but stale
     if (this.lastRefreshTimestamp !== null && Date.now() - this.lastRefreshTimestamp > CacheManager.REFRESH_STALE_MS) {
       const sinceDate = this.timestampToDateString(this.lastRefreshTimestamp);
       for (const label of queryList) {
@@ -607,7 +665,7 @@ export class CacheManager {
 
   /** Execute a single orchestrator action: call the per-page API, store results, update continuation state. */
   async executeAction(action: OrchestratorAction): Promise<void> {
-    const key = this.continuationKey(action.type, action.labelId);
+    const key = action.type === "fetch-scope" ? this.continuationKey("fetch-scope", `${action.scopeTimestamp ?? this.filterConfig.scopeTimestamp}${action.segmentId !== undefined ? `:${action.segmentId}` : ""}`) : this.continuationKey(action.type, action.labelId);
 
     // Cache the query list for isAllLabelsInSet checks within this action
     const queryList = action.type !== "fetch-scope" ? this.buildLabelQueryList() : undefined;
@@ -615,134 +673,110 @@ export class CacheManager {
     switch (action.type) {
       case "fetch-scope": {
         const scopeTimestampForAction = action.scopeTimestamp ?? this.filterConfig.scopeTimestamp;
-        const result = await fetchScopedMessageIdsPage(action.scopeDate!, action.pageToken);
-        this.scopeAccumulator.push(...result.ids);
+        const result = await fetchScopedMessageIdsPage(action.scopeDate!, action.pageToken, action.beforeDate);
+        const scopeKey = scopeTimestampForAction ?? 0;
+        const acc = this.scopeAccumulators.get(scopeKey) ?? [];
+        acc.push(...result.ids);
+        this.scopeAccumulators.set(scopeKey, acc);
         if (result.nextPageToken) {
-          this.continuations.set(key, { type: "fetch-scope", nextPageToken: result.nextPageToken, scopeDate: action.scopeDate });
+          this.continuations.set(key, { type: "fetch-scope", nextPageToken: result.nextPageToken, scopeDate: action.scopeDate, beforeDate: action.beforeDate });
         } else {
           this.continuations.delete(key);
-          const scopeTimestamp = scopeTimestampForAction;
-          if (scopeTimestamp !== null) {
-            const scopedSet = new Set(this.scopeAccumulator);
-            const MAX_SCOPED_ID_SETS = 5;
-            if (this.scopedIdSets.size >= MAX_SCOPED_ID_SETS && !this.scopedIdSets.has(scopeTimestamp)) {
-              const oldestKey = this.scopedIdSets.keys().next().value!;
-              this.scopedIdSets.delete(oldestKey);
+          // Check if all segments for this scope are done
+          const pending = this.scopeSegmentsPending.get(scopeKey);
+          if (pending !== undefined && pending > 1) {
+            this.scopeSegmentsPending.set(scopeKey, pending - 1);
+          } else {
+            // All segments complete (or no segments — single fetch)
+            this.scopeSegmentsPending.delete(scopeKey);
+            const scopeTimestamp = scopeTimestampForAction;
+            if (scopeTimestamp !== null) {
+              const scopedSet = new Set(acc);
+              const MAX_SCOPED_ID_SETS = 16;
+              if (this.scopedIdSets.size >= MAX_SCOPED_ID_SETS && !this.scopedIdSets.has(scopeTimestamp)) {
+                const oldestKey = this.scopedIdSets.keys().next().value!;
+                this.scopedIdSets.delete(oldestKey);
+              }
+              this.scopedIdSets.set(scopeTimestamp, scopedSet);
+              this.requestedScopes.delete(scopeTimestamp);
             }
-            this.scopedIdSets.set(scopeTimestamp, scopedSet);
-            this.requestedScopes.delete(scopeTimestamp);
+            this.scopeAccumulators.delete(scopeKey);
+            const scopeStart = this.scopeStartTimes.get(scopeKey);
+            this.scopeStartTimes.delete(scopeKey);
+            const now = Date.now();
+            console.log(`[cache] Fetching scope ${CacheManager.formatDate(scopeTimestampForAction)} — finished at ${CacheManager.formatTime(now)}, took ${scopeStart ? CacheManager.formatDuration(now - scopeStart) : "?"}`);
+            // Scope is now available — push results
+            this.pushResults(true);
           }
-          this.scopeAccumulator = [];
         }
         break;
       }
       case "fetch-label": {
-        // Capture scope timestamp before the async call — filterConfig may change during the await
-        const scopeTimestampAtDispatch = this.filterConfig.scopeTimestamp;
-        const result = await fetchLabelMessageIdsPage(action.labelId!, action.pageToken, action.scopeDate, action.beforeDate);
-        await this.crossReferenceLabel(action.labelId!, result.ids);
+        const result = await fetchLabelMessageIdsPage(action.labelId!, action.pageToken);
+        // Accumulate IDs in memory — write to IndexedDB only when label is complete
+        const acc = this.labelIdAccumulator.get(action.labelId!) ?? [];
+        acc.push(...result.ids);
+        this.labelIdAccumulator.set(action.labelId!, acc);
         if (result.nextPageToken) {
-          this.continuations.set(key, { type: "fetch-label", labelId: action.labelId, nextPageToken: result.nextPageToken, scopeDate: action.scopeDate, beforeDate: action.beforeDate });
+          this.continuations.set(key, { type: "fetch-label", labelId: action.labelId, nextPageToken: result.nextPageToken });
         } else {
           this.continuations.delete(key);
+          // Write accumulated IDs to IndexedDB in one operation
+          await this.crossReferenceLabel(action.labelId!, acc);
+          this.labelIdAccumulator.delete(action.labelId!);
           this.processedLabels.add(action.labelId!);
-          // Track the narrowest (shallowest) scope used during the initial build so
-          // cacheDepthTimestamp reflects the actual coverage, not the scope at completion time.
-          // Uses the scope timestamp captured before the await so a mid-flight scope change
-          // doesn't overstate coverage.
-          if (this.cacheDepthTimestamp === undefined) {
-            const usedTs = scopeTimestampAtDispatch;
-            if (usedTs !== null) {
-              if (this.initialBuildNarrowestScope === undefined || this.initialBuildNarrowestScope === null || usedTs > this.initialBuildNarrowestScope) {
-                this.initialBuildNarrowestScope = usedTs;
-              }
-            } else if (this.initialBuildNarrowestScope === undefined) {
-              this.initialBuildNarrowestScope = null;
-            }
-          }
+          // Push results when a label finishes indexing — during the initial build
+          // this provides progressive count updates; for the selected label it also
+          // updates the co-label detail view.
+          if (action.labelId === this.filterConfig.labelId || this.cacheDepthTimestamp === undefined) this.pushResults(true);
           if (this.isAllLabelsInSet(this.processedLabels, queryList)) {
             const now = Date.now();
             this.lastRefreshTimestamp = now;
             await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: now });
-            // Only set cache depth on first-time initial build completion — don't regress
-            // a deeper depth set by background expansion when a new label is added later
+            // On initial build completion, set full coverage (null = all time)
             if (this.cacheDepthTimestamp === undefined) {
-              const scopeTs = this.initialBuildNarrowestScope !== undefined ? this.initialBuildNarrowestScope : this.filterConfig.scopeTimestamp;
-              this.cacheDepthTimestamp = scopeTs !== null ? this.normalizeToMidnight(scopeTs) : null;
-              await db.setMeta("cacheDepth", { timestamp: this.cacheDepthTimestamp ?? null });
-              this.initialBuildNarrowestScope = undefined;
+              this.cacheDepthTimestamp = null;
+              await db.setMeta("cacheDepth", { timestamp: null });
             }
             // Signal initial build completion so the service worker pushes results
-            // before background expansion or gap-fill begins
             this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
-          }
-        }
-        break;
-      }
-      case "gap-fill-label": {
-        const result = await fetchLabelMessageIdsPage(action.labelId!, action.pageToken, action.scopeDate, action.beforeDate);
-        await this.crossReferenceLabel(action.labelId!, result.ids);
-        if (result.nextPageToken) {
-          this.continuations.set(key, { type: "gap-fill-label", labelId: action.labelId, nextPageToken: result.nextPageToken, scopeDate: action.scopeDate, beforeDate: action.beforeDate });
-        } else {
-          this.continuations.delete(key);
-          this.gapFillProcessedLabels.add(action.labelId!);
-          if (this.isAllLabelsInSet(this.gapFillProcessedLabels, queryList)) {
-            const targetTimestamp = this.gapFillConfig?.targetTimestamp ?? null;
-            this.cacheDepthTimestamp = targetTimestamp;
-            await db.setMeta("cacheDepth", { timestamp: targetTimestamp });
-            this.gapFillConfig = null;
-            this.gapFillProcessedLabels.clear();
-            // Reset expansion state — gap-fill deepened the cache past any in-progress expansion tier
-            this.currentExpansionTarget = undefined;
-            this.expansionProcessedLabels.clear();
-            for (const [k] of this.continuations) { if (k.startsWith("expand-label:")) this.continuations.delete(k); }
-            // Signal gap-fill completion so the service worker pushes updated counts
-            this.emitProgress({ phase: "expanding", labelsTotal: 0, labelsDone: 0 });
-          }
-        }
-        break;
-      }
-      case "expand-label": {
-        const result = await fetchLabelMessageIdsPage(action.labelId!, action.pageToken, action.scopeDate, action.beforeDate);
-        await this.crossReferenceLabel(action.labelId!, result.ids);
-        if (result.nextPageToken) {
-          this.continuations.set(key, { type: "expand-label", labelId: action.labelId, nextPageToken: result.nextPageToken, scopeDate: action.scopeDate, beforeDate: action.beforeDate });
-        } else {
-          this.continuations.delete(key);
-          this.expansionProcessedLabels.add(action.labelId!);
-          if (this.isAllLabelsInSet(this.expansionProcessedLabels, queryList)) {
-            this.cacheDepthTimestamp = this.currentExpansionTarget ?? null;
-            await db.setMeta("cacheDepth", { timestamp: this.currentExpansionTarget ?? null });
-            this.expansionProcessedLabels.clear();
-            this.currentExpansionTarget = undefined;
-            // Signal expansion tier completion so the service worker pushes updated counts
-            this.emitProgress({ phase: "expanding", labelsTotal: 0, labelsDone: 0 });
+            // Push updated results with full cache accuracy
+            this.pushResults(true);
+            this.logOperationEnd();
           }
         }
         break;
       }
       case "refresh-label": {
         const result = await fetchLabelMessageIdsPage(action.labelId!, action.pageToken, action.scopeDate);
-        await this.crossReferenceLabel(action.labelId!, result.ids);
+        const refreshAcc = this.labelIdAccumulator.get(action.labelId!) ?? [];
+        refreshAcc.push(...result.ids);
+        this.labelIdAccumulator.set(action.labelId!, refreshAcc);
         if (result.nextPageToken) {
           this.continuations.set(key, { type: "refresh-label", labelId: action.labelId, nextPageToken: result.nextPageToken, scopeDate: action.scopeDate });
         } else {
           this.continuations.delete(key);
+          await this.crossReferenceLabel(action.labelId!, refreshAcc);
+          for (const id of refreshAcc) this.refreshedIds.add(id);
+          this.labelIdAccumulator.delete(action.labelId!);
           this.refreshProcessedLabels.add(action.labelId!);
           if (this.isAllLabelsInSet(this.refreshProcessedLabels, queryList)) {
             this.lastRefreshTimestamp = Date.now();
             await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: this.lastRefreshTimestamp });
             this.refreshProcessedLabels.clear();
-            // Invalidate all cached scope state so subsequent reads re-fetch
-            // scoped IDs and re-compute intersections from fresh DB indexes.
-            // scopedIdSets must also be cleared because refresh may have fetched
-            // new messages that fall within the same time range.
+            // Update cached scoped ID sets with newly fetched message IDs — all refreshed
+            // messages are newer than lastRefreshTimestamp, so they fall within every cached scope.
+            for (const [, scopedSet] of this.scopedIdSets) {
+              for (const id of this.refreshedIds) scopedSet.add(id);
+            }
+            this.refreshedIds.clear();
+            // Invalidate pre-computed scope intersections so they're recomputed from updated data
             this.scopedLabelIdx = null;
             this.scopedIdSet = null;
             this.activeScopeTimestamp = undefined;
-            this.scopedIdSets.clear();
             this.scopeFilterGen++;
+            this.pushResults(true);
+            this.logOperationEnd();
           }
         }
         break;
@@ -779,21 +813,18 @@ export class CacheManager {
           await db.clearAll();
           this.labels = [];
           this.processedLabels.clear();
+          this.labelIdAccumulator.clear();
           this.scopedIdSets.clear();
           this.scopedLabelIdx = null;
           this.scopedIdSet = null;
           this.activeScopeTimestamp = undefined;
           this.continuations.clear();
-          this.scopeAccumulator = [];
+          this.scopeAccumulators.clear();
+          this.scopeSegmentsPending.clear();
           this.cacheDepthTimestamp = undefined;
           this.lastRefreshTimestamp = null;
-          this.gapFillConfig = null;
-          this.gapFillProcessedLabels.clear();
-          this.currentExpansionTarget = undefined;
-          this.expansionProcessedLabels.clear();
           this.refreshProcessedLabels.clear();
           this.requestedScopes.clear();
-          this.initialBuildNarrowestScope = undefined;
         }
         await db.setMeta("account", accountPath);
       }
@@ -836,6 +867,9 @@ export class CacheManager {
     // Emit initial cache state so sidepanel knows the orchestrator is ready
     if (this.processedLabels.size > 0) {
       this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
+      // Push results now that labels are loaded — ensures warm-cache restarts get correct counts
+      // even when no user interaction triggers setFilterConfig
+      this.pushResults(true);
     }
 
     const loop = async (): Promise<void> => {
@@ -843,9 +877,20 @@ export class CacheManager {
       while (this.orchestratorRunning) {
         const actions = this.decide(this.orchestratorConcurrency);
         if (actions.length === 0) {
+          if (this.operationStartType !== null && this.operationStartType !== "fetch-scope") {
+            this.logOperationEnd();
+          }
+          this.operationStartType = null;
           this.emitOrchestratorProgress(null);
           await this.orchestratorSleep();
           continue;
+        }
+        // Log operation boundaries when the action type changes (fetch-scope has its own per-scope logging)
+        const actionType = actions[0].type;
+        if (actionType !== this.operationStartType) {
+          if (this.operationStartType !== null) this.logOperationEnd();
+          if (actionType !== "fetch-scope") this.logOperationStart(actionType, this.describeOperation(actions[0]));
+          else this.operationStartType = actionType;
         }
         try {
           await Promise.all(actions.map(action => this.executeAction(action)));
@@ -853,6 +898,7 @@ export class CacheManager {
           errorBackoff = 1000; // reset on success
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
+          console.error(`[cache] Error during ${actions[0].type}: ${errorText}`);
           this.emitProgress({ phase: this.orchestratorProgressPhase(actions[0]), labelsTotal: this.buildLabelQueryList().length, labelsDone: this.processedLabels.size, errorText });
           await new Promise<void>(r => { this.errorBackoffResolve = r; this.errorBackoffTimeout = setTimeout(() => { this.errorBackoffResolve = null; this.errorBackoffTimeout = undefined; r(); }, errorBackoff); });
           errorBackoff = Math.min(errorBackoff * 2, 30_000);
@@ -867,6 +913,9 @@ export class CacheManager {
   /** Stop the orchestrator loop. */
   stop(): void {
     this.orchestratorRunning = false;
+    // Invalidate any in-flight fire-and-forget pushResults() calls so they don't
+    // deliver stale data after an account switch.
+    this.pushGeneration++;
     this.wakeOrchestrator();
     if (this.errorBackoffTimeout !== undefined) { clearTimeout(this.errorBackoffTimeout); this.errorBackoffTimeout = undefined; }
     if (this.errorBackoffResolve) { this.errorBackoffResolve(); this.errorBackoffResolve = null; }
@@ -920,6 +969,7 @@ export class CacheManager {
     if (this.activeFetch) await this.activeFetch.catch(() => {});
     this.aborted = false;
     this.processedLabels.clear();
+    this.labelIdAccumulator.clear();
     // Clear cached scoped ID sets — they become stale after refresh (new messages arrive)
     // and after account switches (different message IDs for the same timestamps).
     // Gap-fill and label prioritization do NOT go through startFetch, so their valid
@@ -986,7 +1036,7 @@ export class CacheManager {
       const existingIndex = isIncremental ? await db.getMeta<string[]>(`labelIdx:${label.id}`) : undefined;
       const labelScopeDate = existingIndex !== undefined ? incrementalScopeDate : (isIncremental ? incrementalNewLabelDate : initialScopeDate);
       const messageIds = await fetchLabelMessageIds(label.id, labelScopeDate);
-      await this.crossReferenceLabel(label.id, messageIds, () => this.isStale(generation));
+      await this.crossReferenceLabel(label.id, messageIds);
       if (this.isStale(generation)) return;
       this.processedLabels.add(label.id);
       labelsDone++;
@@ -1082,8 +1132,6 @@ export class CacheManager {
   /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. Uses scoped label indexes when a scope filter is active. Pass expectedScope to guard against multi-window races where another port may have changed the active scope. Snapshots scope state at entry so concurrent setScopeFilter calls cannot mix data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
   async queryLabel(labelId: string, includeChildren: boolean, expectedScope?: number | null): Promise<LabelQueryResult> {
     const labelIds = this.resolveLabelIds(labelId, includeChildren);
-    const seen = new Set<string>();
-    const messages: CacheMessage[] = [];
     // Snapshot scope state for consistent reads throughout the method
     const scopeSnapshot = this.scopedLabelIdx;
     const scopeTimestampSnapshot = this.activeScopeTimestamp;
@@ -1102,19 +1150,18 @@ export class CacheManager {
       return db.getMeta<string[]>(`labelIdx:${lid}`);
     };
 
+    // Build the set of message IDs for the selected label(s)
+    const selectedMsgIds = new Set<string>();
     for (const lid of labelIds) {
       let msgIds = await getIndex(lid);
 
       // If no index entry or empty index, the label hasn't been cached yet.
       // When the orchestrator is running, skip the blocking prioritizeLabel call — the
-      // orchestrator's Priority 2 (selected label) will fetch it, and pushUpdatedResults
-      // will deliver results once the label is indexed.  Calling prioritizeLabel while
-      // the orchestrator loop is active would create concurrent API calls and risk lost
-      // updates in crossReferenceLabel (two concurrent merges into the same labelIdx).
+      // orchestrator's Priority 2 (selected label) will fetch it, and pushResults
+      // will deliver results once the label is indexed.
       if (!msgIds || msgIds.length === 0) {
         if (!this.orchestratorRunning) {
           await this.prioritizeLabel(lid);
-          // After prioritize, update our snapshot if scope is active so getIndex reads the new data
           if (scopeSnapshot && scopedIdSetSnapshot) {
             const fullIndex = await db.getMeta<string[]>(`labelIdx:${lid}`);
             if (fullIndex) {
@@ -1126,23 +1173,24 @@ export class CacheManager {
       }
 
       if (msgIds) {
-        const newIds = msgIds.filter(id => !seen.has(id));
-        for (const id of newIds) seen.add(id);
-        if (newIds.length > 0) {
-          const batch = await db.getMessagesBatch(newIds);
-          for (const msg of batch.values()) messages.push(msg);
-        }
+        for (const id of msgIds) selectedMsgIds.add(id);
       }
     }
 
+    // Compute co-label counts by intersecting each label's index with the selected message IDs
     const coLabelCounts: Record<string, number> = {};
-    for (const msg of messages) {
-      for (const lid of msg.labelIds) {
-        if (lid !== labelId) coLabelCounts[lid] = (coLabelCounts[lid] ?? 0) + 1;
+    for (const label of this.labels) {
+      if (labelIds.includes(label.id)) continue;
+      const otherIndex = await getIndex(label.id);
+      if (!otherIndex) continue;
+      let count = 0;
+      for (const id of otherIndex) {
+        if (selectedMsgIds.has(id)) count++;
       }
+      if (count > 0) coLabelCounts[label.id] = count;
     }
 
-    return { labelId, count: messages.length, coLabelCounts };
+    return { labelId, count: selectedMsgIds.size, coLabelCounts };
   }
 
   /** Mark a label as processed — prevents duplicate fetches via prioritizeLabel.
@@ -1224,11 +1272,9 @@ export class CacheManager {
   }
 
   /** Cross-reference: for each message ID from a label query, add the label to its record and store the label index. When isInterrupted is provided, checks between batches and aborts early to prevent stale writes after account switch / cancellation. */
-  private async crossReferenceLabel(labelId: string, messageIds: string[], isInterrupted?: () => boolean): Promise<void> {
-    if (isInterrupted?.()) return;
-    // Store label→messageIds index for fast lookup in queryLabel
+  private async crossReferenceLabel(labelId: string, messageIds: string[]): Promise<void> {
+    // Store label→messageIds index for fast lookup in queryLabel and getLabelCounts
     const existingIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
-    if (isInterrupted?.()) return;
     if (existingIndex) {
       const merged = new Set(existingIndex);
       for (const id of messageIds) merged.add(id);
@@ -1236,24 +1282,39 @@ export class CacheManager {
     } else {
       await db.setMeta(`labelIdx:${labelId}`, messageIds);
     }
-    const batchSize = 500;
-    for (let i = 0; i < messageIds.length; i += batchSize) {
-      if (isInterrupted?.()) return;
-      const chunk = messageIds.slice(i, i + batchSize);
-      const existingMap = await db.getMessagesBatch(chunk);
-      if (isInterrupted?.()) return;
-      const updates: CacheMessage[] = [];
-      for (const id of chunk) {
-        const existing = existingMap.get(id);
-        if (existing) {
-          if (!existing.labelIds.includes(labelId)) {
-            updates.push({ ...existing, labelIds: [...existing.labelIds, labelId] });
-          }
-        } else {
-          updates.push({ id, labelIds: [labelId] });
-        }
+  }
+
+  /** Compute results for the current filter config and push via callback. No-op if no callback is registered, labels aren't loaded yet, or required data (scope) isn't available yet. Pass fromOrchestrator=true to bypass the initial-build guard (the orchestrator pushes progressively after each label). */
+  private async pushResults(fromOrchestrator?: boolean): Promise<void> {
+    if (!this.onResult) return;
+    // Skip when labels haven't loaded — counts would be empty/wrong. The orchestrator will push after labels arrive.
+    if (this.labels.length === 0) return;
+    // During initial build, push labels without counts so the sidepanel clears stale data.
+    // The orchestrator pushes progressively after each label is indexed.
+    if (this.cacheDepthTimestamp === undefined && !fromOrchestrator) {
+      this.onResult({ labelId: this.filterConfig.labelId, count: 0, coLabelCounts: {}, counts: {}, filterConfig: { ...this.filterConfig }, partial: true });
+      return;
+    }
+    const config = { ...this.filterConfig };
+    // If scope is needed but not yet cached, skip — orchestrator will push after scope arrives
+    if (config.scopeTimestamp !== null && !this.scopedIdSets.has(config.scopeTimestamp)) return;
+    const myGeneration = ++this.pushGeneration;
+    try {
+      let count = 0;
+      let coLabelCounts: Record<string, number> = {};
+      if (config.labelId !== null) {
+        const result = await this.queryLabel(config.labelId, config.includeChildren, config.scopeTimestamp);
+        // Discard if a newer pushResults call started or filter config changed during async work
+        if (this.pushGeneration !== myGeneration) return;
+        count = result.count;
+        coLabelCounts = result.coLabelCounts;
       }
-      if (updates.length > 0) await db.putMessages(updates);
+      const counts = await this.getLabelCounts(undefined, config.scopeTimestamp);
+      // Discard if a newer pushResults call started or filter config changed during async work
+      if (this.pushGeneration !== myGeneration) return;
+      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: this.cacheDepthTimestamp === undefined });
+    } catch {
+      // Swallow errors — push is best-effort
     }
   }
 
@@ -1266,8 +1327,6 @@ export class CacheManager {
     switch (action.type) {
       case "fetch-scope": return "scope";
       case "fetch-label": return "labels";
-      case "gap-fill-label":
-      case "expand-label": return "expanding";
       case "refresh-label": return "labels";
     }
   }
@@ -1288,23 +1347,15 @@ export class CacheManager {
     this.lastProgressWasComplete = false;
     const queryList = this.buildLabelQueryList();
     const labelsTotal = queryList.length;
-    const phase = this.orchestratorProgressPhase(action);
     switch (action.type) {
       case "fetch-scope": {
-        const count = this.scopeAccumulator.length;
+        const scopeKey = action.scopeTimestamp ?? this.filterConfig.scopeTimestamp ?? 0;
+        const count = this.scopeAccumulators.get(scopeKey)?.length ?? 0;
         this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: count });
         break;
       }
       case "fetch-label": {
         this.emitProgress({ phase: "labels", labelsTotal, labelsDone: this.processedLabels.size, currentLabel: action.labelId ? this.labelName(action.labelId) : undefined });
-        break;
-      }
-      case "gap-fill-label": {
-        this.emitProgress({ phase: "expanding", labelsTotal, labelsDone: this.gapFillProcessedLabels.size, currentLabel: action.labelId ? this.labelName(action.labelId) : undefined });
-        break;
-      }
-      case "expand-label": {
-        this.emitProgress({ phase: "expanding", labelsTotal, labelsDone: this.expansionProcessedLabels.size, currentLabel: action.labelId ? this.labelName(action.labelId) : undefined });
         break;
       }
       case "refresh-label": {

@@ -1,6 +1,7 @@
 body {
   background: #1e1e1e;
   color: #d4d4d4;
+  color-scheme: dark;
   font-family: Consolas, 'Courier New', monospace;
   font-size: 14px;
   padding: 42px 20px 20px;
@@ -119,15 +120,7 @@ body {
 .display-row + .display-row { margin-top: 6px; }
 .display-row label { white-space: nowrap; cursor: pointer; }
 .display-row input[type="checkbox"] { margin: 0; cursor: pointer; }
-.display-row select {
-  background: #333;
-  color: #ddd;
-  border: 1px solid #555;
-  border-radius: 3px;
-  padding: 2px 4px;
-  font-size: 12px;
-  font-family: inherit;
-}
+.display-row select { font-size: 12px; font-family: inherit; }
 
 /* Filter bar (inline above labels) */
 .filter-bar {
@@ -157,20 +150,37 @@ body {
 .cache-spin {
   display: inline-block;
   color: #c90;
-  margin-left: 4px;
+  margin-right: 4px;
   animation: cache-rotate 1s linear infinite;
 }
 .cache-done { color: #4a4; }
 .cache-error { color: #c44; cursor: help; }
 @keyframes cache-rotate { to { transform: rotate(360deg); } }
-.filter-item select {
+.filter-item select, .display-row select {
+  appearance: base-select;
   background: #333;
   color: #ddd;
   border: 1px solid #555;
   border-radius: 3px;
-  padding: 2px 4px;
+  padding: 4px 8px;
   font-size: 12px;
   font-family: inherit;
+  width: 18ch;
+}
+select::picker(select) {
+  appearance: base-select;
+  background: #333;
+  border: 1px solid #555;
+  border-radius: 3px;
+  width: anchor-size(self-inline);
+}
+select option {
+  background: #333;
+  color: #ddd;
+  padding: 4px 8px;
+}
+select option:hover, select option:checked {
+  background: #555;
 }
 
 /* Auto-hide dropdown */

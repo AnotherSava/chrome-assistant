@@ -208,6 +208,8 @@ const KEY_INCLUDE_CHILDREN = "ca_include_children";
 const KEY_SHOW_COUNTS = "ca_show_counts";
 const KEY_SHOW_STARRED = "ca_show_starred";
 const KEY_SHOW_IMPORTANT = "ca_show_important";
+const KEY_CONCURRENCY = "ca_concurrency";
+const KEY_SHOW_CACHE_PROGRESS = "ca_show_cache_progress";
 let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
 let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
 /** Cached scope timestamp — recomputed only when scopeValue changes, so the same value is sent on every message for deduplication in background.ts. */
@@ -217,6 +219,8 @@ let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
 let showCounts: boolean = loadSetting(KEY_SHOW_COUNTS, true);
 let showStarred: boolean = loadSetting(KEY_SHOW_STARRED, false);
 let showImportant: boolean = loadSetting(KEY_SHOW_IMPORTANT, false);
+let concurrency: number = loadSetting(KEY_CONCURRENCY, 10);
+let showCacheProgress: boolean = loadSetting(KEY_SHOW_CACHE_PROGRESS, false);
 
 let displayPanelOpen = false;
 
@@ -242,7 +246,8 @@ function buildDisplayPanel(): void {
   const panel = document.getElementById("display-panel");
   if (!panel) return;
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === labelColumns ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div>`;
+  const concurrencyOptions = [1, 3, 5, 10, 20].map((n) => `<option value="${n}"${n === concurrency ? " selected" : ""}>${n}</option>`).join("");
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Filters tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div><div class="display-row"><input type="checkbox" id="show-cache-progress-check"${showCacheProgress ? " checked" : ""}><label for="show-cache-progress-check">Show background cache progress</label></div><div class="display-row"><label>API concurrency</label><select id="concurrency-select">${concurrencyOptions}</select></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     labelColumns = parseInt(colSelect.value, 10);
@@ -272,8 +277,6 @@ function buildDisplayPanel(): void {
     if (showCounts) {
       loadLabels(true);
     } else {
-      // Keep labelCounts when scope is active (needed for zero-count label filtering)
-      if (scopeValue === "any") labelCounts = null;
       refreshLabelsIfVisible();
     }
   });
@@ -283,7 +286,7 @@ function buildDisplayPanel(): void {
     saveSetting(KEY_SHOW_STARRED, showStarred);
     if (!showStarred && activeLabelId === "STARRED") selectLabel(null);
     refreshLabelsIfVisible();
-    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
+    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant, concurrency });
   });
   const importantCheck = document.getElementById("show-important-check") as HTMLInputElement;
   importantCheck.addEventListener("change", () => {
@@ -291,7 +294,19 @@ function buildDisplayPanel(): void {
     saveSetting(KEY_SHOW_IMPORTANT, showImportant);
     if (!showImportant && activeLabelId === "IMPORTANT") selectLabel(null);
     refreshLabelsIfVisible();
-    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant });
+    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant, concurrency });
+  });
+  const cacheProgressCheck = document.getElementById("show-cache-progress-check") as HTMLInputElement;
+  cacheProgressCheck.addEventListener("change", () => {
+    showCacheProgress = cacheProgressCheck.checked;
+    saveSetting(KEY_SHOW_CACHE_PROGRESS, showCacheProgress);
+    updateCacheProgress();
+  });
+  const concurrencySelect = document.getElementById("concurrency-select") as HTMLSelectElement;
+  concurrencySelect.addEventListener("change", () => {
+    concurrency = parseInt(concurrencySelect.value, 10);
+    saveSetting(KEY_CONCURRENCY, concurrency);
+    if (activePort) activePort.postMessage({ type: "syncSettings", showStarred, showImportant, concurrency });
   });
 }
 
@@ -519,21 +534,6 @@ function updateCountsInPlace(): void {
   });
 }
 
-/** Whether a fetchCounts request is in flight */
-let countsInFlight = false;
-/** Whether more progress arrived while a fetchCounts was in flight */
-let countsPending = false;
-
-/** Request just label counts from background (no Gmail API call). */
-function requestCounts(): void {
-  if (!activePort) return;
-  if (!showCounts && scopeValue === "any") return;
-  if (countsInFlight) { countsPending = true; return; }
-  countsInFlight = true;
-  countsPending = false;
-  fetchCountsSeq++;
-  activePort.postMessage({ type: "fetchCounts", scopeTimestamp: cachedScopeTimestamp, seq: fetchCountsSeq });
-}
 
 function renderLabelTree(nodes: LabelTreeNode[]): string {
   if (nodes.length === 0) return "";
@@ -614,11 +614,27 @@ let labelCounts: Record<string, { own: number; inclusive: number }> | null = nul
 function renderLabels(labels: GmailLabel[]): void {
   switchZoomContext("gmail");
   try {
+    const contentEl = document.getElementById("content");
+    if (!contentEl) return;
     const tree = buildLabelTree(labels);
     const columns = splitIntoColumns(tree, labelColumns);
     const columnsHtml = columns.map((col) => `<ul class="label-tree label-column">${renderLabelTree(col)}</ul>`).join("");
-    showContent(`${renderFilterBar()}<div class="label-columns">${columnsHtml}</div>`);
-    setupFilterBar();
+    // Preserve the filter bar if it already exists — only replace the label columns
+    let filterBar = contentEl.querySelector(".filter-bar");
+    if (filterBar) {
+      let labelColumnsEl = contentEl.querySelector(".label-columns");
+      if (labelColumnsEl) {
+        labelColumnsEl.innerHTML = columnsHtml;
+      } else {
+        labelColumnsEl = document.createElement("div");
+        labelColumnsEl.className = "label-columns";
+        labelColumnsEl.innerHTML = columnsHtml;
+        contentEl.appendChild(labelColumnsEl);
+      }
+    } else {
+      showContent(`${renderFilterBar()}<div class="label-columns">${columnsHtml}</div>`);
+      setupFilterBar();
+    }
     setupLabelHandlers();
     updateCacheProgress();
   } catch (err) {
@@ -636,25 +652,18 @@ let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number;
 /** Last label query result from background */
 let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
 
-/** Whether the last queryLabel request failed */
-let lastQueryError = false;
+/** Whether the last pushed results are partial (initial build in progress) — don't hide zero-count labels from partial results */
+let lastResultsPartial = true;
 
-/** Monotonic sequence number to correlate queryLabel requests with responses */
-let queryLabelSeq = 0;
 
 /** Monotonic sequence number to correlate fetchLabels requests with labelsReady responses */
 let fetchLabelsSeq = 0;
 
-/** Separate sequence number for fetchCounts requests */
-let fetchCountsSeq = 0;
-
 /** Send a selectionChanged message to background for the current selection state */
 function sendSelectionChanged(): void {
   if (!activePort) return;
-  lastQueryError = false;
-  queryLabelSeq++;
   updateCacheProgress();
-  activePort.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp, seq: queryLabelSeq });
+  activePort.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp });
 }
 
 /** Add parent label IDs to a set based on label name hierarchy */
@@ -680,9 +689,9 @@ function renderFilteredLabels(): void {
 
   if (!activeLabelId || !lastLabelResult) {
     // No label selected or no query result yet
-    // When scope is active and labelCounts is available, hide zero-count labels
-    const cacheIsBuilding = lastCacheProgress?.phase === "labels";
-    if (scopeValue !== "any" && labelCounts && Object.keys(labelCounts).length > 0 && !cacheIsBuilding) {
+    // When scope is active and labelCounts is available, hide zero-count labels.
+    // Skip filtering for partial results (initial build in progress) — counts are incomplete.
+    if (scopeValue !== "any" && labelCounts && Object.keys(labelCounts).length > 0 && !lastResultsPartial) {
       const visibleIds = new Set(Object.keys(labelCounts));
       const withParents = addParentChain(visibleIds, cachedLabels);
       const filtered = cachedLabels.filter(l => withParents.has(l.id));
@@ -722,25 +731,12 @@ function updateCacheProgress(): void {
   // Build text parts (without icons — icons are persistent elements)
   const textParts: string[] = [];
   let showSpinner = false;
-  let showCheck = false;
   let errorText: string | null = null;
 
-  if (lastQueryError && activeLabelId) {
-    textParts.push("query failed — showing unfiltered labels");
-  } else if (lastLabelResult && activeLabelId) {
-    textParts.push(`current: ${lastLabelResult.count} emails`);
-    showCheck = true;
-  }
-
   if (lastCacheProgress && lastCacheProgress.phase === "labels") {
-    const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
-    textParts.push(`Background caching: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName}`);
+    textParts.push(`Fetching labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}`);
     showSpinner = true;
-  } else if (lastCacheProgress && lastCacheProgress.phase === "expanding") {
-    const labelName = lastCacheProgress.currentLabel ? ` — ${escapeHtml(lastCacheProgress.currentLabel)}` : "";
-    textParts.push(`Expanding cache: labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}${labelName}`);
-    showSpinner = true;
-  } else if (lastCacheProgress && lastCacheProgress.phase === "scope") {
+  } else if (lastCacheProgress && lastCacheProgress.phase === "scope" && (lastResultsPartial || showCacheProgress)) {
     const count = lastCacheProgress.labelsDone > 0 ? ` ${lastCacheProgress.labelsDone}` : "";
     textParts.push(`Fetching scope${count}`);
     showSpinner = true;
@@ -751,8 +747,13 @@ function updateCacheProgress(): void {
   // Update persistent elements instead of replacing innerHTML
   let textEl = el.querySelector(".cache-text") as HTMLSpanElement | null;
   let spinEl = el.querySelector(".cache-spin") as HTMLSpanElement | null;
-  let checkEl = el.querySelector(".cache-done") as HTMLSpanElement | null;
   let errEl = el.querySelector(".cache-error") as HTMLSpanElement | null;
+
+  if (showSpinner) {
+    if (!spinEl) { spinEl = document.createElement("span"); spinEl.className = "cache-spin"; spinEl.textContent = "\u25E0"; el.prepend(spinEl); }
+  } else if (spinEl) {
+    spinEl.remove();
+  }
 
   const text = textParts.join(" | ");
   if (text) {
@@ -760,18 +761,6 @@ function updateCacheProgress(): void {
     textEl.textContent = text;
   } else if (textEl) {
     textEl.remove();
-  }
-
-  if (showSpinner) {
-    if (!spinEl) { spinEl = document.createElement("span"); spinEl.className = "cache-spin"; spinEl.textContent = "\u25E0"; el.appendChild(spinEl); }
-  } else if (spinEl) {
-    spinEl.remove();
-  }
-
-  if (showCheck) {
-    if (!checkEl) { checkEl = document.createElement("span"); checkEl.className = "cache-done"; checkEl.textContent = "\u2714"; el.appendChild(checkEl); }
-  } else if (checkEl) {
-    checkEl.remove();
   }
 
   if (errorText) {
@@ -782,7 +771,7 @@ function updateCacheProgress(): void {
   }
 
   // Clear everything if no content
-  if (!text && !showSpinner && !showCheck && !errorText) {
+  if (!text && !showSpinner && !errorText) {
     el.textContent = "";
   }
 }
@@ -845,7 +834,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; error?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; filterConfig?: Record<string, unknown>; partial?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -876,7 +865,8 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (message.seq !== undefined && message.seq !== fetchLabelsSeq) return;
     cachedLabels = message.labels;
     if (message.counts) labelCounts = message.counts;
-    else if (!showCounts) labelCounts = null;
+    // Preserve existing labelCounts when showCounts is off — zero-count filtering in
+    // renderFilteredLabels() needs them even when counts aren't displayed.
     // Validate and refresh saved label against the current account's labels
     if (activeLabelId !== null) {
       const matchedLabel = cachedLabels.find((l) => l.id === activeLabelId);
@@ -893,31 +883,37 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     refreshLabelsIfVisible();
     // If a label is selected, send selection to background for query + navigation
     if (activeLabelId) sendSelectionChanged();
-    // Request counts separately (non-blocking) — needed for badge display AND scope-based label filtering
-    if (showCounts || scopeValue !== "any") requestCounts();
   } else if (message.type === "labelsError") {
     if (currentTab === "filters" && onGmailPage && !cachedLabels) {
       showContent('<div class="status">Loading labels...</div>');
       setTimeout(() => { if (!cachedLabels && onGmailPage) loadLabels(true); }, 3000);
     }
-  } else if (message.type === "countsReady") {
-    if (message.seq !== undefined && message.seq !== fetchCountsSeq) {
-      countsInFlight = false;
-      if (countsPending) requestCounts();
-      return;
-    }
-    countsInFlight = false;
-    if (message.counts) {
-      labelCounts = message.counts;
-      const cacheIsBuilding = lastCacheProgress?.phase === "labels";
-      if (scopeValue !== "any" && !cacheIsBuilding) {
-        refreshLabelsIfVisible();
-      } else {
-        updateCountsInPlace();
+  } else if (message.type === "filterResults") {
+    // Unified push from cache manager — carries counts (always) and label query result (when a label is selected)
+    const fc = message.filterConfig as { labelId?: string | null; scopeTimestamp?: number | null; includeChildren?: boolean } | undefined;
+    let countsChanged = false;
+    let labelResultChanged = false;
+    // Accept counts if scope matches (counts don't depend on label selection)
+    if (!fc || fc.scopeTimestamp === cachedScopeTimestamp) {
+      if (message.counts) {
+        labelCounts = message.counts;
+        countsChanged = true;
       }
+      lastResultsPartial = !!message.partial;
     }
-    // When counts is null (scope not ready), keep old labelCounts — don't flash all labels
-    if (countsPending) requestCounts();
+    // Accept label result if full filterConfig matches
+    if (message.labelId !== undefined && message.labelId !== null && message.labelId === activeLabelId && (!fc || (fc.labelId === activeLabelId && fc.scopeTimestamp === cachedScopeTimestamp && fc.includeChildren === includeChildren))) {
+      lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabelCounts: message.coLabelCounts ?? {} };
+      labelResultChanged = true;
+    }
+    // Refresh UI — label result changes which labels are visible (always re-render),
+    // counts changes may trigger zero-count filtering when scope is active (but not for partial results)
+    if (labelResultChanged || (countsChanged && scopeValue !== "any" && !lastResultsPartial)) {
+      refreshLabelsIfVisible();
+    } else if (countsChanged) {
+      updateCountsInPlace();
+    }
+    updateCacheProgress();
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
     // skipNavigation: the user already navigated where they want, don't override with return-to-inbox
@@ -930,26 +926,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     // Cache progress pushed from background
     lastCacheProgress = { phase: message.phase ?? "labels", labelsTotal: message.labelsTotal ?? 0, labelsDone: message.labelsDone ?? 0, currentLabel: message.currentLabel, error: message.errorText };
     updateCacheProgress();
-    // Refresh counts during cache build (completion re-query is handled by service worker)
-    if (message.phase === "labels" && (showCounts || scopeValue !== "any")) {
-      requestCounts();
-    }
-  } else if (message.type === "labelResult" && message.labelId !== undefined) {
-    // Query result from background cache — ignore stale responses
-    if (message.labelId === activeLabelId && (message.seq === undefined || message.seq === queryLabelSeq)) {
-      if (message.error) {
-        // Query failed — clear stale result so labels show unfiltered, don't hide everything
-        lastLabelResult = null;
-        lastQueryError = true;
-        refreshLabelsIfVisible();
-        updateCacheProgress();
-      } else {
-        lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabelCounts: message.coLabelCounts ?? {} };
-        lastQueryError = false;
-        refreshLabelsIfVisible();
-        updateCacheProgress();
-      }
-    }
   } else if (message.type === "fetchError") {
     showContent('<div class="status">Failed to fetch emails. Try refreshing the page.</div>');
   }
@@ -967,11 +943,9 @@ if (chrome.runtime?.connect) {
       activePort = port;
       reconnectDelay = 1000;
       port.onMessage.addListener(handleMessage);
-      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id, scopeTimestamp: cachedScopeTimestamp }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant }); syncState(); });
+      chrome.windows.getCurrent().then((win) => { port.postMessage({ type: "initWindow", windowId: win.id, scopeTimestamp: cachedScopeTimestamp }); port.postMessage({ type: "setPinMode", mode: currentPinMode }); port.postMessage({ type: "syncSettings", showStarred, showImportant, concurrency }); syncState(); });
       port.onDisconnect.addListener(() => {
         activePort = null;
-        countsInFlight = false;
-        countsPending = false;
         if (!chrome.runtime?.id) return;
         setTimeout(connectToBackground, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);

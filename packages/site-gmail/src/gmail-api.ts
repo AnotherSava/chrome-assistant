@@ -124,10 +124,12 @@ export async function fetchLabelMessageIdsPage(labelId: string, pageToken?: stri
   return { ids: (data.messages ?? []).map(m => m.id), nextPageToken: data.nextPageToken ?? null };
 }
 
-/** Fetch one page of message IDs matching a scope date (q=after:DATE). Returns IDs and the next page token (null if no more pages). */
-export async function fetchScopedMessageIdsPage(scopeDate: string, pageToken?: string): Promise<PageResult> {
+/** Fetch one page of message IDs matching a date range (q=after:DATE [before:DATE]). Returns IDs and the next page token (null if no more pages). */
+export async function fetchScopedMessageIdsPage(scopeDate: string, pageToken?: string, beforeDate?: string): Promise<PageResult> {
   const token = await getAuthToken();
-  let path = `/messages?maxResults=500&q=${encodeURIComponent(`after:${scopeDate}`)}`;
+  let q = `after:${scopeDate}`;
+  if (beforeDate) q += ` before:${beforeDate}`;
+  let path = `/messages?maxResults=500&q=${encodeURIComponent(q)}`;
   if (pageToken) path += `&pageToken=${encodeURIComponent(pageToken)}`;
   const data = await gmailFetch<MessagesListResponse>(path, token);
   return { ids: (data.messages ?? []).map(m => m.id), nextPageToken: data.nextPageToken ?? null };

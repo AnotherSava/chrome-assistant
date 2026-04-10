@@ -101,7 +101,7 @@ describe("handleMessage", () => {
     expect(progress?.innerHTML).toBe("");
   });
 
-  it("handles labelResult by filtering displayed labels", () => {
+  it("handles filterResults by filtering displayed labels", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     const labels = [
       { id: "Label_1", name: "Work", type: "user" },
@@ -114,8 +114,8 @@ describe("handleMessage", () => {
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
 
-    // Simulate background returning labelResult — only Label_2 co-occurs
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 42, coLabelCounts: { Label_2: 1 } });
+    // Simulate background returning filterResults — only Label_2 co-occurs
+    handleMessage({ type: "filterResults", labelId: "Label_1", count: 42, coLabelCounts: { Label_2: 1 } });
 
     // Content should show Work and Personal but not Archive
     const content = document.getElementById("content");
@@ -147,9 +147,9 @@ describe("handleMessage", () => {
     // Select then deselect
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 5, coLabelCounts: {} });
+    handleMessage({ type: "filterResults", labelId: "Label_1", count: 5, coLabelCounts: {} });
 
-    // After labelResult, Personal might be hidden. Now deselect:
+    // After filterResults, Personal might be hidden. Now deselect:
     const workLink2 = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink2?.click();
 
@@ -159,7 +159,7 @@ describe("handleMessage", () => {
     expect(content?.innerHTML).toContain("Personal");
   });
 
-  it("ignores labelResult for non-active label", () => {
+  it("ignores filterResults for non-active label", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     const labels = [
       { id: "Label_1", name: "Work", type: "user" },
@@ -172,7 +172,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Result arrives for a different label (stale result) — should be ignored
-    handleMessage({ type: "labelResult", labelId: "Label_999", count: 0, coLabelCounts: {} });
+    handleMessage({ type: "filterResults", labelId: "Label_999", count: 0, coLabelCounts: {} });
 
     // Both labels should still be visible (no filtering applied from stale result)
     const content = document.getElementById("content");
@@ -225,41 +225,6 @@ describe("handleMessage", () => {
     expect(content?.innerHTML).toContain("Failed to fetch emails");
   });
 
-  it("shows error status in cache progress when labelResult has error", () => {
-    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Personal", type: "user" }] });
-
-    // Select Work label
-    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
-    workLink?.click();
-
-    // Simulate error response from background
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabelCounts: {}, error: true });
-
-    const progress = document.getElementById("cache-progress");
-    expect(progress?.innerHTML).toContain("query failed");
-
-    // Both labels should still be visible (unfiltered)
-    const content = document.getElementById("content");
-    expect(content?.innerHTML).toContain("Work");
-    expect(content?.innerHTML).toContain("Personal");
-  });
-
-  it("clears error status when a successful labelResult arrives", () => {
-    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Personal", type: "user" }] });
-
-    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
-    workLink?.click();
-
-    // Error first
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 0, coLabelCounts: {}, error: true });
-
-    // Then success — error should be cleared
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 1 } });
-    const progress = document.getElementById("cache-progress");
-    expect(progress?.innerHTML).not.toContain("query failed");
-  });
 });
 
 describe("scopeToTimestamp", () => {
@@ -407,8 +372,8 @@ describe("label counts rendering", () => {
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
 
-    // Simulate labelResult with co-label counts
-    handleMessage({ type: "labelResult", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 3 } });
+    // Simulate filterResults with co-label counts
+    handleMessage({ type: "filterResults", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 3 } });
 
     const content = document.getElementById("content");
     const countSpans = content?.querySelectorAll(".label-count");
@@ -422,7 +387,72 @@ describe("label counts rendering", () => {
     expect(personalCount?.textContent).toBe(" (3)");
   });
 
-  it("updates displayed counts when countsReady arrives after labelsReady", () => {
+  it("pushed results update UI without seq matching", () => {
+    // Fresh account to clear stale module state (labelCounts, lastLabelResult)
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/50/" });
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    setScopeValue("any");
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ];
+    handleMessage({ type: "labelsReady", labels });
+
+    // Select Work label
+    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
+    workLink?.click();
+
+    // Push filterResults with filterConfig (no seq) — should update UI
+    handleMessage({ type: "filterResults", labelId: "Label_1", count: 15, coLabelCounts: { Label_2: 4 }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: null } });
+
+    const content = document.getElementById("content");
+    const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
+    expect(workCount?.textContent).toBe(" (15)");
+    const personalCount = content?.querySelector('[data-label-id="Label_2"] .label-count');
+    expect(personalCount?.textContent).toBe(" (4)");
+  });
+
+  it("ignores pushed filterResults with stale filterConfig", () => {
+    // Fresh account to clear stale module state
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/51/" });
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    setScopeValue("any");
+    const labels = [
+      { id: "Label_1", name: "Work", type: "user" },
+      { id: "Label_2", name: "Personal", type: "user" },
+    ];
+    handleMessage({ type: "labelsReady", labels });
+
+    // Select Work label
+    const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
+    workLink?.click();
+
+    // Push filterResults with a stale filterConfig (wrong scopeTimestamp)
+    handleMessage({ type: "filterResults", labelId: "Label_1", count: 99, coLabelCounts: { Label_2: 50 }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: 999 } });
+
+    // Should NOT have applied — no count shown for this stale result
+    const content = document.getElementById("content");
+    const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
+    expect(workCount).toBeNull();
+  });
+
+  it("ignores pushed filterResults with stale scopeTimestamp for counts", () => {
+    // Fresh account to clear stale state
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/52/" });
+    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
+    setScopeValue("any");
+    handleMessage({ type: "labelsReady", labels: [
+      { id: "Label_1", name: "Work", type: "user" },
+    ] });
+
+    // Push filterResults with a stale scopeTimestamp — counts should be ignored
+    handleMessage({ type: "filterResults", counts: { Label_1: { own: 999, inclusive: 999 } }, filterConfig: { scopeTimestamp: 12345 } });
+
+    // No counts should be shown since the push was stale
+    expect(document.querySelectorAll(".label-count").length).toBe(0);
+  });
+
+  it("updates displayed counts when filterResults arrives after labelsReady", () => {
     // Fresh account to clear stale state
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/99/" });
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
@@ -434,8 +464,8 @@ describe("label counts rendering", () => {
     // No counts yet (labelsReady has no counts field)
     expect(document.querySelectorAll(".label-count").length).toBe(0);
 
-    // countsReady arrives — counts appear via in-place update
-    handleMessage({ type: "countsReady", counts: { Label_1: { own: 42, inclusive: 42 }, Label_2: { own: 7, inclusive: 7 } } });
+    // filterResults arrives — counts appear via in-place update
+    handleMessage({ type: "filterResults", counts: { Label_1: { own: 42, inclusive: 42 }, Label_2: { own: 7, inclusive: 7 } } });
     const countSpans = document.querySelectorAll(".label-count");
     expect(countSpans.length).toBe(2);
   });
@@ -581,8 +611,9 @@ describe("hide zero-count labels when scope is active", () => {
   it("labels not filtered during cache build even with scope active", () => {
     setScopeValue("1m");
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    // Simulate cache still building (labels phase)
+    // Simulate cache still building — partial results flag prevents zero-count filtering
     handleMessage({ type: "cacheState", phase: "labels", labelsTotal: 10, labelsDone: 3 });
+    handleMessage({ type: "filterResults", counts: { Label_1: { own: 10, inclusive: 10 } }, partial: true });
     const labels = [
       { id: "Label_1", name: "Work", type: "user" },
       { id: "Label_2", name: "Personal", type: "user" },
@@ -605,7 +636,7 @@ describe("hide zero-count labels when scope is active", () => {
   it("labels filtered after cache completes with scope active", () => {
     setScopeValue("1m");
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    // Cache complete
+    // Cache complete — final results (not partial)
     handleMessage({ type: "cacheState", phase: "complete", labelsTotal: 10, labelsDone: 10 });
     const labels = [
       { id: "Label_1", name: "Work", type: "user" },
@@ -616,6 +647,7 @@ describe("hide zero-count labels when scope is active", () => {
       Label_1: { own: 10, inclusive: 10 },
       Label_2: { own: 5, inclusive: 5 },
     };
+    handleMessage({ type: "filterResults", counts, partial: false });
     handleMessage({ type: "labelsReady", labels, counts });
 
     const content = document.getElementById("content");
