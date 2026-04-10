@@ -1180,7 +1180,7 @@ export class CacheManager {
     // Compute co-label counts by intersecting each label's index with the selected message IDs
     const coLabelCounts: Record<string, number> = {};
     for (const label of this.labels) {
-      if (labelIds.includes(label.id)) continue;
+      if (label.id === labelId) continue;
       const otherIndex = await getIndex(label.id);
       if (!otherIndex) continue;
       let count = 0;

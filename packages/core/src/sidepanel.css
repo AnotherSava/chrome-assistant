@@ -57,7 +57,7 @@ body {
 .label-link.dimmed { opacity: 0.3; }
 .label-toggle { color: #666; cursor: pointer; margin-right: 4px; font-size: 11px; user-select: none; }
 .label-toggle:hover { color: #aaa; }
-.label-count { color: #666; font-size: 12px; }
+.label-count { color: #666; font-size: 12px; margin-left: 10px; }
 
 /* Top row — tabs left, buttons right */
 .top-row {

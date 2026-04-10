@@ -320,10 +320,10 @@ describe("CacheManager", () => {
       const result = await mgr.queryLabel("Label_1", true);
       expect(result.labelId).toBe("Label_1");
       expect(result.count).toBe(3); // m1, m2, m3 (deduplicated)
-      // Descendants are part of the selection, not co-labels
+      // Primary label excluded, descendants appear as co-labels
       expect(result.coLabelCounts).not.toHaveProperty("Label_1");
-      expect(result.coLabelCounts).not.toHaveProperty("Label_2");
-      expect(result.coLabelCounts).not.toHaveProperty("Label_3");
+      expect(result.coLabelCounts).toHaveProperty("Label_2");
+      expect(result.coLabelCounts).toHaveProperty("Label_3");
     });
 
     it("does not include descendants when includeChildren is false", async () => {

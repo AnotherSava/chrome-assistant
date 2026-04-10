@@ -521,11 +521,11 @@ function updateCountsInPlace(): void {
     let span = link.querySelector(".label-count") as HTMLSpanElement | null;
     if (count !== null) {
       if (span) {
-        span.textContent = ` (${count})`;
+        span.textContent = `${count}`;
       } else {
         span = document.createElement("span");
         span.className = "label-count";
-        span.textContent = ` (${count})`;
+        span.textContent = `${count}`;
         link.appendChild(span);
       }
     } else if (span) {
@@ -541,8 +541,8 @@ function renderLabelTree(nodes: LabelTreeNode[]): string {
     const hasChildren = node.children.length > 0;
     const activeClass = node.id === activeLabelId ? " active" : "";
     const count = getLabelCount(node.id);
-    const countSpan = count !== null ? `<span class="label-count"> (${count})</span>` : "";
-    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name)}${countSpan}</a>`;
+    const countSpan = count !== null ? `<span class="label-count">${count}</span>` : "";
+    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name.replace(/_+$/, ""))}${countSpan}</a>`;
     const children = hasChildren ? `<ul class="label-tree">${renderLabelTree(node.children)}</ul>` : "";
     return `<li class="label-node">${link}${children}</li>`;
   }).join("");

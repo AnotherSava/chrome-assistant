@@ -338,8 +338,8 @@ describe("label counts rendering", () => {
     const countSpans = content?.querySelectorAll(".label-count");
     expect(countSpans?.length).toBe(2);
     // Labels are sorted alphabetically: Personal (5), Work (10)
-    expect(countSpans?.[0]?.textContent).toBe(" (5)");
-    expect(countSpans?.[1]?.textContent).toBe(" (10)");
+    expect(countSpans?.[0]?.textContent).toBe("5");
+    expect(countSpans?.[1]?.textContent).toBe("10");
   });
 
   it("does not show counts when showCounts is disabled", () => {
@@ -381,10 +381,10 @@ describe("label counts rendering", () => {
     expect(countSpans?.length).toBe(2);
     // Work label shows the query result count
     const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
-    expect(workCount?.textContent).toBe(" (10)");
+    expect(workCount?.textContent).toBe("10");
     // Personal shows co-label count
     const personalCount = content?.querySelector('[data-label-id="Label_2"] .label-count');
-    expect(personalCount?.textContent).toBe(" (3)");
+    expect(personalCount?.textContent).toBe("3");
   });
 
   it("pushed results update UI without seq matching", () => {
@@ -407,9 +407,9 @@ describe("label counts rendering", () => {
 
     const content = document.getElementById("content");
     const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
-    expect(workCount?.textContent).toBe(" (15)");
+    expect(workCount?.textContent).toBe("15");
     const personalCount = content?.querySelector('[data-label-id="Label_2"] .label-count');
-    expect(personalCount?.textContent).toBe(" (4)");
+    expect(personalCount?.textContent).toBe("4");
   });
 
   it("ignores pushed filterResults with stale filterConfig", () => {
