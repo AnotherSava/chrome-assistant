@@ -2,7 +2,7 @@ import { renderHelp } from "./help.js";
 import { escapeHtml, ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSetting, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
-interface LabelTreeNode { name: string; fullName: string; id: string; children: LabelTreeNode[] }
+interface LabelTreeNode { name: string; fullName: string; id: string; type: string; children: LabelTreeNode[] }
 
 let currentTab: "summary" | "filters" = "filters";
 const KEY_ACTIVE_LABEL = "ca_active_label";
@@ -384,7 +384,7 @@ function showContent(html: string): void {
 const LABELS_HIDDEN = new Set(["CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
 
 /** System labels shown in fixed order before user labels */
-const SYSTEM_LABEL_ORDER = ["INBOX", "SENT", "STARRED", "IMPORTANT"];
+const SYSTEM_LABEL_ORDER = ["INBOX", "SENT", "STARRED", "IMPORTANT", "NONE"];
 
 // Apply initial hidden state for conditional system labels
 if (!showStarred) LABELS_HIDDEN.add("STARRED");
@@ -423,7 +423,7 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
 
     if (!isNested) {
       // Flat label — use the full name as display
-      const node: LabelTreeNode = { name: label.name, fullName: label.name, id: label.id, children: [] };
+      const node: LabelTreeNode = { name: label.name, fullName: label.name, id: label.id, type: label.type, children: [] };
       nodeMap.set(label.name, node);
       root.push(node);
     } else {
@@ -431,12 +431,12 @@ function buildLabelTree(labels: GmailLabel[]): LabelTreeNode[] {
       const parentNode = nodeMap.get(parentPath);
       if (!parentNode) {
         // Treat as root-level if parent is missing (e.g., hidden parent)
-        const node: LabelTreeNode = { name: label.name, fullName: label.name, id: label.id, children: [] };
+        const node: LabelTreeNode = { name: label.name, fullName: label.name, id: label.id, type: label.type, children: [] };
         nodeMap.set(label.name, node);
         root.push(node);
         continue;
       }
-      const node: LabelTreeNode = { name: parts[parts.length - 1], fullName: label.name, id: label.id, children: [] };
+      const node: LabelTreeNode = { name: parts[parts.length - 1], fullName: label.name, id: label.id, type: label.type, children: [] };
       nodeMap.set(label.name, node);
       parentNode.children.push(node);
     }
@@ -540,11 +540,14 @@ function renderLabelTree(nodes: LabelTreeNode[]): string {
   const items = nodes.map((node) => {
     const hasChildren = node.children.length > 0;
     const activeClass = node.id === activeLabelId ? " active" : "";
+    const systemClass = node.type === "system" ? " system" : "";
     const count = getLabelCount(node.id);
     const countSpan = count !== null ? `<span class="label-count">${count}</span>` : "";
-    const link = `<a class="label-link${activeClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(node.name.replace(/_+$/, ""))}${countSpan}</a>`;
+    const displayName = node.type === "system" ? node.name.charAt(0) + node.name.slice(1).toLowerCase() : node.name.replace(/_+$/, "");
+    const link = `<a class="label-link${activeClass}${systemClass}" href="#" data-label-id="${escapeHtml(node.id)}" data-label-name="${escapeHtml(node.fullName)}">${escapeHtml(displayName)}${countSpan}</a>`;
     const children = hasChildren ? `<ul class="label-tree">${renderLabelTree(node.children)}</ul>` : "";
-    return `<li class="label-node">${link}${children}</li>`;
+    const nodeClass = node.type === "system" ? "label-node system" : "label-node";
+    return `<li class="${nodeClass}">${link}${children}</li>`;
   }).join("");
   return items;
 }
@@ -687,7 +690,7 @@ function addParentChain(ids: Set<string>, labels: GmailLabel[]): Set<string> {
 function renderFilteredLabels(): void {
   if (!cachedLabels) return;
 
-  if (!activeLabelId || !lastLabelResult) {
+  if (!activeLabelId || !lastLabelResult || lastResultsPartial) {
     // No label selected or no query result yet
     // When scope is active and labelCounts is available, hide zero-count labels.
     // Skip filtering for partial results (initial build in progress) — counts are incomplete.
@@ -906,9 +909,9 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
       lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabelCounts: message.coLabelCounts ?? {} };
       labelResultChanged = true;
     }
-    // Refresh UI — label result changes which labels are visible (always re-render),
-    // counts changes may trigger zero-count filtering when scope is active (but not for partial results)
-    if (labelResultChanged || (countsChanged && scopeValue !== "any" && !lastResultsPartial)) {
+    // Refresh UI — label result or final counts trigger full re-render (needed to
+    // show/hide labels on scope change). Partial results only update counts in place.
+    if (labelResultChanged || (countsChanged && !lastResultsPartial)) {
       refreshLabelsIfVisible();
     } else if (countsChanged) {
       updateCountsInPlace();

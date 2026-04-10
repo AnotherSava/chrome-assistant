@@ -146,6 +146,7 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:SENT", ["m1"]);
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
       mockDb._meta.set("labelIdx:Label_2", ["m1"]);
+      mockDb._meta.set("labelIdx:NONE", ["m1"]);
 
       mockApi.fetchLabels.mockResolvedValue(testLabels);
       mockApi.fetchLabelMessageIds.mockResolvedValue([]);
@@ -752,6 +753,7 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:INBOX", ["m1", "m2"]);
       mockDb._meta.set("labelIdx:SENT", ["m2"]);
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
+      mockDb._meta.set("labelIdx:NONE", ["m1"]);
 
       mockApi.fetchLabels.mockResolvedValue(refreshLabels);
       // Incremental refresh returns new messages only
@@ -956,11 +958,12 @@ describe("CacheManager", () => {
       await manager.startFetch("/mail/u/0/");
 
       const labelUpdates = updates.filter(p => p.phase === "labels");
-      // Initial + 2 labels = 3 updates in label phase
-      expect(labelUpdates.length).toBe(3);
+      // Initial + 2 labels + NONE = 4 updates in label phase
+      expect(labelUpdates.length).toBe(4);
       expect(labelUpdates[0].labelsDone).toBe(0);
       expect(labelUpdates[1].labelsDone).toBe(1);
       expect(labelUpdates[2].labelsDone).toBe(2);
+      expect(labelUpdates[3].labelsDone).toBe(3);
     });
   });
 
@@ -1205,7 +1208,7 @@ describe("CacheManager", () => {
       manager.stop();
       await startPromise;
 
-      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledTimes(1);
+      expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledTimes(2);
       expect(mockApi.fetchLabelMessageIdsPage).toHaveBeenCalledWith("INBOX", undefined);
       expect((manager as unknown as { processedLabels: Set<string> }).processedLabels.has("INBOX")).toBe(true);
     });
@@ -1275,6 +1278,7 @@ describe("CacheManager", () => {
     it("multi-page fetch uses continuation tokens", async () => {
       const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
       mockApi.fetchLabels.mockResolvedValue(singleLabel);
+      manager.markProcessed("NONE");
       let callCount = 0;
       mockApi.fetchLabelMessageIdsPage.mockImplementation(async () => {
         callCount++;
@@ -1388,6 +1392,7 @@ describe("CacheManager", () => {
       manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
 
       mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+      manager.markProcessed("NONE");
       await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
 
       expect(manager.getCacheDepthTimestamp()).toBeNull(); // null scope = full coverage
@@ -1403,6 +1408,7 @@ describe("CacheManager", () => {
       manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTs });
 
       mockApi.fetchLabelMessageIdsPage.mockResolvedValue({ ids: ["m1"], nextPageToken: null });
+      manager.markProcessed("NONE");
       await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
 
       expect(manager.getCacheDepthTimestamp()).toBeNull();
@@ -1429,11 +1435,10 @@ describe("CacheManager", () => {
 
       const labelUpdates = updates.filter(p => p.phase === "labels");
       expect(labelUpdates.length).toBeGreaterThanOrEqual(1);
-      // After processing INBOX, we should see it in progress
-      const withLabel = labelUpdates.find(p => p.currentLabel === "INBOX");
-      expect(withLabel).toBeDefined();
-      expect(withLabel!.labelsDone).toBe(1);
-      expect(withLabel!.labelsTotal).toBe(1);
+      // After processing all labels, the final progress should reflect labelsTotal of 2 (INBOX + NONE)
+      const lastLabelUpdate = labelUpdates[labelUpdates.length - 1];
+      expect(lastLabelUpdate.labelsTotal).toBe(2);
+      expect(lastLabelUpdate.labelsDone).toBeGreaterThanOrEqual(1);
     });
 
     it("emits scope progress during scope fetch", async () => {

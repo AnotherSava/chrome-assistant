@@ -4,6 +4,8 @@ import { fetchLabels, fetchLabelMessageIds, fetchScopedMessageIds, fetchLabelMes
 
 /** System labels always cached */
 const BASE_SYSTEM_LABELS = ["INBOX", "SENT"];
+/** Synthetic label ID for messages with no user-created labels (has:nouserlabels) */
+const NONE_LABEL_ID = "NONE";
 
 /** Compute expansion tier timestamps using calendar semantics (matching the UI's scopeToTimestamp). Returns timestamps ordered from narrowest to widest scope. */
 function expansionTierTimestamps(now: Date): number[] {
@@ -955,6 +957,7 @@ export class CacheManager {
   /** Populate the in-memory labels list without running a full fetch (e.g. after service worker restart with fresh cache). */
   async loadLabels(): Promise<void> {
     this.labels = await fetchLabels();
+    if (!this.labels.some(l => l.id === NONE_LABEL_ID)) this.labels.push({ id: NONE_LABEL_ID, name: "No user labels", type: "system" });
   }
 
   /** Start the full cache population: fetch labels then cross-reference messages. When scopeTimestamp is set, only fetches messages within that scope for the initial build. */
@@ -998,6 +1001,7 @@ export class CacheManager {
       await db.setMeta("account", accountPath);
 
       this.labels = await fetchLabels();
+      if (!this.labels.some(l => l.id === NONE_LABEL_ID)) this.labels.push({ id: NONE_LABEL_ID, name: "No user labels", type: "system" });
     } finally {
       // Only resolve the readiness gate if this fetch is still the current one;
       // otherwise a newer resetReady() has replaced the resolver and should be
@@ -1068,7 +1072,9 @@ export class CacheManager {
 
   /** Get own and inclusive counts for all known labels. When a scope filter is active, counts come from the pre-computed scopedLabelIdx. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). Pass expectedScope to guard against multi-window races. Snapshots scopedLabelIdx at entry so concurrent setScopeFilter calls from other ports cannot mix scoped/unscoped data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
   async getLabelCounts(labelsOverride?: GmailLabel[], expectedScope?: number | null): Promise<Record<string, { own: number; inclusive: number }>> {
-    const labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
+    let labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
+    // Include synthetic NONE label if not already present
+    if (labels.length > 0 && !labels.some(l => l.id === NONE_LABEL_ID)) labels = [...labels, { id: NONE_LABEL_ID, name: "No user labels", type: "system" }];
     // Snapshot scope state to ensure consistent reads throughout the loop
     const scopeSnapshot = this.scopedLabelIdx;
     const scopeTimestampSnapshot = this.activeScopeTimestamp;
@@ -1179,7 +1185,8 @@ export class CacheManager {
 
     // Compute co-label counts by intersecting each label's index with the selected message IDs
     const coLabelCounts: Record<string, number> = {};
-    for (const label of this.labels) {
+    const coLabels = this.labels.some(l => l.id === NONE_LABEL_ID) ? this.labels : [...this.labels, { id: NONE_LABEL_ID, name: "No user labels", type: "system" }];
+    for (const label of coLabels) {
       if (label.id === labelId) continue;
       const otherIndex = await getIndex(label.id);
       if (!otherIndex) continue;
@@ -1239,6 +1246,7 @@ export class CacheManager {
     return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
   }
 
+
   /** Build the list of labels to query. Sorted alphabetically with sub-labels before parents so inclusive counts are ready when the parent is processed. */
   buildLabelQueryList(): GmailLabel[] {
     const addedIds = new Set<string>();
@@ -1254,6 +1262,12 @@ export class CacheManager {
         result.push(label);
         addedIds.add(label.id);
       }
+    }
+
+    // Synthetic "no user labels" label — included when real labels are loaded
+    if (this.labels.length > 0 && !addedIds.has(NONE_LABEL_ID)) {
+      result.push({ id: NONE_LABEL_ID, name: "No user labels", type: "system" });
+      addedIds.add(NONE_LABEL_ID);
     }
 
     // User labels: alphabetically, sub-labels before parents
@@ -1292,7 +1306,7 @@ export class CacheManager {
     // During initial build, push labels without counts so the sidepanel clears stale data.
     // The orchestrator pushes progressively after each label is indexed.
     if (this.cacheDepthTimestamp === undefined && !fromOrchestrator) {
-      this.onResult({ labelId: this.filterConfig.labelId, count: 0, coLabelCounts: {}, counts: {}, filterConfig: { ...this.filterConfig }, partial: true });
+      this.onResult({ labelId: null, count: 0, coLabelCounts: {}, counts: {}, filterConfig: { ...this.filterConfig }, partial: true });
       return;
     }
     const config = { ...this.filterConfig };
@@ -1312,7 +1326,8 @@ export class CacheManager {
       const counts = await this.getLabelCounts(undefined, config.scopeTimestamp);
       // Discard if a newer pushResults call started or filter config changed during async work
       if (this.pushGeneration !== myGeneration) return;
-      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: this.cacheDepthTimestamp === undefined });
+      const allProcessed = this.buildLabelQueryList().every(l => this.processedLabels.has(l.id));
+      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: this.cacheDepthTimestamp === undefined || !allProcessed });
     } catch {
       // Swallow errors — push is best-effort
     }

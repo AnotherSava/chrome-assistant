@@ -228,6 +228,14 @@ function navigateGmailToLabel(tabId: number, base: string, labelId: string, incl
   const labels = cacheManager.getLabels();
   const doNav = (labels: GmailLabel[]): void => {
     if (gen !== navGeneration.get(tabId)) return;
+    // Synthetic NONE label — use has:nouserlabels search
+    if (labelId === "NONE") {
+      const query = scope ? `has:nouserlabels after:${scope}` : "has:nouserlabels";
+      const url = `${base}#search/${encodeURIComponent(query)}`;
+      lastExtensionNavHash.set(tabId, urlHash(url));
+      chrome.tabs.update(tabId, { url });
+      return;
+    }
     const label = labels.find(l => l.id === labelId);
     if (!label) return;
     let labelName: string | string[] = label.name;
@@ -348,7 +356,8 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       const fetchSeq = message.seq;
       fetchLabels().then((labels) => {
         cacheManager.setLabels(labels);
-        const response: Record<string, unknown> = { type: "labelsReady", labels };
+        const labelsWithNone = [...labels, { id: "NONE", name: "No user labels", type: "system" }];
+        const response: Record<string, unknown> = { type: "labelsReady", labels: labelsWithNone };
         if (fetchSeq !== undefined) response.seq = fetchSeq;
         port.postMessage(response);
       }).catch(() => { port.postMessage({ type: "labelsError" }); });

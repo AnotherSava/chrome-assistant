@@ -54,6 +54,8 @@ body {
 .label-link { color: #7db8f0; text-decoration: none; cursor: pointer; font-size: 13px; }
 .label-link:hover { color: #9dcaff; }
 .label-link.active { color: #fff; font-weight: bold; }
+.label-link.system { font-style: italic; }
+.label-node.system + .label-node:not(.system) { margin-top: 10px; }
 .label-link.dimmed { opacity: 0.3; }
 .label-toggle { color: #666; cursor: pointer; margin-right: 4px; font-size: 11px; user-select: none; }
 .label-toggle:hover { color: #aaa; }

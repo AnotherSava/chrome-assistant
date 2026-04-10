@@ -114,8 +114,14 @@ export interface PageResult {
 /** Fetch one page of message IDs for a label. Returns IDs and the next page token (null if no more pages). */
 export async function fetchLabelMessageIdsPage(labelId: string, pageToken?: string, scopeDate?: string, beforeDate?: string): Promise<PageResult> {
   const token = await getAuthToken();
-  let path = `/messages?maxResults=500&labelIds=${encodeURIComponent(labelId)}`;
   const qParts: string[] = [];
+  let path: string;
+  if (labelId === "NONE") {
+    qParts.push("has:nouserlabels");
+    path = `/messages?maxResults=500`;
+  } else {
+    path = `/messages?maxResults=500&labelIds=${encodeURIComponent(labelId)}`;
+  }
   if (scopeDate) qParts.push(`after:${scopeDate}`);
   if (beforeDate) qParts.push(`before:${beforeDate}`);
   if (qParts.length > 0) path += `&q=${encodeURIComponent(qParts.join(" "))}`;
