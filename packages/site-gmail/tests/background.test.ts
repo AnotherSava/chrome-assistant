@@ -15,7 +15,7 @@ vi.mock("../src/cache-manager.js", () => {
   const mockSetProgressCallback = vi.fn();
   const mockSetResultCallback = vi.fn();
   const mockUpdateSystemLabelSettings = vi.fn();
-  const mockWhenReady = vi.fn().mockResolvedValue(undefined);
+
   const mockLoadLabels = vi.fn().mockResolvedValue(undefined);
   const mockIsScopeReady = vi.fn().mockReturnValue(true);
   const mockRequestScopeFetch = vi.fn();
@@ -34,7 +34,6 @@ vi.mock("../src/cache-manager.js", () => {
       setProgressCallback: mockSetProgressCallback,
       setResultCallback: mockSetResultCallback,
       updateSystemLabelSettings: mockUpdateSystemLabelSettings,
-      whenReady: mockWhenReady,
       loadLabels: mockLoadLabels,
       isScopeReady: mockIsScopeReady,
       requestScopeFetch: mockRequestScopeFetch,

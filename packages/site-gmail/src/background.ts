@@ -84,9 +84,6 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
     chrome.alarms.get(CACHE_ALARM_NAME).then(existing => {
       if (!existing) chrome.alarms.create(CACHE_ALARM_NAME, { delayInMinutes: 11 });
     }).catch(() => {});
-  } else if (progress.phase === "expanding") {
-    // Keep service worker alive during background expansion
-    chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
   }
 });
 

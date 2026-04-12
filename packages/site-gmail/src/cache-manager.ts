@@ -1,34 +1,14 @@
 import type { GmailLabel } from "@core/types.js";
 import * as db from "./cache-db.js";
-import { fetchLabels, fetchLabelMessageIds, fetchScopedMessageIds, fetchLabelMessageIdsPage, fetchScopedMessageIdsPage } from "./gmail-api.js";
+import { fetchLabels, fetchLabelMessageIdsPage, fetchScopedMessageIdsPage } from "./gmail-api.js";
 
 /** System labels always cached */
 const BASE_SYSTEM_LABELS = ["INBOX", "SENT"];
 /** Synthetic label ID for messages with no user-created labels (has:nouserlabels) */
 const NONE_LABEL_ID = "NONE";
 
-/** Compute expansion tier timestamps using calendar semantics (matching the UI's scopeToTimestamp). Returns timestamps ordered from narrowest to widest scope. */
-function expansionTierTimestamps(now: Date): number[] {
-  const tier = (fn: (d: Date) => void): number => {
-    const d = new Date(now);
-    fn(d);
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  };
-  return [
-    tier(d => d.setDate(d.getDate() - 7)),          // 1 week
-    tier(d => d.setDate(d.getDate() - 14)),         // 2 weeks
-    tier(d => d.setMonth(d.getMonth() - 1)),        // 1 month
-    tier(d => d.setMonth(d.getMonth() - 2)),        // 2 months
-    tier(d => d.setMonth(d.getMonth() - 6)),        // 6 months
-    tier(d => d.setFullYear(d.getFullYear() - 1)),  // 1 year
-    tier(d => d.setFullYear(d.getFullYear() - 3)),  // 3 years
-    tier(d => d.setFullYear(d.getFullYear() - 5)),  // 5 years
-  ];
-}
-
 export interface CacheProgress {
-  phase: "labels" | "scope" | "scope-done" | "expanding" | "complete";
+  phase: "labels" | "scope" | "complete";
   labelsTotal: number;
   labelsDone: number;
   currentLabel?: string;
@@ -83,7 +63,7 @@ interface Continuation {
 }
 
 interface FetchState {
-  phase: "labels" | "complete";
+  phase: "complete";
   lastFetchTimestamp: number | null;
 }
 
@@ -93,33 +73,14 @@ export class CacheManager {
   private onResult: ResultCallback | null = null;
   /** Generation counter for pushResults — incremented on each call so stale async completions are discarded. */
   private pushGeneration = 0;
-  private aborted = false;
-  private fetchGeneration = 0;
-  private activeFetch: Promise<void> | null = null;
   /** Labels already processed (by priority or main loop) — skipped by main loop. */
   private processedLabels = new Set<string>();
   /** In-memory accumulator for multi-page fetch-label — accumulates message IDs per label, writes to IndexedDB only when the label is complete (all pages fetched). Avoids expensive per-page read+merge+write cycles. */
   private labelIdAccumulator = new Map<string, string[]>();
-  /** Resolves when a priority label finishes; main loop awaits this between iterations. */
-  private priorityBarrier: Promise<void> | null = null;
-  private priorityResolve: (() => void) | null = null;
-  /** Resolves once account setup and label fetch are complete — safe to call prioritizeLabel after. */
-  private initReady: Promise<void> = Promise.resolve();
-  private resolveInitReady: (() => void) | null = null;
   showStarred = false;
   showImportant = false;
-  /** Pre-computed label indexes filtered by scope. null = no scope filter active. */
-  private scopedLabelIdx: Map<string, string[]> | null = null;
-  /** The set of message IDs in the current scope — kept for updating scopedLabelIdx when new labels are prioritized. */
-  private scopedIdSet: Set<string> | null = null;
-  /** The scope timestamp that scopedLabelIdx was built for — used by getLabelIndex to detect multi-window races where another port's setScopeFilter overwrote the shared state. */
-  private activeScopeTimestamp: number | null | undefined = undefined;
-  /** Monotonically increasing generation for setScopeFilter — prevents stale in-flight calls from overwriting fresher results. */
-  private scopeFilterGen = 0;
-  /** Per-timestamp cache of scoped ID sets — enables correct on-the-fly intersection when multiple windows use different scopes and the active scopedLabelIdx was built for a different timestamp. */
+  /** Per-timestamp cache of scoped ID sets — enables correct on-the-fly intersection when multiple windows use different scopes. Populated by executeAction(fetch-scope). */
   private scopedIdSets = new Map<number, Set<string>>();
-  /** Monotonically increasing generation for gap-fill — prevents stale gap-fills from writing results after a newer scope change. (Still used by legacy startGapFill/runGapFill paths.) */
-  private gapFillGen = 0;
 
   // --- Orchestrator state ---
   /** Current filter configuration set by the service worker. */
@@ -261,194 +222,9 @@ export class CacheManager {
     }
   }
 
-  /** Return the scope timestamp that the current scopedLabelIdx was built for. */
-  getActiveScopeTimestamp(): number | null | undefined {
-    return this.activeScopeTimestamp;
-  }
-
-  /** Clear cached scope state and bump the scope filter generation so any in-flight setScopeFilter calls from before the invalidation bail out. Called by the service worker when the underlying label indexes change (cache complete, backfill, etc.). */
-  clearScopeState(): void {
-    this.scopedLabelIdx = null;
-    this.scopedIdSet = null;
-    this.activeScopeTimestamp = undefined;
-    this.scopedIdSets.clear();
-    this.scopeFilterGen++;
-    this.gapFillGen++;
-  }
-
-  /** Set scope filter: fetches scoped message IDs via API and pre-computes filtered label indexes. Pass null to clear. Uses a generation counter to prevent stale in-flight calls from overwriting fresher results. When the new scope is wider than cacheDepth, triggers a background gap-fill to fetch the missing segment. */
-  async setScopeFilter(scopeTimestamp: number | null): Promise<void> {
-    const gen = ++this.scopeFilterGen;
-    if (scopeTimestamp === null) {
-      this.scopedLabelIdx = null;
-      this.scopedIdSet = null;
-      this.activeScopeTimestamp = null;
-      // If cache depth is not null, we have partial coverage — gap-fill to full
-      const cacheDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-      if (gen !== this.scopeFilterGen) return;
-      if (cacheDepth && cacheDepth.timestamp !== null) {
-        const beforeDate = this.timestampToDateString(cacheDepth.timestamp);
-        this.startGapFill(undefined, beforeDate, null);
-      }
-      return;
-    }
-    // Don't fetch scope while cache is still building — indexes are incomplete.
-    // After cache completes, pushResults will re-apply the scope.
-    if (this.labels.length === 0) return;
-    let showedSpinner = false;
-    try {
-      // Check if we already have scoped IDs for this timestamp
-      const cachedSet = this.scopedIdSets.get(scopeTimestamp);
-      let scopedSet: Set<string>;
-      if (cachedSet) {
-        scopedSet = cachedSet;
-      } else {
-        const dateStr = this.timestampToDateString(scopeTimestamp);
-        showedSpinner = true;
-        this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: 0 });
-        let lastReported = 0;
-        const scopedIds = await fetchScopedMessageIds(dateStr, (count) => { if (count - lastReported >= 1000) { lastReported = count; this.emitProgress({ phase: "scope", labelsTotal: 0, labelsDone: count }); } });
-        scopedSet = new Set(scopedIds);
-        // Cache per timestamp for reuse. Evict oldest to prevent unbounded growth.
-        const MAX_SCOPED_ID_SETS = 16;
-        if (this.scopedIdSets.size >= MAX_SCOPED_ID_SETS && !this.scopedIdSets.has(scopeTimestamp)) {
-          const oldestKey = this.scopedIdSets.keys().next().value!;
-          this.scopedIdSets.delete(oldestKey);
-        }
-        this.scopedIdSets.set(scopeTimestamp, scopedSet);
-      }
-      if (gen !== this.scopeFilterGen) return;
-
-      // Intersect with each known label index
-      const scopedMap = new Map<string, string[]>();
-      const labels = this.labels;
-      for (const label of labels) {
-        const fullIndex = await db.getMeta<string[]>(`labelIdx:${label.id}`);
-        if (gen !== this.scopeFilterGen) return;
-        if (!fullIndex) continue;
-        const filtered = fullIndex.filter(id => scopedSet.has(id));
-        scopedMap.set(label.id, filtered);
-      }
-      if (gen !== this.scopeFilterGen) return;
-      this.scopedIdSet = scopedSet;
-      this.scopedLabelIdx = scopedMap;
-      this.activeScopeTimestamp = scopeTimestamp;
-
-      // Check if scope is wider than cache depth — trigger gap-fill for missing segment
-      const cacheDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-      if (gen !== this.scopeFilterGen) return;
-      if (cacheDepth && cacheDepth.timestamp !== null && scopeTimestamp < cacheDepth.timestamp) {
-        const afterDate = this.timestampToDateString(scopeTimestamp);
-        const beforeDate = this.timestampToDateString(cacheDepth.timestamp);
-        this.startGapFill(afterDate, beforeDate, scopeTimestamp);
-      }
-    } finally {
-      if (showedSpinner) this.emitProgress({ phase: "scope-done", labelsTotal: 0, labelsDone: 0 });
-    }
-  }
-
-  /** Start a background gap-fill to expand cache coverage. newDepthTimestamp is the target depth after completion (null = full coverage). */
-  private startGapFill(afterDate: string | undefined, beforeDate: string, newDepthTimestamp: number | null): void {
-    const gapGen = ++this.gapFillGen;
-    this.runGapFill(afterDate, beforeDate, gapGen).then(async () => {
-      if (gapGen !== this.gapFillGen) return;
-      await db.setMeta("cacheDepth", { timestamp: newDepthTimestamp !== null ? this.normalizeToMidnight(newDepthTimestamp) : null });
-      this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
-    }).catch((err) => {
-      console.warn("Gap-fill failed:", err);
-      this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0, errorText: `Gap-fill failed: ${err instanceof Error ? err.message : String(err)}` });
-    });
-  }
-
-  /** Run gap-fill: fetch missing time segment for each label and merge into indexes. */
-  private async runGapFill(afterDate: string | undefined, beforeDate: string, generation: number): Promise<void> {
-    const labelsToQuery = this.buildLabelQueryList();
-    const labelsTotal = labelsToQuery.length;
-    let labelsDone = 0;
-    this.emitProgress({ phase: "expanding", labelsTotal, labelsDone });
-    for (const label of labelsToQuery) {
-      if (generation !== this.gapFillGen) return;
-      const messageIds = await fetchLabelMessageIds(label.id, afterDate, beforeDate);
-      if (generation !== this.gapFillGen) return;
-      await this.crossReferenceLabel(label.id, messageIds);
-      if (generation !== this.gapFillGen) return;
-      labelsDone++;
-      this.emitProgress({ phase: "expanding", labelsTotal, labelsDone, currentLabel: label.name });
-    }
-  }
-
-  /** Normalize a timestamp to the start of the local day (midnight), matching the day-granular normalization used by the UI's scopeToTimestamp. */
-  private normalizeToMidnight(timestamp: number): number {
-    const d = new Date(timestamp);
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  }
-
-  /** Find the next expansion tier timestamp that is strictly wider (older) than the current depth. Returns null if the widest tier is reached (expand to full coverage). Uses calendar semantics matching the UI's scopeToTimestamp to avoid off-by-one mismatches. */
-  private nextExpansionTier(currentDepthTimestamp: number, now: Date): number | null {
-    const tiers = expansionTierTimestamps(now);
-    // Walk tiers from narrowest to widest; find the first one that's strictly older than currentDepth
-    for (const tierTimestamp of tiers) {
-      if (tierTimestamp < currentDepthTimestamp) return tierTimestamp;
-    }
-    // All tiers are within current depth — expand to full coverage
-    return null;
-  }
-
-  /** Background depth expansion: after cache build/refresh, progressively deepen the cache one tier at a time. Interruptible by user actions (new fetch, scope change). */
-  private async startBackgroundExpansion(generation: number): Promise<void> {
-    const now = new Date();
-    // Signal expansion start so the service worker can re-create its keepalive alarm
-    this.emitProgress({ phase: "expanding", labelsTotal: 1, labelsDone: 0 });
-    try {
-      while (!this.isStale(generation)) {
-        const currentDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-        if (this.isStale(generation)) return;
-        if (!currentDepth || currentDepth.timestamp === null) {
-          this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
-          return;
-        }
-
-        const nextTier = this.nextExpansionTier(currentDepth.timestamp, now);
-        const beforeDate = this.timestampToDateString(currentDepth.timestamp);
-        const afterDate = nextTier !== null ? this.timestampToDateString(nextTier) : undefined;
-        const gapGen = ++this.gapFillGen;
-
-        await this.runGapFill(afterDate, beforeDate, gapGen);
-        if (gapGen !== this.gapFillGen || this.isStale(generation)) return;
-
-        await db.setMeta("cacheDepth", { timestamp: nextTier });
-        if (nextTier === null) {
-          this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
-          return;
-        }
-        this.emitProgress({ phase: "expanding", labelsTotal: 0, labelsDone: 0 });
-      }
-    } catch (err) {
-      console.warn("Background expansion failed:", err);
-      if (!this.isStale(generation)) {
-        this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0, errorText: `Expansion failed: ${err instanceof Error ? err.message : String(err)}` });
-      }
-    }
-  }
-
-  /** Get label index: returns scoped index when scope is active, or falls back to IndexedDB label index. When expectedScope is provided and doesn't match the active scope (e.g. multi-window race), computes filtered results on the fly from the per-timestamp scoped ID set cache. Falls back to unscoped IndexedDB only if no cached set is available. */
-  async getLabelIndex(labelId: string, expectedScope?: number | null): Promise<string[] | undefined> {
-    if (this.scopedLabelIdx) {
-      if (expectedScope !== undefined && expectedScope !== this.activeScopeTimestamp) {
-        return this.computeFromCachedScope(labelId, expectedScope);
-      }
-      return this.scopedLabelIdx.get(labelId);
-    }
+  /** Get label index filtered by scope. When expectedScope is set and a cached scoped ID set exists, intersects the full label index with the scope set. Falls back to unscoped IndexedDB if no cached set is available. */
+  private async getLabelIndex(labelId: string, expectedScope?: number | null): Promise<string[] | undefined> {
     if (expectedScope !== undefined && expectedScope !== null) {
-      return this.computeFromCachedScope(labelId, expectedScope);
-    }
-    return db.getMeta<string[]>(`labelIdx:${labelId}`);
-  }
-
-  /** Compute a filtered label index from a per-timestamp cached scoped ID set. Falls back to unscoped IndexedDB if no cached set is available for the given scope. */
-  private async computeFromCachedScope(labelId: string, expectedScope: number | null): Promise<string[] | undefined> {
-    if (expectedScope !== null) {
       const cachedSet = this.scopedIdSets.get(expectedScope);
       if (cachedSet) {
         const fullIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
@@ -621,31 +397,7 @@ export class CacheManager {
     const initialBuildComplete = queryList.every(l => this.processedLabels.has(l.id));
     if (!initialBuildComplete || actions.length > 0) return actions;
 
-    // Priority 4: Background scope expansion — pre-fetch wider scoped ID sets through tiers
-    // Only expand when a scope is active and the initial build completed through executeAction
-    // (cacheDepthTimestamp !== undefined means the build set it to null on completion)
-    if (this.filterConfig.scopeTimestamp !== null && this.cacheDepthTimestamp !== undefined) {
-      const tiers = expansionTierTimestamps(new Date());
-      for (const tier of tiers) {
-        if (actions.length >= concurrency) break;
-        if (this.scopedIdSets.has(tier)) continue;
-        const scopeDate = this.timestampToDateString(tier);
-        const key = this.continuationKey("fetch-scope", String(tier));
-        const cont = this.continuations.get(key);
-        if (cont) {
-          tryAdd({ type: "fetch-scope", pageToken: cont.nextPageToken, scopeDate, scopeTimestamp: tier });
-        } else {
-          if (!this.scopeStartTimes.has(tier)) {
-            this.scopeStartTimes.set(tier, Date.now());
-            console.log(`[cache] Fetching scope ${CacheManager.formatDate(tier)} — started at ${CacheManager.formatTime(Date.now())}`);
-          }
-          tryAdd({ type: "fetch-scope", scopeDate, scopeTimestamp: tier });
-        }
-      }
-      if (actions.length > 0) return actions;
-    }
-
-    // Priority 5: Incremental refresh — cache is complete but stale
+    // Priority 4: Incremental refresh — cache is complete but stale
     if (this.lastRefreshTimestamp !== null && Date.now() - this.lastRefreshTimestamp > CacheManager.REFRESH_STALE_MS) {
       const sinceDate = this.timestampToDateString(this.lastRefreshTimestamp);
       for (const label of queryList) {
@@ -772,11 +524,6 @@ export class CacheManager {
               for (const id of this.refreshedIds) scopedSet.add(id);
             }
             this.refreshedIds.clear();
-            // Invalidate pre-computed scope intersections so they're recomputed from updated data
-            this.scopedLabelIdx = null;
-            this.scopedIdSet = null;
-            this.activeScopeTimestamp = undefined;
-            this.scopeFilterGen++;
             this.pushResults(true);
             this.logOperationEnd();
           }
@@ -805,7 +552,6 @@ export class CacheManager {
     if (myGeneration !== this.startGeneration) return;
     this.orchestratorRunning = true;
     this.lastProgressWasComplete = false;
-    this.resetReady();
 
     try {
       // Account setup — clear stale data if switching accounts
@@ -817,9 +563,6 @@ export class CacheManager {
           this.processedLabels.clear();
           this.labelIdAccumulator.clear();
           this.scopedIdSets.clear();
-          this.scopedLabelIdx = null;
-          this.scopedIdSet = null;
-          this.activeScopeTimestamp = undefined;
           this.continuations.clear();
           this.scopeAccumulators.clear();
           this.scopeSegmentsPending.clear();
@@ -854,17 +597,14 @@ export class CacheManager {
     } catch (err) {
       console.warn("Orchestrator start failed:", err);
       this.orchestratorRunning = false;
-      this.resolveReady();
       throw err;
     }
 
     // Bail out if another start() was called during the async setup phase
     if (myGeneration !== this.startGeneration) {
       this.orchestratorRunning = false;
-      this.resolveReady();
       return;
     }
-    this.resolveReady();
 
     // Emit initial cache state so sidepanel knows the orchestrator is ready
     if (this.processedLabels.size > 0) {
@@ -928,175 +668,24 @@ export class CacheManager {
     return this.orchestratorRunning;
   }
 
-  abort(): void {
-    this.aborted = true;
-    this.gapFillGen++;
-  }
-
-  /** Returns true if the current fetch has been superseded or aborted. */
-  private isStale(generation: number): boolean {
-    return this.aborted || generation !== this.fetchGeneration;
-  }
-
-  /** Returns a promise that resolves once account setup and label fetch are complete. Safe to call prioritizeLabel after this resolves. */
-  whenReady(): Promise<void> {
-    return this.initReady;
-  }
-
-  /** Create a pending readiness gate. Must be called synchronously before any async work
-   *  so that whenReady() callers block until startFetch resolves initReady. */
-  resetReady(): void {
-    this.initReady = new Promise(resolve => { this.resolveInitReady = resolve; });
-  }
-
-  /** Resolve the readiness gate without running startFetch (e.g. when cache is already fresh). */
-  resolveReady(): void {
-    if (this.resolveInitReady) { this.resolveInitReady(); this.resolveInitReady = null; }
-  }
-
   /** Populate the in-memory labels list without running a full fetch (e.g. after service worker restart with fresh cache). */
   async loadLabels(): Promise<void> {
     this.labels = await fetchLabels();
     if (!this.labels.some(l => l.id === NONE_LABEL_ID)) this.labels.push({ id: NONE_LABEL_ID, name: "No user labels", type: "system" });
   }
 
-  /** Start the full cache population: fetch labels then cross-reference messages. When scopeTimestamp is set, only fetches messages within that scope for the initial build. */
-  async startFetch(accountPath: string, scopeTimestamp?: number | null): Promise<void> {
-    this.aborted = true;
-    // Cancel any in-flight gap-fill/background-expansion so it doesn't write stale data
-    // (e.g. from a previous account) after clearAll() below.
-    this.gapFillGen++;
-    // Increment generation BEFORE awaiting the old fetch so the old fetch's finally block
-    // sees a stale generation and does not resolve the new readiness gate.
-    const generation = ++this.fetchGeneration;
-    if (this.activeFetch) await this.activeFetch.catch(() => {});
-    this.aborted = false;
-    this.processedLabels.clear();
-    this.labelIdAccumulator.clear();
-    // Clear cached scoped ID sets — they become stale after refresh (new messages arrive)
-    // and after account switches (different message IDs for the same timestamps).
-    // Gap-fill and label prioritization do NOT go through startFetch, so their valid
-    // cached sets are preserved.
-    this.scopedIdSets.clear();
-    // Reuse the pending readiness gate if resetReady() was already called (e.g. by startCacheIfNeeded),
-    // so callers who captured whenReady() before startFetch runs aren't left waiting on an orphaned promise.
-    if (!this.resolveInitReady) {
-      this.initReady = new Promise(resolve => { this.resolveInitReady = resolve; });
-    }
-    const fetchPromise = this.runFetch(accountPath, generation, scopeTimestamp);
-    this.activeFetch = fetchPromise;
-    try {
-      await fetchPromise;
-    } finally {
-      if (this.activeFetch === fetchPromise) this.activeFetch = null;
-    }
-  }
-
-  private async runFetch(accountPath: string, generation: number, scopeTimestamp?: number | null): Promise<void> {
-    try {
-      const storedAccount = await db.getMeta<string>("account");
-      if (storedAccount && storedAccount !== accountPath) {
-        await db.clearAll();
-      }
-      await db.setMeta("account", accountPath);
-
-      this.labels = await fetchLabels();
-      if (!this.labels.some(l => l.id === NONE_LABEL_ID)) this.labels.push({ id: NONE_LABEL_ID, name: "No user labels", type: "system" });
-    } finally {
-      // Only resolve the readiness gate if this fetch is still the current one;
-      // otherwise a newer resetReady() has replaced the resolver and should be
-      // resolved by its own fetch to avoid unblocking callers prematurely.
-      if (generation === this.fetchGeneration && this.resolveInitReady) { this.resolveInitReady(); this.resolveInitReady = null; }
-    }
-
-    const labelsToQuery = this.buildLabelQueryList();
-    const labelsTotal = labelsToQuery.length;
-    let labelsDone = 0;
-
-    const fetchState = await db.getMeta<FetchState>("fetchState");
-    const isIncremental = fetchState?.phase === "complete" && fetchState.lastFetchTimestamp !== null;
-    const incrementalScopeDate = isIncremental ? this.timestampToDateString(fetchState.lastFetchTimestamp!) : undefined;
-    // For initial (non-incremental) builds, use the provided scopeTimestamp to limit the fetch
-    const initialScopeDate = (!isIncremental && scopeTimestamp != null) ? this.timestampToDateString(scopeTimestamp) : undefined;
-    // For incremental refreshes with partial depth, new labels (no existing index) should be
-    // bounded by cacheDepth rather than fetched from full history — otherwise one new label
-    // gets full coverage while the rest of the cache is depth-limited.
-    let incrementalNewLabelDate: string | undefined;
-    if (isIncremental) {
-      const cacheDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-      if (this.isStale(generation)) return;
-      incrementalNewLabelDate = cacheDepth?.timestamp != null ? this.timestampToDateString(cacheDepth.timestamp) : undefined;
-    }
-
-    this.emitProgress({ phase: "labels", labelsTotal, labelsDone });
-    await db.setMeta("fetchState", { phase: "labels", lastFetchTimestamp: fetchState?.lastFetchTimestamp ?? null });
-
-    for (const label of labelsToQuery) {
-      // Wait for any priority label processing to finish before continuing
-      if (this.priorityBarrier) await this.priorityBarrier;
-      if (this.isStale(generation)) return;
-      if (this.processedLabels.has(label.id)) { labelsDone++; this.emitProgress({ phase: "labels", labelsTotal, labelsDone }); continue; }
-      // Only use incremental scope if the label index already exists; otherwise use cache depth boundary
-      const existingIndex = isIncremental ? await db.getMeta<string[]>(`labelIdx:${label.id}`) : undefined;
-      const labelScopeDate = existingIndex !== undefined ? incrementalScopeDate : (isIncremental ? incrementalNewLabelDate : initialScopeDate);
-      const messageIds = await fetchLabelMessageIds(label.id, labelScopeDate);
-      await this.crossReferenceLabel(label.id, messageIds);
-      if (this.isStale(generation)) return;
-      this.processedLabels.add(label.id);
-      labelsDone++;
-      this.emitProgress({ phase: "labels", labelsTotal, labelsDone, currentLabel: label.name });
-    }
-
-    if (this.isStale(generation)) return;
-    const now = Date.now();
-    await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: now });
-    // Store cache depth: how far back in time the label indexes cover.
-    // On initial build with scope, depth = scopeTimestamp. Without scope, depth = null (full coverage).
-    // On incremental refresh, preserve existing depth (don't regress).
-    if (!isIncremental) {
-      // Normalize to midnight for consistency with expansion tiers and UI scope timestamps
-      const normalizedDepth = scopeTimestamp != null ? this.normalizeToMidnight(scopeTimestamp) : null;
-      await db.setMeta("cacheDepth", { timestamp: normalizedDepth });
-    }
-    this.emitProgress({ phase: "complete", labelsTotal, labelsDone: labelsTotal });
-
-    // After build/refresh, start background depth expansion if we have partial coverage
-    if (!this.isStale(generation)) {
-      const currentDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-      if (currentDepth && currentDepth.timestamp !== null) {
-        this.startBackgroundExpansion(generation);
-      }
-    }
-  }
-
-
-  /** Get own and inclusive counts for all known labels. When a scope filter is active, counts come from the pre-computed scopedLabelIdx. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). Pass expectedScope to guard against multi-window races. Snapshots scopedLabelIdx at entry so concurrent setScopeFilter calls from other ports cannot mix scoped/unscoped data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
+  /** Get own and inclusive counts for all known labels. When expectedScope is set and a cached scoped ID set exists, counts are filtered by scope intersection. Accepts an optional labels override for when this.labels is empty (e.g. after service worker restart with fresh cache). */
   async getLabelCounts(labelsOverride?: GmailLabel[], expectedScope?: number | null): Promise<Record<string, { own: number; inclusive: number }>> {
     let labels = labelsOverride && labelsOverride.length > 0 ? labelsOverride : this.labels;
     // Include synthetic NONE label if not already present
     if (labels.length > 0 && !labels.some(l => l.id === NONE_LABEL_ID)) labels = [...labels, { id: NONE_LABEL_ID, name: "No user labels", type: "system" }];
-    // Snapshot scope state to ensure consistent reads throughout the loop
-    const scopeSnapshot = this.scopedLabelIdx;
-    const scopeTimestampSnapshot = this.activeScopeTimestamp;
-    // Check if a cached scoped ID set is available for on-the-fly filtering (multi-window support)
-    const fallbackScopeSet = (expectedScope !== undefined && expectedScope !== null && expectedScope !== scopeTimestampSnapshot) ? this.scopedIdSets.get(expectedScope) ?? null : null;
-    const useScope = (scopeSnapshot !== null && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) || fallbackScopeSet !== null;
-
-    const getIndex = async (labelId: string): Promise<string[] | undefined> => {
-      if (scopeSnapshot && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) {
-        return scopeSnapshot.get(labelId);
-      }
-      if (fallbackScopeSet) {
-        const fullIndex = await db.getMeta<string[]>(`labelIdx:${labelId}`);
-        return fullIndex ? fullIndex.filter(id => fallbackScopeSet.has(id)) : undefined;
-      }
-      return db.getMeta<string[]>(`labelIdx:${labelId}`);
-    };
+    // Check if a cached scoped ID set is available for scope-filtered counting
+    const useScope = expectedScope !== undefined && expectedScope !== null && this.scopedIdSets.has(expectedScope);
 
     // Build own counts from label indexes
     const ownCounts: Record<string, number> = {};
     for (const label of labels) {
-      const msgIds = await getIndex(label.id);
+      const msgIds = await this.getLabelIndex(label.id, expectedScope);
       if (msgIds === undefined) continue;
       ownCounts[label.id] = msgIds.length;
     }
@@ -1120,7 +709,7 @@ export class CacheManager {
       const seenMsgIds = new Set<string>();
 
       for (const lid of allIds) {
-        const msgIds = await getIndex(lid);
+        const msgIds = await this.getLabelIndex(lid, expectedScope);
         if (msgIds) {
           for (const id of msgIds) seenMsgIds.add(id);
         }
@@ -1135,49 +724,16 @@ export class CacheManager {
     return result;
   }
 
-  /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. Uses scoped label indexes when a scope filter is active. Pass expectedScope to guard against multi-window races where another port may have changed the active scope. Snapshots scope state at entry so concurrent setScopeFilter calls cannot mix data within a single result. When the active scope doesn't match expectedScope but a cached scoped ID set exists for that timestamp, computes filtered results on the fly. */
+  /** Query the cache for a label's message count and co-occurring labels. Resolves descendants internally via prefix matching when includeChildren is true. When expectedScope is set and a cached scoped ID set exists, results are filtered by scope intersection. */
   async queryLabel(labelId: string, includeChildren: boolean, expectedScope?: number | null): Promise<LabelQueryResult> {
     const labelIds = this.resolveLabelIds(labelId, includeChildren);
-    // Snapshot scope state for consistent reads throughout the method
-    const scopeSnapshot = this.scopedLabelIdx;
-    const scopeTimestampSnapshot = this.activeScopeTimestamp;
-    const scopedIdSetSnapshot = this.scopedIdSet;
-    // Check if a cached scoped ID set is available for on-the-fly filtering (multi-window support)
-    const fallbackScopeSet = (expectedScope !== undefined && expectedScope !== null && expectedScope !== scopeTimestampSnapshot) ? this.scopedIdSets.get(expectedScope) ?? null : null;
 
-    const getIndex = async (lid: string): Promise<string[] | undefined> => {
-      if (scopeSnapshot && (expectedScope === undefined || expectedScope === scopeTimestampSnapshot)) {
-        return scopeSnapshot.get(lid);
-      }
-      if (fallbackScopeSet) {
-        const fullIndex = await db.getMeta<string[]>(`labelIdx:${lid}`);
-        return fullIndex ? fullIndex.filter(id => fallbackScopeSet.has(id)) : undefined;
-      }
-      return db.getMeta<string[]>(`labelIdx:${lid}`);
-    };
-
-    // Build the set of message IDs for the selected label(s)
+    // Build the set of message IDs for the selected label(s).
+    // If a label hasn't been cached yet, the orchestrator's Priority 2 (selected label)
+    // will fetch it, and pushResults will deliver results once the label is indexed.
     const selectedMsgIds = new Set<string>();
     for (const lid of labelIds) {
-      let msgIds = await getIndex(lid);
-
-      // If no index entry or empty index, the label hasn't been cached yet.
-      // When the orchestrator is running, skip the blocking prioritizeLabel call — the
-      // orchestrator's Priority 2 (selected label) will fetch it, and pushResults
-      // will deliver results once the label is indexed.
-      if (!msgIds || msgIds.length === 0) {
-        if (!this.orchestratorRunning) {
-          await this.prioritizeLabel(lid);
-          if (scopeSnapshot && scopedIdSetSnapshot) {
-            const fullIndex = await db.getMeta<string[]>(`labelIdx:${lid}`);
-            if (fullIndex) {
-              scopeSnapshot.set(lid, fullIndex.filter(id => scopedIdSetSnapshot.has(id)));
-            }
-          }
-          msgIds = await getIndex(lid);
-        }
-      }
-
+      const msgIds = await this.getLabelIndex(lid, expectedScope);
       if (msgIds) {
         for (const id of msgIds) selectedMsgIds.add(id);
       }
@@ -1188,7 +744,7 @@ export class CacheManager {
     const coLabels = this.labels.some(l => l.id === NONE_LABEL_ID) ? this.labels : [...this.labels, { id: NONE_LABEL_ID, name: "No user labels", type: "system" }];
     for (const label of coLabels) {
       if (label.id === labelId) continue;
-      const otherIndex = await getIndex(label.id);
+      const otherIndex = await this.getLabelIndex(label.id, expectedScope);
       if (!otherIndex) continue;
       let count = 0;
       for (const id of otherIndex) {
@@ -1200,36 +756,10 @@ export class CacheManager {
     return { labelId, count: selectedMsgIds.size, coLabelCounts };
   }
 
-  /** Mark a label as processed — prevents duplicate fetches via prioritizeLabel.
-   *  Used by the skip path to register labels whose indexes already exist in IndexedDB. */
+  /** Mark a label as processed so decide() skips it.
+   *  Used by start() to register labels whose indexes already exist in IndexedDB. */
   markProcessed(labelId: string): void {
     this.processedLabels.add(labelId);
-  }
-
-  /** Pause the main cache loop, process a single label, then resume. */
-  async prioritizeLabel(labelId: string): Promise<void> {
-    // Skip if this label was already fetched (avoids duplicate API calls when
-    // both the skip path and syncSettings race to prioritize the same label).
-    if (this.processedLabels.has(labelId)) return;
-    // Wait for any in-flight priority operation before starting a new one
-    while (this.priorityBarrier) await this.priorityBarrier;
-    // Re-check after waiting — the in-flight operation may have processed this label.
-    if (this.processedLabels.has(labelId)) return;
-    this.priorityBarrier = new Promise(resolve => { this.priorityResolve = resolve; });
-    try {
-      // Respect cacheDepth so on-demand labels don't fetch beyond the current depth boundary.
-      // Fall back to scopeTimestamp during initial build (before depth is established) to avoid fetching entire label history.
-      const cacheDepth = await db.getMeta<{ timestamp: number | null }>("cacheDepth");
-      const afterDate = cacheDepth?.timestamp != null ? this.timestampToDateString(cacheDepth.timestamp) : (this.filterConfig.scopeTimestamp !== null ? this.timestampToDateString(this.filterConfig.scopeTimestamp) : undefined);
-      const messageIds = await fetchLabelMessageIds(labelId, afterDate);
-      await this.crossReferenceLabel(labelId, messageIds);
-      this.processedLabels.add(labelId);
-    } finally {
-      const resolve = this.priorityResolve;
-      this.priorityBarrier = null;
-      this.priorityResolve = null;
-      if (resolve) resolve();
-    }
   }
 
   /** Resolve a labelId into an array of IDs: just the label itself, or the label + its descendants via prefix matching. */
