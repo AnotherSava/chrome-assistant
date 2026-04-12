@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // Minimal DOM setup for sidepanel.ts module-level code
 function setupDOM(): void {
   document.body.innerHTML = `
-    <div id="tab-bar"><div class="tab" data-tab="summary">Summary</div><div class="tab active" data-tab="filters">Filters</div></div>
+    <div id="tab-bar"><div class="tab" data-tab="summary">Summary</div><div class="tab active" data-tab="search">Search</div></div>
     <div id="content"></div>
     <div id="zoom-indicator"></div>
     <button id="btn-zoom-out"></button>

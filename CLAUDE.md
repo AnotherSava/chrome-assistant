@@ -75,10 +75,11 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `packages/site-gmail/sidepanel.html` — side panel HTML entry point
 - `packages/site-gmail/vite.config.ts` — Gmail-specific Vite config (extends base, sets entry points)
 - `packages/site-gmail/src/background.ts` — service worker (port-based messaging, orchestrator integration via start()/setFilterConfig()/wakeOrchestrator(), selectionChanged handler with Gmail navigation + setFilterConfig, result callback relay as filterResults to sidepanel, cacheState push to sidepanel, return-to-inbox on disconnect, user-navigation detection for auto-tab-switch)
-- `packages/site-gmail/src/sidepanel.ts` — Gmail side panel UI (tabs, labels, zoom, pin mode, display settings, label counts, scope-based zero-count label hiding, sends selectionChanged intent to service worker, receives pushed filterResults/cacheState)
+- `packages/site-gmail/src/sidepanel.ts` — side panel shell (connection, tab switching, zoom, pin mode, display settings panel, help, handleMessage dispatch)
+- `packages/site-gmail/src/search-tab.ts` — Search tab (label tree building, rendering, filtering, selection, scope, cache progress, co-label counts, sends selectionChanged to service worker)
 - `packages/site-gmail/src/gmail-api.ts` — Gmail API client (OAuth2 auth, label fetch, per-page fetch variants for orchestrator pagination, scope-based message search with beforeDate support for parallel segments, search query builder)
 - `packages/site-gmail/src/cache-db.ts` — IndexedDB storage layer (meta store for label indexes and fetch state, label coverage tracking)
-- `packages/site-gmail/src/cache-manager.ts` — cache orchestrator (single-loop architecture with decide()/executeAction() and configurable concurrency, setFilterConfig() for priority control with push-based result callback, all-time per-label fetch with in-memory ID accumulation, parallel scope segment fetching, background scope expansion through tiers, co-label counts via label index intersection, incremental refresh with scope set updates)
+- `packages/site-gmail/src/cache-manager.ts` — cache orchestrator (single-loop architecture with decide()/executeAction() and configurable concurrency, setFilterConfig() for priority control with push-based result callback, all-time per-label fetch with in-memory ID accumulation, parallel scope segment fetching, co-label counts via label index intersection, incremental refresh with scope set updates)
 - `packages/site-gmail/src/help.ts` — Gmail-specific help page renderer
 - `assets/extension/gmail/` — Gmail extension icons
 

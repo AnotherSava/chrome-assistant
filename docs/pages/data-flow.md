@@ -14,10 +14,10 @@
 |---------|---------|
 | `initWindow` | Sidepanel opened — sends windowId so service worker can track which Gmail tab belongs to which panel |
 | `selectionChanged` | User selected/deselected a label, changed scope, or toggled include-children. Carries `{ labelId, includeChildren, scope, scopeTimestamp }`. Service worker navigates Gmail and calls `setFilterConfig`. |
-| `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching to Summary tab with return-to-inbox enabled) |
+| `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled) |
 | `fetchLabels` | Request Gmail label list (used on first load and account switch) |
 | `syncSettings` | Push display settings (showStarred, showImportant, concurrency) to service worker |
-| `syncState` | Push UI state (returnToInbox, onFiltersTab) to service worker |
+| `syncState` | Push UI state (returnToInbox, onSearchTab) to service worker |
 | `setPinMode` | Change pin mode (pinned vs autohide-site) |
 
 ## Message Types (service worker → sidepanel)
@@ -86,7 +86,7 @@ Co-labels are computed by intersecting label indexes rather than reading individ
 
 The cache manager includes a synthetic label with ID `NONE` that represents messages with no user-created labels. It is fetched using the Gmail search query `has:nouserlabels` and indexed like any other label. It appears in the sidepanel as "No user labels" among the system labels.
 
-### Filters Off (Summary Tab)
+### Search Tab Close (Return to Inbox)
 
 1. User switches to Summary tab with return-to-inbox enabled
 2. Sidepanel sends `filtersOff`

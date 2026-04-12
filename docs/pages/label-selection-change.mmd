@@ -27,7 +27,7 @@ sequenceDiagram
     CM-->>SW: counts
     SW->>SP: countsReady {counts}
 
-    Note over SP,Gmail: Filters Off
+    Note over SP,Gmail: Search Tab Close
     SP->>SW: filtersOff
     SW->>Gmail: tabs.update(url) — #inbox
 

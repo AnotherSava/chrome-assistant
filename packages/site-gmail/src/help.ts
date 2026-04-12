@@ -28,7 +28,7 @@ export function renderHelp(): string {
   <div class="help-section">
     <div class="help-section-title">Tabs</div>
     <div class="help-sections-grid">
-      <div class="help-grid-item"><span class="help-grid-label">Filters</span><span> Browse Gmail labels in a multi-column layout. Click a label to filter the Gmail page. Combine with Location and Scope dropdowns for precise filtering. Labels are dynamically filtered to show only those that appear on matching messages — a background cache builds progressively so subsequent filtering is instant.</span></div>
+      <div class="help-grid-item"><span class="help-grid-label">Search</span><span> Browse Gmail labels in a multi-column layout. Click a label to search the Gmail page. Combine with Location and Scope dropdowns for precise searching. Labels are dynamically filtered to show only those that appear on matching messages — a background cache builds progressively so subsequent searching is instant.</span></div>
       <div class="help-grid-item"><span class="help-grid-label">Summary</span><span> Email summary view (coming soon).</span></div>
     </div>
   </div>
