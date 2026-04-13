@@ -103,8 +103,12 @@ export class CacheManager {
   private scopeSegmentsPending = new Map<number, number>();
   /** Per-scope start times for logging — keyed by scope timestamp. */
   private scopeStartTimes = new Map<number, number>();
-  /** In-memory mirror of cacheDepth from IndexedDB. undefined = not yet determined. */
-  private cacheDepthTimestamp: number | null | undefined = undefined;
+  /** In-memory mirror of cacheDepth from IndexedDB (null = full coverage). */
+  private cacheDepthTimestamp: number | null = null;
+  /** Whether the initial cache build has completed (all labels fetched at least once). */
+  private initialBuildComplete = false;
+  /** Suppress intermediate pushes during build (e.g. after reset — keep old view until complete). */
+  private suppressPushes = false;
   /** In-memory mirror of lastFetchTimestamp from fetchState. */
   private lastRefreshTimestamp: number | null = null;
   /** Whether the last emitted progress was "complete" — prevents redundant re-emission on idle wakes. */
@@ -216,10 +220,6 @@ export class CacheManager {
   updateSystemLabelSettings(showStarred: boolean, showImportant: boolean): void {
     this.showStarred = showStarred;
     this.showImportant = showImportant;
-    // Persist so alarm-driven restarts after SW suspension retain these settings
-    if (typeof chrome !== "undefined" && chrome.storage?.session) {
-      chrome.storage.session.set({ showStarred, showImportant });
-    }
   }
 
   /** Get label index filtered by scope. When expectedScope is set and a cached scoped ID set exists, intersects the full label index with the scope set. Falls back to unscoped IndexedDB if no cached set is available. */
@@ -251,13 +251,18 @@ export class CacheManager {
   }
 
   /** Set the in-memory cache depth timestamp. */
-  setCacheDepthTimestamp(timestamp: number | null | undefined): void {
+  setCacheDepthTimestamp(timestamp: number | null): void {
     this.cacheDepthTimestamp = timestamp;
   }
 
   /** Get the in-memory cache depth timestamp. */
-  getCacheDepthTimestamp(): number | null | undefined {
+  getCacheDepthTimestamp(): number | null {
     return this.cacheDepthTimestamp;
+  }
+
+  /** Whether the initial cache build has completed. */
+  isInitialBuildComplete(): boolean {
+    return this.initialBuildComplete;
   }
 
   /** Set the in-memory last refresh timestamp. */
@@ -460,7 +465,7 @@ export class CacheManager {
             const now = Date.now();
             console.log(`[cache] Fetching scope ${CacheManager.formatDate(scopeTimestampForAction)} — finished at ${CacheManager.formatTime(now)}, took ${scopeStart ? CacheManager.formatDuration(now - scopeStart) : "?"}`);
             // Scope is now available — push results
-            this.pushResults(true);
+            this.pushResults();
           }
         }
         break;
@@ -479,23 +484,23 @@ export class CacheManager {
           await this.crossReferenceLabel(action.labelId!, acc);
           this.labelIdAccumulator.delete(action.labelId!);
           this.processedLabels.add(action.labelId!);
-          // Push results when a label finishes indexing — during the initial build
-          // this provides progressive count updates; for the selected label it also
-          // updates the co-label detail view.
-          if (action.labelId === this.filterConfig.labelId || this.cacheDepthTimestamp === undefined) this.pushResults(true);
+          // Push results when a label finishes indexing — provides progressive
+          // count updates during initial build (suppressed during reset).
+          if (action.labelId === this.filterConfig.labelId || !this.initialBuildComplete) this.pushResults();
           if (this.isAllLabelsInSet(this.processedLabels, queryList)) {
             const now = Date.now();
             this.lastRefreshTimestamp = now;
             await db.setMeta("fetchState", { phase: "complete", lastFetchTimestamp: now });
-            // On initial build completion, set full coverage (null = all time)
-            if (this.cacheDepthTimestamp === undefined) {
-              this.cacheDepthTimestamp = null;
+            // On initial build completion, set full coverage and mark build as done
+            if (!this.initialBuildComplete) {
+              this.initialBuildComplete = true;
+              this.suppressPushes = false;
               await db.setMeta("cacheDepth", { timestamp: null });
             }
             // Signal initial build completion so the service worker pushes results
             this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
             // Push updated results with full cache accuracy
-            this.pushResults(true);
+            this.pushResults();
             this.logOperationEnd();
           }
         }
@@ -524,7 +529,7 @@ export class CacheManager {
               for (const id of this.refreshedIds) scopedSet.add(id);
             }
             this.refreshedIds.clear();
-            this.pushResults(true);
+            this.pushResults();
             this.logOperationEnd();
           }
         }
@@ -566,7 +571,8 @@ export class CacheManager {
           this.continuations.clear();
           this.scopeAccumulators.clear();
           this.scopeSegmentsPending.clear();
-          this.cacheDepthTimestamp = undefined;
+          this.cacheDepthTimestamp = null;
+          this.initialBuildComplete = false;
           this.lastRefreshTimestamp = null;
           this.refreshProcessedLabels.clear();
           this.requestedScopes.clear();
@@ -588,6 +594,7 @@ export class CacheManager {
         // If cache was previously complete, detect which labels are already indexed
         // so decide() skips them (avoids re-fetching everything on service worker restart)
         if (fetchState.phase === "complete") {
+          this.initialBuildComplete = true;
           for (const label of this.buildLabelQueryList()) {
             const idx = await db.getMeta<string[]>(`labelIdx:${label.id}`);
             if (idx) this.processedLabels.add(label.id);
@@ -611,7 +618,7 @@ export class CacheManager {
       this.emitProgress({ phase: "complete", labelsTotal: 0, labelsDone: 0 });
       // Push results now that labels are loaded — ensures warm-cache restarts get correct counts
       // even when no user interaction triggers setFilterConfig
-      this.pushResults(true);
+      this.pushResults();
     }
 
     const loop = async (): Promise<void> => {
@@ -653,6 +660,26 @@ export class CacheManager {
   }
 
   /** Stop the orchestrator loop. */
+  /** Clear all cached data (IndexedDB + in-memory state) and stop the orchestrator. Call start() after to rebuild from scratch. */
+  async reset(): Promise<void> {
+    this.stop();
+    await db.clearAll();
+    this.labels = [];
+    this.processedLabels.clear();
+    this.labelIdAccumulator.clear();
+    // Preserve scopedIdSets — message timestamps are immutable, so scoped ID sets stay valid
+    this.continuations.clear();
+    this.scopeAccumulators.clear();
+    this.scopeSegmentsPending.clear();
+    this.cacheDepthTimestamp = null;
+    this.initialBuildComplete = false;
+    this.suppressPushes = true;
+    this.lastRefreshTimestamp = null;
+    this.refreshProcessedLabels.clear();
+    this.requestedScopes.clear();
+    this.lastProgressWasComplete = false;
+  }
+
   stop(): void {
     this.orchestratorRunning = false;
     // Invalidate any in-flight fire-and-forget pushResults() calls so they don't
@@ -828,17 +855,10 @@ export class CacheManager {
     }
   }
 
-  /** Compute results for the current filter config and push via callback. No-op if no callback is registered, labels aren't loaded yet, or required data (scope) isn't available yet. Pass fromOrchestrator=true to bypass the initial-build guard (the orchestrator pushes progressively after each label). */
-  private async pushResults(fromOrchestrator?: boolean): Promise<void> {
+  /** Compute results for the current filter config and push via callback. No-op if no callback is registered, labels aren't loaded, pushes are suppressed, or required scope data isn't available yet. */
+  private async pushResults(): Promise<void> {
     if (!this.onResult) return;
-    // Skip when labels haven't loaded — counts would be empty/wrong. The orchestrator will push after labels arrive.
-    if (this.labels.length === 0) return;
-    // During initial build, push labels without counts so the sidepanel clears stale data.
-    // The orchestrator pushes progressively after each label is indexed.
-    if (this.cacheDepthTimestamp === undefined && !fromOrchestrator) {
-      this.onResult({ labelId: null, count: 0, coLabelCounts: {}, counts: {}, filterConfig: { ...this.filterConfig }, partial: true });
-      return;
-    }
+    if (this.labels.length === 0 || this.suppressPushes) return;
     const config = { ...this.filterConfig };
     // If scope is needed but not yet cached, skip — orchestrator will push after scope arrives
     if (config.scopeTimestamp !== null && !this.scopedIdSets.has(config.scopeTimestamp)) return;
@@ -857,7 +877,7 @@ export class CacheManager {
       // Discard if a newer pushResults call started or filter config changed during async work
       if (this.pushGeneration !== myGeneration) return;
       const allProcessed = this.buildLabelQueryList().every(l => this.processedLabels.has(l.id));
-      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: this.cacheDepthTimestamp === undefined || !allProcessed });
+      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: !allProcessed });
     } catch {
       // Swallow errors — push is best-effort
     }

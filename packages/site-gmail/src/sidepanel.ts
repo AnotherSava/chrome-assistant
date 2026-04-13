@@ -1,6 +1,6 @@
 import { renderHelp } from "./help.js";
 import { ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
-import { loadSetting, saveSetting } from "@core/settings.js";
+import { loadSettings, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
 import * as searchTab from "./search-tab.js";
 
@@ -10,13 +10,6 @@ export { scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, se
 let currentTab: "summary" | "search" = "search";
 let onGmailPage = false;
 let currentAccountPath: string | null = null;
-
-// ---------------------------------------------------------------------------
-// Migration: remove old localStorage cache keys (replaced by IndexedDB)
-// ---------------------------------------------------------------------------
-
-const OLD_CACHE_KEYS = ["ca_msg_cache_labels", "ca_msg_cache_messages", "ca_msg_cache_oldest", "ca_msg_cache_broad_oldest", "ca_msg_cache_complete", "ca_msg_cache_label_oldest", "ca_msg_cache_newest", "ca_msg_cache_ids", "ca_msg_cache_account"];
-for (const key of OLD_CACHE_KEYS) localStorage.removeItem(key);
 
 // ---------------------------------------------------------------------------
 // Zoom (Ctrl+/- and Ctrl+0)
@@ -29,13 +22,13 @@ const KEY_ZOOM = "ca_zoom_levels";
 const ZOOM_DEFAULT = 1.0;
 
 let zoomLevel = ZOOM_DEFAULT;
+let zoomLevels: Record<string, number> = {};
 let zoomFadeTimeout: ReturnType<typeof setTimeout> | undefined;
 let currentZoomContext = "help";
 
 function switchZoomContext(context: string): void {
   currentZoomContext = context;
-  const levels = loadSetting<Record<string, number>>(KEY_ZOOM, {});
-  const stored = levels[context];
+  const stored = zoomLevels[context];
   zoomLevel = stored !== undefined && stored >= ZOOM_MIN && stored <= ZOOM_MAX ? stored : ZOOM_DEFAULT;
   const contentEl = document.getElementById("content");
   if (contentEl) contentEl.style.zoom = String(zoomLevel);
@@ -44,9 +37,8 @@ function switchZoomContext(context: string): void {
 function applyZoom(): void {
   const contentEl = document.getElementById("content");
   if (contentEl) contentEl.style.zoom = String(zoomLevel);
-  const levels = loadSetting<Record<string, number>>(KEY_ZOOM, {});
-  levels[currentZoomContext] = zoomLevel;
-  saveSetting(KEY_ZOOM, levels);
+  zoomLevels[currentZoomContext] = zoomLevel;
+  saveSetting(KEY_ZOOM, zoomLevels);
   const indicator = document.getElementById("zoom-indicator");
   if (indicator) {
     indicator.textContent = `${Math.round(zoomLevel * 100)}%`;
@@ -87,8 +79,7 @@ document.getElementById("btn-zoom-in")?.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 const KEY_PIN_MODE = "ca_pin_mode";
-const PIN_MODE_DEFAULT: PinMode = "pinned";
-let currentPinMode: PinMode = loadSetting(KEY_PIN_MODE, PIN_MODE_DEFAULT);
+let currentPinMode: PinMode = "pinned";
 let pinDropdownOpen = false;
 
 const PIN_ICONS: Record<PinMode, string> = { "pinned": ICON_PANEL, "autohide-site": ICON_PANEL_1 };
@@ -112,7 +103,6 @@ function selectPinMode(mode: PinMode): void {
   saveSetting(KEY_PIN_MODE, mode);
   updatePinButtonIcon();
   closePinDropdown();
-  if (activePort) activePort.postMessage({ type: "setPinMode", mode });
 }
 
 function buildPinDropdown(): void {
@@ -173,9 +163,7 @@ document.addEventListener("mouseup", (e: MouseEvent) => {
 // ---------------------------------------------------------------------------
 
 const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
-const KEY_SHOW_SUMMARY_TAB = "ca_show_summary_tab";
-let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
-let showSummaryTab: boolean = loadSetting(KEY_SHOW_SUMMARY_TAB, false);
+let returnToInbox = true;
 let displayPanelOpen = false;
 
 function closeDisplayPanel(): void {
@@ -190,23 +178,16 @@ function buildDisplayPanel(): void {
   const ds = searchTab.getDisplaySettings();
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === ds.labelColumns ? " selected" : ""}>${n}</option>`).join("");
   const concurrencyOptions = [1, 3, 5, 10, 20].map((n) => `<option value="${n}"${n === ds.concurrency ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="show-summary-tab-check"${showSummaryTab ? " checked" : ""}><label for="show-summary-tab-check">Show Summary tab</label></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Search tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${ds.includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${ds.showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${ds.showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${ds.showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div><div class="display-row"><input type="checkbox" id="show-cache-progress-check"${ds.showCacheProgress ? " checked" : ""}><label for="show-cache-progress-check">Show background cache progress</label></div><div class="display-row"><label>API concurrency</label><select id="concurrency-select">${concurrencyOptions}</select></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Search tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${ds.includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${ds.showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${ds.showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${ds.showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div><div class="display-row"><label>API concurrency</label><select id="concurrency-select">${concurrencyOptions}</select></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     searchTab.setLabelColumns(parseInt(colSelect.value, 10));
-    if (currentTab === "search") searchTab.loadLabels();
-  });
-  const summaryTabCheck = document.getElementById("show-summary-tab-check") as HTMLInputElement;
-  summaryTabCheck.addEventListener("change", () => {
-    showSummaryTab = summaryTabCheck.checked;
-    saveSetting(KEY_SHOW_SUMMARY_TAB, showSummaryTab);
-    updateSummaryTabVisibility();
+    if (currentTab === "search") searchTab.renderIfReady();
   });
   const returnCheck = document.getElementById("return-inbox-check") as HTMLInputElement;
   returnCheck.addEventListener("change", () => {
     returnToInbox = returnCheck.checked;
     saveSetting(KEY_RETURN_TO_INBOX, returnToInbox);
-    syncState();
   });
   const childrenCheck = document.getElementById("include-children-check") as HTMLInputElement;
   childrenCheck.addEventListener("change", () => {
@@ -216,29 +197,22 @@ function buildDisplayPanel(): void {
   countsCheck.addEventListener("change", () => {
     searchTab.setShowCounts(countsCheck.checked);
     if (countsCheck.checked) {
-      searchTab.loadLabels(true);
+      searchTab.renderIfReady();
     } else if (currentTab === "search") {
-      searchTab.loadLabels();
+      searchTab.renderIfReady();
     }
   });
   const starredCheck = document.getElementById("show-starred-check") as HTMLInputElement;
   starredCheck.addEventListener("change", () => {
     searchTab.setShowStarred(starredCheck.checked);
-    syncSettings();
   });
   const importantCheck = document.getElementById("show-important-check") as HTMLInputElement;
   importantCheck.addEventListener("change", () => {
     searchTab.setShowImportant(importantCheck.checked);
-    syncSettings();
-  });
-  const cacheProgressCheck = document.getElementById("show-cache-progress-check") as HTMLInputElement;
-  cacheProgressCheck.addEventListener("change", () => {
-    searchTab.setShowCacheProgress(cacheProgressCheck.checked);
   });
   const concurrencySelect = document.getElementById("concurrency-select") as HTMLSelectElement;
   concurrencySelect.addEventListener("change", () => {
     searchTab.setConcurrency(parseInt(concurrencySelect.value, 10));
-    syncSettings();
   });
 }
 
@@ -258,6 +232,10 @@ if (btnDisplay) {
   });
 }
 
+document.getElementById("btn-refresh")?.addEventListener("click", () => {
+  if (activePort) activePort.postMessage({ type: "resetCache" });
+});
+
 document.addEventListener("click", (e) => {
   if (displayPanelOpen) {
     const panel = document.getElementById("display-panel");
@@ -275,12 +253,6 @@ function showTabBar(visible: boolean): void {
   if (tabBar) tabBar.style.display = visible ? "" : "none";
 }
 
-function updateSummaryTabVisibility(): void {
-  const summaryBtn = document.querySelector<HTMLElement>('.tab[data-tab="summary"]');
-  if (summaryBtn) summaryBtn.style.display = showSummaryTab ? "" : "none";
-  if (!showSummaryTab && currentTab === "summary") switchTab("search");
-}
-
 function showContent(html: string): void {
   const contentEl = document.getElementById("content");
   if (contentEl) contentEl.innerHTML = html;
@@ -293,7 +265,6 @@ function showSummary(): void {
 
 function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): void {
   currentTab = tab;
-  syncState();
   document.querySelectorAll<HTMLElement>(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   if (tab === "summary") {
     searchTab.deactivate();
@@ -308,21 +279,11 @@ function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): 
 document.querySelectorAll<HTMLElement>(".tab").forEach((t) => {
   t.addEventListener("click", () => { switchTab(t.dataset.tab as "summary" | "search"); });
 });
-updateSummaryTabVisibility();
-
 // ---------------------------------------------------------------------------
 // Messaging helpers
 // ---------------------------------------------------------------------------
 
-function syncState(): void {
-  if (activePort) activePort.postMessage({ type: "syncState", returnToInbox, onFiltersTab: currentTab === "search" });
-}
 
-function syncSettings(): void {
-  if (!activePort) return;
-  const s = searchTab.getInitSettings();
-  activePort.postMessage({ type: "syncSettings", showStarred: s.showStarred, showImportant: s.showImportant, concurrency: s.concurrency });
-}
 
 function sendFiltersOff(): void {
   if (!activePort) return;
@@ -353,7 +314,7 @@ function showHelp(): void {
 function returnFromHelp(): void {
   if (onGmailPage) {
     showTabBar(true);
-    if (currentTab === "search") searchTab.loadLabels();
+    if (currentTab === "search") searchTab.renderIfReady();
     else if (currentTab === "summary") showSummary();
   }
 }
@@ -383,17 +344,12 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     showTabBar(true);
     if (currentTab === "search") {
       switchZoomContext("gmail");
-      searchTab.activate(true);
+      searchTab.activate();
     } else if (currentTab === "summary") {
       showSummary();
     }
   } else if (message.type === "labelsReady") {
-    // Delegate to search tab, then handle initial navigation
     searchTab.handleMessage(message);
-    if (needsInitialNav || searchTab.hasActiveLabel()) {
-      needsInitialNav = false;
-      searchTab.sendSelection();
-    }
     return;
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
@@ -404,45 +360,50 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     searchTab.reset();
     if (!isShowingHelp()) showHelp();
   } else {
-    // Delegate remaining messages (filterResults, cacheState, labelsError, fetchError) to search tab
+    // Delegate remaining messages (filterResults, cacheState, fetchError) to search tab
     searchTab.handleMessage(message);
   }
 }
 
 let activePort: chrome.runtime.Port | null = null;
-/** True after (re)connect until the first labelsReady — ensures we navigate Gmail to match the current filter on panel open. */
-let needsInitialNav = false;
 
-if (chrome.runtime?.connect) {
-  let reconnectDelay = 1000;
-  const MAX_RECONNECT_DELAY = 30000;
-  const connectToBackground = (): void => {
-    if (!chrome.runtime?.id) return;
-    try {
-      const port = chrome.runtime.connect(undefined, { name: "sidepanel" });
-      activePort = port;
-      searchTab.setPort(port);
-      needsInitialNav = true;
-      reconnectDelay = 1000;
-      port.onMessage.addListener(handleMessage);
-      chrome.windows.getCurrent().then((win) => {
-        const s = searchTab.getInitSettings();
-        port.postMessage({ type: "initWindow", windowId: win.id, scopeTimestamp: s.scopeTimestamp });
-        port.postMessage({ type: "setPinMode", mode: currentPinMode });
-        port.postMessage({ type: "syncSettings", showStarred: s.showStarred, showImportant: s.showImportant, concurrency: s.concurrency });
-        syncState();
-      });
-      port.onDisconnect.addListener(() => {
-        activePort = null;
-        searchTab.setPort(null);
-        if (!chrome.runtime?.id) return;
-        setTimeout(connectToBackground, reconnectDelay);
-        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
-      });
-    } catch { /* Extension context invalidated */ }
-  };
-  connectToBackground();
-}
-
-// Show loading on startup
+// Show loading immediately, then init settings and connect
 showContent('<div class="status">Loading...</div>');
+
+const SIDEPANEL_SETTINGS_DEFAULTS = { [KEY_ZOOM]: {} as Record<string, number>, [KEY_PIN_MODE]: "pinned" as PinMode, [KEY_RETURN_TO_INBOX]: true };
+
+export const ready = (async () => {
+  // Load sidepanel settings and search tab settings in parallel
+  const [shellSettings] = await Promise.all([loadSettings(SIDEPANEL_SETTINGS_DEFAULTS), searchTab.init()]);
+  zoomLevels = shellSettings[KEY_ZOOM];
+  currentPinMode = shellSettings[KEY_PIN_MODE] as PinMode;
+  returnToInbox = shellSettings[KEY_RETURN_TO_INBOX];
+  updatePinButtonIcon();
+
+  if (chrome.runtime?.connect) {
+    let reconnectDelay = 1000;
+    const MAX_RECONNECT_DELAY = 30000;
+    const connectToBackground = (): void => {
+      if (!chrome.runtime?.id) return;
+      try {
+        const port = chrome.runtime.connect(undefined, { name: "sidepanel" });
+        activePort = port;
+        searchTab.setPort(port);
+        reconnectDelay = 1000;
+        port.onMessage.addListener(handleMessage);
+        chrome.windows.getCurrent().then((win) => {
+          port.postMessage({ type: "initWindow", windowId: win.id });
+          searchTab.sendSelection();
+        });
+        port.onDisconnect.addListener(() => {
+          activePort = null;
+          searchTab.setPort(null);
+          if (!chrome.runtime?.id) return;
+          setTimeout(connectToBackground, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+        });
+      } catch { /* Extension context invalidated */ }
+    };
+    connectToBackground();
+  }
+})();

@@ -892,7 +892,7 @@ describe("CacheManager", () => {
   });
 
   describe("orchestrator initial build completion", () => {
-    it("fetch-label sets cacheDepthTimestamp and lastRefreshTimestamp when all labels done", async () => {
+    it("fetch-label marks build complete and sets lastRefreshTimestamp when all labels done", async () => {
       const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
       manager.setLabels(singleLabel);
       manager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: null });
@@ -901,13 +901,13 @@ describe("CacheManager", () => {
       manager.markProcessed("NONE");
       await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
 
-      expect(manager.getCacheDepthTimestamp()).toBeNull(); // null scope = full coverage
+      expect(manager.isInitialBuildComplete()).toBe(true);
       expect(manager.getLastRefreshTimestamp()).toBeGreaterThan(0);
       const fetchState = mockDb._meta.get("fetchState") as { phase: string; lastFetchTimestamp: number };
       expect(fetchState.phase).toBe("complete");
     });
 
-    it("fetch-label sets cacheDepthTimestamp to null (full coverage) when all labels done, even with scope set", async () => {
+    it("fetch-label marks build complete even with scope set", async () => {
       const singleLabel: GmailLabel[] = [{ id: "INBOX", name: "INBOX", type: "system" }];
       manager.setLabels(singleLabel);
       const scopeTs = new Date("2025-04-08").getTime();
@@ -917,7 +917,7 @@ describe("CacheManager", () => {
       manager.markProcessed("NONE");
       await manager.executeAction({ type: "fetch-label", labelId: "INBOX" });
 
-      expect(manager.getCacheDepthTimestamp()).toBeNull();
+      expect(manager.isInitialBuildComplete()).toBe(true);
     });
   });
 
@@ -1044,7 +1044,7 @@ describe("CacheManager", () => {
       // Set labels on manager so queryLabel/getLabelCounts work
       (manager as unknown as { labels: GmailLabel[] }).labels = testLabels;
       // Mark initial build as complete so pushResults doesn't skip
-      manager.setCacheDepthTimestamp(null);
+      (manager as unknown as { initialBuildComplete: boolean }).initialBuildComplete = true;
 
       const pushes: ResultPush[] = [];
       manager.setResultCallback(r => pushes.push(r));
@@ -1068,7 +1068,7 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:INBOX", ["m1"]);
       mockDb._store.set("m1", { id: "m1", labelIds: ["INBOX"] });
       (manager as unknown as { labels: GmailLabel[] }).labels = testLabels;
-      manager.setCacheDepthTimestamp(null);
+      (manager as unknown as { initialBuildComplete: boolean }).initialBuildComplete = true;
 
       const pushes: ResultPush[] = [];
       manager.setResultCallback(r => pushes.push(r));

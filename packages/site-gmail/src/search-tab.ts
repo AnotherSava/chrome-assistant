@@ -1,38 +1,41 @@
 import { escapeHtml } from "@core/icons.js";
-import { loadSetting, saveSetting } from "@core/settings.js";
+import { loadSettings, saveSetting } from "@core/settings.js";
 import type { GmailLabel } from "@core/types.js";
 
 interface LabelTreeNode { name: string; fullName: string; id: string; type: string; children: LabelTreeNode[] }
 
 // ---------------------------------------------------------------------------
-// State
+// Settings keys and defaults
+// ---------------------------------------------------------------------------
+
+const SETTINGS_DEFAULTS = {
+  ca_active_label: null as string | null,
+  ca_active_label_name: null as string | null,
+  ca_scope_value: "any",
+  ca_label_columns: 3,
+  ca_include_children: true,
+  ca_show_counts: true,
+  ca_show_starred: false,
+  ca_show_important: false,
+  ca_concurrency: 10,
+};
+
+// ---------------------------------------------------------------------------
+// State (initialized by init(), called before any rendering)
 // ---------------------------------------------------------------------------
 
 let port: chrome.runtime.Port | null = null;
 
-const KEY_ACTIVE_LABEL = "ca_active_label";
-const KEY_ACTIVE_LABEL_NAME = "ca_active_label_name";
-const KEY_SCOPE_VALUE = "ca_scope_value";
-const KEY_LABEL_COLUMNS = "ca_label_columns";
-const KEY_INCLUDE_CHILDREN = "ca_include_children";
-const KEY_SHOW_COUNTS = "ca_show_counts";
-const KEY_SHOW_STARRED = "ca_show_starred";
-const KEY_SHOW_IMPORTANT = "ca_show_important";
-const KEY_CONCURRENCY = "ca_concurrency";
-const KEY_SHOW_CACHE_PROGRESS = "ca_show_cache_progress";
-
-let activeLabelId: string | null = loadSetting(KEY_ACTIVE_LABEL, null as string | null);
-let activeLabelName: string | null = loadSetting(KEY_ACTIVE_LABEL_NAME, null as string | null);
-let scopeValue: string = loadSetting(KEY_SCOPE_VALUE, "any");
-/** Cached scope timestamp — recomputed only when scopeValue changes, so the same value is sent on every message for deduplication in background.ts. */
-let cachedScopeTimestamp: number | null = scopeToTimestamp(scopeValue);
-let labelColumns: number = loadSetting(KEY_LABEL_COLUMNS, 3);
-let includeChildren: boolean = loadSetting(KEY_INCLUDE_CHILDREN, true);
-let showCounts: boolean = loadSetting(KEY_SHOW_COUNTS, true);
-let showStarred: boolean = loadSetting(KEY_SHOW_STARRED, false);
-let showImportant: boolean = loadSetting(KEY_SHOW_IMPORTANT, false);
-let concurrency: number = loadSetting(KEY_CONCURRENCY, 10);
-let showCacheProgress: boolean = loadSetting(KEY_SHOW_CACHE_PROGRESS, false);
+let activeLabelId: string | null = null;
+let activeLabelName: string | null = null;
+let scopeValue = "any";
+let cachedScopeTimestamp: number | null = null;
+let labelColumns = 3;
+let includeChildren = true;
+let showCounts = true;
+let showStarred = false;
+let showImportant = false;
+let concurrency = 10;
 
 let cachedLabels: GmailLabel[] | null = null;
 let labelCounts: Record<string, { own: number; inclusive: number }> | null = null;
@@ -40,16 +43,28 @@ let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number;
 let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
 /** Whether the last pushed results are partial (initial build in progress) — don't hide zero-count labels from partial results */
 let lastResultsPartial = true;
-/** Monotonic sequence number to correlate fetchLabels requests with labelsReady responses */
-let fetchLabelsSeq = 0;
 
 const LABELS_HIDDEN = new Set(["CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
 /** System labels shown in fixed order before user labels */
 const SYSTEM_LABEL_ORDER = ["INBOX", "SENT", "STARRED", "IMPORTANT", "NONE"];
 
-// Apply initial hidden state for conditional system labels
-if (!showStarred) LABELS_HIDDEN.add("STARRED");
-if (!showImportant) LABELS_HIDDEN.add("IMPORTANT");
+/** Load settings from chrome.storage.local and initialize state. Must be called before any rendering. */
+export async function init(): Promise<void> {
+  const s = await loadSettings(SETTINGS_DEFAULTS);
+  activeLabelId = s.ca_active_label;
+  activeLabelName = s.ca_active_label_name;
+  scopeValue = s.ca_scope_value;
+  cachedScopeTimestamp = scopeToTimestamp(scopeValue);
+  labelColumns = s.ca_label_columns;
+  includeChildren = s.ca_include_children;
+  showCounts = s.ca_show_counts;
+  showStarred = s.ca_show_starred;
+  showImportant = s.ca_show_important;
+  concurrency = s.ca_concurrency;
+
+  if (!showStarred) LABELS_HIDDEN.add("STARRED");
+  if (!showImportant) LABELS_HIDDEN.add("IMPORTANT");
+}
 
 const SCOPE_OPTIONS: { value: string; label: string }[] = [
   { value: "any", label: "any" },
@@ -106,32 +121,23 @@ export function setPort(p: chrome.runtime.Port | null): void {
   port = p;
 }
 
-/** Returns settings needed by the shell for connection init messages. */
-export function getInitSettings(): { scopeTimestamp: number | null; showStarred: boolean; showImportant: boolean; concurrency: number } {
-  return { scopeTimestamp: cachedScopeTimestamp, showStarred, showImportant, concurrency };
-}
-
-/** Returns current scope timestamp for the shell to include in initWindow. */
-export function getScopeTimestamp(): number | null {
-  return cachedScopeTimestamp;
-}
 
 // ---------------------------------------------------------------------------
 // Public API — display settings (called by shell's display panel)
 // ---------------------------------------------------------------------------
 
-export function getDisplaySettings(): { labelColumns: number; includeChildren: boolean; showCounts: boolean; showStarred: boolean; showImportant: boolean; showCacheProgress: boolean; concurrency: number } {
-  return { labelColumns, includeChildren, showCounts, showStarred, showImportant, showCacheProgress, concurrency };
+export function getDisplaySettings(): { labelColumns: number; includeChildren: boolean; showCounts: boolean; showStarred: boolean; showImportant: boolean; concurrency: number } {
+  return { labelColumns, includeChildren, showCounts, showStarred, showImportant, concurrency };
 }
 
 export function setLabelColumns(value: number): void {
   labelColumns = value;
-  saveSetting(KEY_LABEL_COLUMNS, labelColumns);
+  saveSetting("ca_label_columns", labelColumns);
 }
 
 export function setIncludeChildren(value: boolean): void {
   includeChildren = value;
-  saveSetting(KEY_INCLUDE_CHILDREN, includeChildren);
+  saveSetting("ca_include_children", includeChildren);
   if (activeLabelId) {
     sendSelectionChanged();
   } else {
@@ -141,13 +147,13 @@ export function setIncludeChildren(value: boolean): void {
 
 export function setShowCounts(value: boolean): void {
   showCounts = value;
-  saveSetting(KEY_SHOW_COUNTS, showCounts);
+  saveSetting("ca_show_counts", showCounts);
 }
 
 export function setShowStarred(value: boolean): void {
   showStarred = value;
   if (showStarred) LABELS_HIDDEN.delete("STARRED"); else LABELS_HIDDEN.add("STARRED");
-  saveSetting(KEY_SHOW_STARRED, showStarred);
+  saveSetting("ca_show_starred", showStarred);
   if (!showStarred && activeLabelId === "STARRED") selectLabel(null);
   refreshLabelsIfVisible();
 }
@@ -155,20 +161,14 @@ export function setShowStarred(value: boolean): void {
 export function setShowImportant(value: boolean): void {
   showImportant = value;
   if (showImportant) LABELS_HIDDEN.delete("IMPORTANT"); else LABELS_HIDDEN.add("IMPORTANT");
-  saveSetting(KEY_SHOW_IMPORTANT, showImportant);
+  saveSetting("ca_show_important", showImportant);
   if (!showImportant && activeLabelId === "IMPORTANT") selectLabel(null);
   refreshLabelsIfVisible();
 }
 
-export function setShowCacheProgress(value: boolean): void {
-  showCacheProgress = value;
-  saveSetting(KEY_SHOW_CACHE_PROGRESS, showCacheProgress);
-  updateCacheProgress();
-}
-
 export function setConcurrency(value: number): void {
   concurrency = value;
-  saveSetting(KEY_CONCURRENCY, concurrency);
+  saveSetting("ca_concurrency", concurrency);
 }
 
 export function setScopeValue(value: string): void {
@@ -182,7 +182,7 @@ export function setScopeValue(value: string): void {
 function sendSelectionChanged(): void {
   if (!port) return;
   updateCacheProgress();
-  port.postMessage({ type: "selectionChanged", labelId: activeLabelId, includeChildren, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp });
+  port.postMessage({ type: "selectionChanged", labelId: activeLabelId, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp });
 }
 
 // ---------------------------------------------------------------------------
@@ -327,8 +327,8 @@ function renderLabelTree(nodes: LabelTreeNode[]): string {
 function selectLabel(labelId: string | null): void {
   activeLabelId = labelId;
   activeLabelName = labelId ? (cachedLabels?.find(l => l.id === labelId)?.name ?? null) : null;
-  saveSetting(KEY_ACTIVE_LABEL, activeLabelId);
-  saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
+  saveSetting("ca_active_label", activeLabelId);
+  saveSetting("ca_active_label_name", activeLabelName);
   lastLabelResult = null;
 
   document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
@@ -366,7 +366,7 @@ function setupFilterBar(): void {
   scopeSelect?.addEventListener("change", () => {
     scopeValue = scopeSelect.value;
     cachedScopeTimestamp = scopeToTimestamp(scopeValue);
-    saveSetting(KEY_SCOPE_VALUE, scopeValue);
+    saveSetting("ca_scope_value", scopeValue);
     sendSelectionChanged();
   });
 }
@@ -425,7 +425,6 @@ function addParentChain(ids: Set<string>, labels: GmailLabel[]): Set<string> {
 
 function renderFilteredLabels(): void {
   if (!cachedLabels) return;
-
   if (!activeLabelId || !lastLabelResult || lastResultsPartial) {
     // No label selected or no query result yet
     // When scope is active and labelCounts is available, hide zero-count labels.
@@ -478,7 +477,7 @@ function updateCacheProgress(): void {
   if (lastCacheProgress && lastCacheProgress.phase === "labels") {
     textParts.push(`Fetching labels ${lastCacheProgress.labelsDone}/${lastCacheProgress.labelsTotal}`);
     showSpinner = true;
-  } else if (lastCacheProgress && lastCacheProgress.phase === "scope" && (lastResultsPartial || showCacheProgress)) {
+  } else if (lastCacheProgress && lastCacheProgress.phase === "scope") {
     const count = lastCacheProgress.labelsDone > 0 ? ` ${lastCacheProgress.labelsDone}` : "";
     textParts.push(`Fetching scope${count}`);
     showSpinner = true;
@@ -527,13 +526,14 @@ function refreshLabelsIfVisible(): void {
 let isActive = true;
 
 /** Called when the search tab becomes visible. */
-export function activate(forceRefresh: boolean = false): void {
+export function activate(): void {
   isActive = true;
   if (cachedLabels) {
     sendSelectionChanged();
     renderFilteredLabels();
+  } else {
+    showContent('<div class="status">Loading labels...</div>');
   }
-  loadLabels(forceRefresh);
 }
 
 /** Called when the search tab is hidden (e.g., switching to another tab). */
@@ -541,15 +541,12 @@ export function deactivate(): void {
   isActive = false;
 }
 
-export function loadLabels(forceRefresh: boolean = false): void {
-  if (cachedLabels && !forceRefresh) {
+/** Render cached labels if available, or show loading placeholder. Labels are pushed proactively by the service worker — no fetch request needed. */
+export function renderIfReady(): void {
+  if (cachedLabels) {
     renderFilteredLabels();
-    return;
-  }
-  if (!cachedLabels) showContent('<div class="status">Loading labels...</div>');
-  if (port) {
-    fetchLabelsSeq++;
-    port.postMessage({ type: "fetchLabels", seq: fetchLabelsSeq });
+  } else {
+    showContent('<div class="status">Loading labels...</div>');
   }
 }
 
@@ -561,8 +558,8 @@ export function reset(): void {
   activeLabelName = null;
   lastLabelResult = null;
   lastCacheProgress = null;
-  saveSetting(KEY_ACTIVE_LABEL, null);
-  saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+  saveSetting("ca_active_label", null);
+  saveSetting("ca_active_label_name", null);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +568,6 @@ export function reset(): void {
 
 export function handleMessage(message: { type: string; labels?: GmailLabel[]; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; seq?: number; filterConfig?: Record<string, unknown>; partial?: boolean }): boolean {
   if (message.type === "labelsReady" && message.labels) {
-    if (message.seq !== undefined && message.seq !== fetchLabelsSeq) return true;
     cachedLabels = message.labels;
     if (message.counts) labelCounts = message.counts;
     // Validate and refresh saved label against the current account's labels
@@ -580,24 +576,20 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ph
       if (!matchedLabel || LABELS_HIDDEN.has(activeLabelId)) {
         activeLabelId = null;
         activeLabelName = null;
-        saveSetting(KEY_ACTIVE_LABEL, null);
-        saveSetting(KEY_ACTIVE_LABEL_NAME, null);
+        saveSetting("ca_active_label", null);
+        saveSetting("ca_active_label_name", null);
       } else if (matchedLabel.name !== activeLabelName) {
         activeLabelName = matchedLabel.name;
-        saveSetting(KEY_ACTIVE_LABEL_NAME, activeLabelName);
+        saveSetting("ca_active_label_name", activeLabelName);
       }
     }
-    refreshLabelsIfVisible();
+    // When a label is active but no query result yet (e.g. panel just reopened),
+    // skip rendering — the upcoming filterResults push will render the filtered view
+    // directly, avoiding a flash of all-labels before co-label filtering kicks in.
+    if (!activeLabelId || lastLabelResult) refreshLabelsIfVisible();
     return true;
   }
 
-  if (message.type === "labelsError") {
-    if (isActive && !cachedLabels) {
-      showContent('<div class="status">Loading labels...</div>');
-      setTimeout(() => { if (!cachedLabels) loadLabels(true); }, 3000);
-    }
-    return true;
-  }
 
   if (message.type === "filterResults") {
     const fc = message.filterConfig as { labelId?: string | null; scopeTimestamp?: number | null; includeChildren?: boolean } | undefined;
@@ -635,11 +627,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ph
   }
 
   return false;
-}
-
-/** Whether there's an active label that needs a selectionChanged on connect. */
-export function hasActiveLabel(): boolean {
-  return activeLabelId !== null;
 }
 
 /** Send the current selection state to the background. */
