@@ -12,13 +12,10 @@
 
 | Message | Purpose |
 |---------|---------|
-| `initWindow` | Sidepanel opened — sends windowId so service worker can track which Gmail tab belongs to which panel |
-| `selectionChanged` | User selected/deselected a label, changed scope, or toggled include-children. Carries `{ labelId, includeChildren, scope, scopeTimestamp }`. Service worker navigates Gmail and calls `setFilterConfig`. |
-| `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled) |
-| `fetchLabels` | Request Gmail label list (used on first load and account switch) |
-| `syncSettings` | Push display settings (showStarred, showImportant, concurrency) to service worker |
-| `syncState` | Push UI state (returnToInbox, onSearchTab) to service worker |
-| `setPinMode` | Change pin mode (pinned vs autohide-site) |
+| `initWindow` | Sidepanel opened — sends windowId so service worker can track which Gmail tab belongs to which panel. Always followed immediately by `selectionChanged`. |
+| `selectionChanged` | User selected/deselected a label or changed scope. Carries `{ labelId, scope, scopeTimestamp }`. Service worker navigates Gmail and calls `setFilterConfig`. Also signals the search tab is active. `includeChildren` is read from `chrome.storage.local` by the SW. |
+| `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled). Also signals the search tab is inactive. |
+| `resetCache` | Clear IndexedDB cache and restart the orchestrator from scratch |
 
 ## Message Types (service worker → sidepanel)
 
@@ -26,10 +23,9 @@
 |---------|---------|
 | `resultsReady` | Gmail tab detected — carries `accountPath` so sidepanel can initialize |
 | `notOnGmail` | Active tab is not Gmail |
-| `labelsReady` | Label list fetched — carries `labels` array (includes synthetic NONE label) |
-| `labelsError` | Label fetch failed |
+| `labelsReady` | Label list pushed proactively — carries `labels` array (includes synthetic NONE label). Sent on warm reconnect (from cache manager's in-memory list) and on cold start (when initial build begins). |
 | `filterResults` | Pushed results from cache manager — carries `labelId`, `count`, `coLabelCounts`, `counts`, `filterConfig`, `partial` |
-| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `scope-done` (scope fetch complete), `complete` (all work done, cache idle) |
+| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle) |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
 
 ## Key Flows
@@ -39,14 +35,15 @@
 All user-initiated filter changes follow the same flow. The user may click a label, deselect one, change scope, or toggle include-children — the sidepanel expresses the new filter state and the service worker + cache manager handle the rest.
 
 1. User changes filter criteria in the sidepanel (clicks label, changes scope, toggles include-children)
-2. Sidepanel sends `selectionChanged { labelId, includeChildren, scope }`
+2. Sidepanel sends `selectionChanged { labelId, scope, scopeTimestamp }`
 3. Service worker navigates Gmail immediately (resolves label names, builds URL, updates tab)
-4. Service worker calls `cacheManager.setFilterConfig({ labelId, includeChildren, scope })`
+4. Service worker calls `cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp })` (includeChildren from shared settings)
 5. Cache manager pushes results via registered callback whenever data is available:
-   - Immediately if data is cached (label indexes exist for the requested scope)
-   - During initial build, `setFilterConfig` pushes empty counts with `partial: true`; the orchestrator then pushes progressively after each label is indexed
+   - Immediately if data is cached and initial build is complete
    - After orchestrator fetches missing label/scope data
-   - Again when cache completes or refresh finishes
+   - Progressively during initial build (after each label is indexed)
+   - Suppressed during cache reset (old view stays frozen until rebuild completes)
+   - When cache refresh finishes
 6. Service worker relays each push as `filterResults` to sidepanel
 7. Sidepanel renders whatever arrives — progressively accurate counts
 
@@ -62,16 +59,34 @@ The orchestrator is driven by `setFilterConfig()` signals from the service worke
 
 1. `fetch-scope` — user has a scope but scoped ID set not yet fetched. Large scope date ranges are split into parallel segments for faster completion.
 2. `fetch-label` — user selected a label not yet in cache
-3. `fetch-label` (initial build) — labels not yet fully indexed. Always fetches all time (no date restriction). Message IDs accumulated in memory per label, written to IndexedDB once on completion. Includes the synthetic NONE label (`has:nouserlabels`).
-4. `fetch-scope` (background expansion) — pre-fetch wider scoped ID sets through expansion tiers (1w → 2w → 1m → 2m → 6m → 1y → 3y → 5y). Only runs when a scope is active and initial build is complete.
-5. `refresh-label` — cache stale (>10 min), fetch new messages per-label since lastFetchTimestamp. Updates cached scoped ID sets with new message IDs instead of clearing them.
-6. Idle — everything cached and fresh, sleep until signaled
+3. `fetch-label` (initial build) — labels not yet fully indexed. Always fetches all time (no date restriction). Message IDs accumulated in memory per label, written to IndexedDB once on completion. Includes the synthetic NONE label (`has:nouserlabels`). Results pushed progressively (suppressed during reset).
+4. `refresh-label` — cache stale (>10 min), fetch new messages per-label since lastFetchTimestamp. Updates cached scoped ID sets with new message IDs instead of clearing them.
+5. Idle — everything cached and fresh, sleep until signaled
 
 Each iteration: `decide()` → execute actions (up to concurrency limit) → loop back. Priority changes take effect on the next iteration.
 
 #### Co-Label Computation
 
 Co-labels are computed by intersecting label indexes rather than reading individual messages. For a selected label, `queryLabel` builds the set of matching message IDs, then for each other label counts `|selectedIdx ∩ otherIdx|`. No per-message IndexedDB store is needed.
+
+### Panel Open / Reconnect
+
+When the side panel opens (or reconnects after a service worker restart), the sidepanel establishes a port connection and the service worker initializes the cache orchestrator.
+
+1. Sidepanel connects, sends `initWindow { windowId }` and `selectionChanged { labelId, scope }` immediately (no roundtrip needed — uses saved label/scope from settings)
+2. Service worker finds the active Gmail tab, navigates Gmail, calls `setFilterConfig`, sends `resultsReady { accountPath }`
+3. Service worker calls `cacheManager.start(accountPath)` (idempotent — no-op if already running for same account)
+4. Service worker pushes `labelsReady` proactively (from cache manager's in-memory list on warm reconnect, or from progress callback when initial build begins)
+5. Sidepanel stores labels but skips rendering if a label is selected (avoids flash of all labels before co-label filtering)
+6. Cache manager pushes `filterResults` when data is available → sidepanel renders the filtered view
+
+**Warm reconnect** (orchestrator already running for this account): the service worker pushes both `labelsReady` and `filterResults` immediately from cached data — no API calls or build needed.
+
+Labels are never requested by the sidepanel — the service worker pushes them proactively. No `fetchLabels` request/response.
+
+**Shared settings**: display settings (showStarred, showImportant, includeChildren, concurrency, pinMode, returnToInbox) are stored in `chrome.storage.local` — readable by both sidepanel and service worker. The service worker loads them on startup and listens for changes via `chrome.storage.onChanged`. No port messages needed for settings synchronization. The service worker infers per-window tab state from `selectionChanged` (search tab active) and `filtersOff` (left search tab).
+
+See [startup-reconnect.mmd](startup-reconnect.mmd) for the full sequence diagram. See [storage-layout](storage-layout) for the complete list of storage keys and in-memory state.
 
 ### Zero-Count Label Hiding
 

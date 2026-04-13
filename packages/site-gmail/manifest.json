@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Gmail Assistant",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A Chrome extension for Gmail, part of Another Chrome Assistant project",
+  "homepage_url": "https://anothersava.github.io/chrome-assistant/",
   "permissions": [
     "activeTab",
     "alarms",
@@ -45,5 +46,5 @@
       "description": "Toggle side panel"
     }
   },
-  "minimum_chrome_version": "129"
+  "minimum_chrome_version": "134"
 }

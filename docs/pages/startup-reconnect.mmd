@@ -1,0 +1,38 @@
+sequenceDiagram
+    participant SP as Sidepanel
+    participant SW as Service Worker
+    participant CM as Cache Manager
+    participant API as Gmail API
+    participant Gmail as Gmail Tab
+
+    Note over SP,Gmail: Panel Open / Reconnect
+    SP->>SW: initWindow {windowId}
+    SP->>SW: selectionChanged {labelId, scope, scopeTimestamp}
+    Note over SP: Settings loaded from chrome.storage.local (no port sync needed)
+    SW->>SW: find active Gmail tab
+    SW->>Gmail: tabs.update(url) — navigate to match filter
+    SW->>CM: setFilterConfig(...)
+    SW->>SP: resultsReady {accountPath}
+    SW->>CM: start(accountPath)
+
+    Note over SP,Gmail: Labels + Cache Build
+    CM->>API: fetchLabels()
+    API-->>CM: labels[]
+    CM->>SW: progress callback (phase: labels)
+    SW->>SP: labelsReady {labels}
+    Note over SP: Store labels, skip render if label selected (wait for filterResults)
+    loop For each label (parallel, up to concurrency)
+        CM->>API: fetchLabelMessageIdsPage(labelId)
+        API-->>CM: {ids, nextPageToken}
+        CM->>CM: crossReferenceLabel — store labelIdx
+    end
+    CM->>SW: pushResults via callback
+    SW->>SP: filterResults {counts, coLabelCounts, partial}
+    Note over SP: Render filtered labels + counts
+
+    Note over SP,Gmail: Warm Reconnect (orchestrator already running)
+    SP->>SW: initWindow {windowId}
+    SP->>SW: selectionChanged {labelId, scope, scopeTimestamp}
+    SW->>SP: resultsReady {accountPath}
+    SW->>SP: labelsReady {labels} (from cache)
+    SW->>SP: filterResults (immediate push from cached data)
