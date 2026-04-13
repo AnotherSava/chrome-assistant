@@ -91,36 +91,33 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:Label_2", ["m3", "m4"]);
     });
 
-    it("returns count and co-occurring labels for a label", async () => {
+    it("returns co-occurring labels for a label", async () => {
       const result = await manager.queryLabel("INBOX", false);
-      expect(result.count).toBe(3); // m1, m2, m4
       expect(result.coLabelCounts).toHaveProperty("Label_1");
       expect(result.coLabelCounts).toHaveProperty("SENT");
       expect(result.coLabelCounts).toHaveProperty("Label_2");
     });
 
-    it("returns all messages for a label without location filtering", async () => {
+    it("returns co-labels for a label without location filtering", async () => {
       const result = await manager.queryLabel("Label_1", false);
-      expect(result.count).toBe(2); // m1, m2
+      expect(result.coLabelCounts).toHaveProperty("INBOX");
     });
 
-    it("returns filtered results when scope is active", async () => {
-      // Seed scoped ID set directly — only m2 and m4 are in scope
+    it("returns filtered co-labels when scope is active", async () => {
       (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(2500, new Set(["m2", "m4"]));
 
       const result = await manager.queryLabel("INBOX", false, 2500);
-      expect(result.count).toBe(2); // m2 and m4 are in scoped INBOX index
+      expect(result.coLabelCounts).toHaveProperty("Label_1");
+      expect(result.coLabelCounts).toHaveProperty("Label_2");
     });
 
     it("returns empty result for unknown label", async () => {
       const result = await manager.queryLabel("NONEXISTENT", false);
-      expect(result.count).toBe(0);
       expect(result.coLabelCounts).toEqual({});
     });
 
     it("returns empty for uncached label (orchestrator will fetch it later)", async () => {
       const result = await manager.queryLabel("Label_uncached", false);
-      expect(result.count).toBe(0);
       expect(result.coLabelCounts).toEqual({});
     });
 
@@ -149,7 +146,6 @@ describe("CacheManager", () => {
       // Query Work with includeChildren — should include Work, Work/Projects, Work/Projects/Alpha
       const result = await mgr.queryLabel("Label_1", true);
       expect(result.labelId).toBe("Label_1");
-      expect(result.count).toBe(3); // m1, m2, m3 (deduplicated)
       // Primary label excluded, descendants appear as co-labels
       expect(result.coLabelCounts).not.toHaveProperty("Label_1");
       expect(result.coLabelCounts).toHaveProperty("Label_2");
@@ -172,9 +168,9 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
       mockDb._meta.set("labelIdx:Label_2", ["m2"]);
 
-      // Query Work without children — should only get m1
+      // Query Work without children — should not include Work/Projects as co-label
       const result = await mgr.queryLabel("Label_1", false);
-      expect(result.count).toBe(1);
+      expect(result.coLabelCounts).not.toHaveProperty("Label_2");
     });
   });
 
@@ -420,7 +416,7 @@ describe("CacheManager", () => {
       (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(2000, new Set(["m2", "m3"]));
 
       const result = await manager.queryLabel("INBOX", false, 2000);
-      expect(result.count).toBe(2); // m2, m3 (m1 not in scope)
+      // co-labels filtered by scope
       expect(result.coLabelCounts["Label_1"]).toBe(1); // m2 only
       expect(result.coLabelCounts["Label_2"]).toBe(1); // m3 only
     });
@@ -439,7 +435,10 @@ describe("CacheManager", () => {
     it("null scope reads from IndexedDB directly", async () => {
       manager.setLabels(scopeLabels);
       const result = await manager.queryLabel("INBOX", false, null);
-      expect(result.count).toBe(3); // All three messages from IndexedDB label index
+      // null scope — all 3 INBOX messages, unfiltered
+      expect(result.coLabelCounts["SENT"]).toBe(2); // m2, m3
+      expect(result.coLabelCounts["Label_1"]).toBe(2); // m1, m2
+      expect(result.coLabelCounts["Label_2"]).toBe(1); // m3
     });
 
     it("multi-window: different scopes return correct filtered results", async () => {
@@ -448,10 +447,13 @@ describe("CacheManager", () => {
       (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.set(3000, new Set(["m3"]));
 
       const result2000 = await manager.queryLabel("INBOX", false, 2000);
-      expect(result2000.count).toBe(2);
+      expect(Object.keys(result2000.coLabelCounts).length).toBeGreaterThan(0);
 
       const result3000 = await manager.queryLabel("INBOX", false, 3000);
-      expect(result3000.count).toBe(1);
+      // Scope 3000 only has m3 — INBOX co-labels should reflect that
+      expect(result3000.coLabelCounts["SENT"]).toBe(1); // m3
+      expect(result3000.coLabelCounts["Label_2"]).toBe(1); // m3
+      expect(result3000.coLabelCounts["Label_1"]).toBeUndefined(); // m1, m2 not in scope
 
       const counts2000 = await manager.getLabelCounts(undefined, 2000);
       expect(counts2000["INBOX"].own).toBe(2);
@@ -464,9 +466,10 @@ describe("CacheManager", () => {
 
       (manager as unknown as { scopedIdSets: Map<number, Set<string>> }).scopedIdSets.clear();
 
-      // After clear, expectedScope=2000 falls through to unscoped DB read
+      // After clear, expectedScope=2000 falls through to unscoped DB read — returns all messages
       const result = await manager.queryLabel("INBOX", false, 2000);
-      expect(result.count).toBe(3); // m1, m2, m3 — unscoped
+      expect(result.coLabelCounts["SENT"]).toBe(2); // unscoped: m2, m3
+      expect(result.coLabelCounts["Label_1"]).toBe(2); // unscoped: m1, m2
     });
   });
 
@@ -1057,7 +1060,6 @@ describe("CacheManager", () => {
 
       expect(pushes.length).toBe(1);
       expect(pushes[0].labelId).toBe("INBOX");
-      expect(pushes[0].count).toBe(2);
       expect(pushes[0].coLabelCounts).toEqual({ Label_1: 1, Label_2: 1 });
       expect(pushes[0].filterConfig).toEqual({ labelId: "INBOX", includeChildren: false, scopeTimestamp: null });
       // counts should include label counts
@@ -1097,9 +1099,8 @@ describe("CacheManager", () => {
       await startPromise;
 
       // Should have pushed at least once with real data (when INBOX label is indexed and it's the selected label)
-      const inboxPushes = pushes.filter(p => p.labelId === "INBOX" && p.count > 0);
+      const inboxPushes = pushes.filter(p => p.labelId === "INBOX" && p.counts["INBOX"]?.own > 0);
       expect(inboxPushes.length).toBeGreaterThanOrEqual(1);
-      expect(inboxPushes[0].count).toBe(1);
       expect(inboxPushes[0].filterConfig.labelId).toBe("INBOX");
     });
 

@@ -5,7 +5,7 @@ sequenceDiagram
     participant Gmail as Gmail Tab
 
     Note over SP,Gmail: Label Selection
-    SP->>SW: selectionChanged {labelId, scope, scopeTimestamp}
+    SP->>SW: selectionChanged {labelId, scopeTimestamp}
     SW->>Gmail: tabs.update(url) — label/search hash
     SW->>CM: setFilterConfig({labelId, includeChildren, scopeTimestamp}) (includeChildren from settings)
     CM->>CM: pushResults — queryLabel + getLabelCounts

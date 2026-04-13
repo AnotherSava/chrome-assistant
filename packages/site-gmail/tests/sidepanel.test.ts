@@ -44,11 +44,12 @@ const mockPort = {
 setupDOM();
 const mod = await import("../src/sidepanel.js");
 await mod.ready;
-const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue } = mod;
+const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue, resetSearchTab } = mod;
 
 describe("handleMessage", () => {
   beforeEach(() => {
     setupDOM();
+    resetSearchTab();
     vi.clearAllMocks();
   });
 
@@ -117,7 +118,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Simulate background returning filterResults — only Label_2 co-occurs
-    handleMessage({ type: "filterResults", labelId: "Label_1", count: 42, coLabelCounts: { Label_2: 1 } });
+    handleMessage({ type: "filterResults", labelId: "Label_1", coLabelCounts: { Label_2: 1 } });
 
     // Content should show Work and Personal but not Archive
     const content = document.getElementById("content");
@@ -149,7 +150,7 @@ describe("handleMessage", () => {
     // Select then deselect
     const workLink = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
     workLink?.click();
-    handleMessage({ type: "filterResults", labelId: "Label_1", count: 5, coLabelCounts: {} });
+    handleMessage({ type: "filterResults", labelId: "Label_1", coLabelCounts: {} });
 
     // After filterResults, Personal might be hidden. Now deselect:
     const workLink2 = document.querySelector('[data-label-id="Label_1"]') as HTMLAnchorElement;
@@ -174,7 +175,7 @@ describe("handleMessage", () => {
     workLink?.click();
 
     // Result arrives for a different label (stale result) — should be ignored
-    handleMessage({ type: "filterResults", labelId: "Label_999", count: 0, coLabelCounts: {} });
+    handleMessage({ type: "filterResults", labelId: "Label_999", coLabelCounts: {} });
 
     // Both labels should still be visible (no filtering applied from stale result)
     const content = document.getElementById("content");
@@ -210,11 +211,11 @@ describe("handleMessage", () => {
     expect(selectionMessages).toHaveLength(0);
   });
 
-  it("handles labelsError gracefully when no labels cached", () => {
+  it("ignores unrecognized message types and preserves existing content", () => {
     // Force a fresh Gmail state by switching accounts (clears cachedLabels)
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/99/" });
-    // Now labelsError should show error since cachedLabels is null after account switch
+    // Unrecognized message type is silently ignored — loading placeholder remains
     handleMessage({ type: "labelsError" });
 
     const content = document.getElementById("content");
@@ -287,6 +288,7 @@ describe("sendSelectionChanged with include children", () => {
 describe("label counts rendering", () => {
   beforeEach(() => {
     setupDOM();
+    resetSearchTab();
     vi.clearAllMocks();
     setShowCounts(true);
   });
@@ -346,7 +348,7 @@ describe("label counts rendering", () => {
     workLink?.click();
 
     // Simulate filterResults with co-label counts
-    handleMessage({ type: "filterResults", labelId: "Label_1", count: 10, coLabelCounts: { Label_2: 3 } });
+    handleMessage({ type: "filterResults", labelId: "Label_1", coLabelCounts: { Label_2: 3 } });
 
     const content = document.getElementById("content");
     const countSpans = content?.querySelectorAll(".label-count");
@@ -376,7 +378,7 @@ describe("label counts rendering", () => {
     workLink?.click();
 
     // Push filterResults with filterConfig (no seq) — should update UI
-    handleMessage({ type: "filterResults", labelId: "Label_1", count: 15, coLabelCounts: { Label_2: 4 }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: null } });
+    handleMessage({ type: "filterResults", labelId: "Label_1", coLabelCounts: { Label_2: 4 }, counts: { Label_1: { own: 15, inclusive: 15 }, Label_2: { own: 4, inclusive: 4 } }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: null } });
 
     const content = document.getElementById("content");
     const workCount = content?.querySelector('[data-label-id="Label_1"] .label-count');
@@ -401,7 +403,7 @@ describe("label counts rendering", () => {
     workLink?.click();
 
     // Push filterResults with a stale filterConfig (wrong scopeTimestamp)
-    handleMessage({ type: "filterResults", labelId: "Label_1", count: 99, coLabelCounts: { Label_2: 50 }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: 999 } });
+    handleMessage({ type: "filterResults", labelId: "Label_1", coLabelCounts: { Label_2: 50 }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: 999 } });
 
     // Should NOT have applied — no count shown for this stale result
     const content = document.getElementById("content");
@@ -447,6 +449,7 @@ describe("label counts rendering", () => {
 describe("system labels in label tree", () => {
   beforeEach(() => {
     setupDOM();
+    resetSearchTab();
     vi.clearAllMocks();
     setShowStarred(false);
     setShowImportant(false);
@@ -523,6 +526,7 @@ describe("system labels in label tree", () => {
 describe("hide zero-count labels when scope is active", () => {
   beforeEach(() => {
     setupDOM();
+    resetSearchTab();
     vi.clearAllMocks();
     setShowCounts(true);
   });

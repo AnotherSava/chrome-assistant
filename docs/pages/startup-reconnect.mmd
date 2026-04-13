@@ -7,7 +7,7 @@ sequenceDiagram
 
     Note over SP,Gmail: Panel Open / Reconnect
     SP->>SW: initWindow {windowId}
-    SP->>SW: selectionChanged {labelId, scope, scopeTimestamp}
+    SP->>SW: selectionChanged {labelId, scopeTimestamp}
     Note over SP: Settings loaded from chrome.storage.local (no port sync needed)
     SW->>SW: find active Gmail tab
     SW->>Gmail: tabs.update(url) — navigate to match filter
@@ -32,7 +32,7 @@ sequenceDiagram
 
     Note over SP,Gmail: Warm Reconnect (orchestrator already running)
     SP->>SW: initWindow {windowId}
-    SP->>SW: selectionChanged {labelId, scope, scopeTimestamp}
+    SP->>SW: selectionChanged {labelId, scopeTimestamp}
     SW->>SP: resultsReady {accountPath}
     SW->>SP: labelsReady {labels} (from cache)
     SW->>SP: filterResults (immediate push from cached data)

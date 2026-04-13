@@ -23,7 +23,7 @@ const CACHE_ALARM_NAME = "cache-keepalive";
 
 /** Relay cache manager result pushes to all connected sidepanel ports. For ports whose last selection differs from the pushed filterConfig, compute and send their own results so multi-window use stays fresh. */
 function relayResultPush(result: ResultPush): void {
-  const { labelId, count, coLabelCounts, counts, filterConfig, partial } = result;
+  const { labelId, coLabelCounts, counts, filterConfig, partial } = result;
   // Ensure all active port scopes are fetched by the orchestrator (multi-window support)
   for (const [, s] of portState) {
     const ts = s.lastSelection?.scopeTimestamp ?? s.lastScopeTimestamp;
@@ -39,7 +39,7 @@ function relayResultPush(result: ResultPush): void {
       // Bump generation to invalidate any in-flight pushResultsForPort() for this port
       state.pushGeneration++;
       try {
-        port.postMessage({ type: "filterResults", labelId, count, coLabelCounts, counts, filterConfig, partial });
+        port.postMessage({ type: "filterResults", labelId, coLabelCounts, counts, filterConfig, partial });
       } catch { /* port may be dead */ }
     } else {
       // This port has a different selection or scope — compute its own results
@@ -58,20 +58,18 @@ function pushResultsForPort(port: chrome.runtime.Port, sel: PortSelection): void
   const myGeneration = ++state.pushGeneration;
   const portFilterConfig = { labelId, includeChildren, scopeTimestamp };
   (async () => {
-    let portCount = 0;
     let portCoLabelCounts: Record<string, number> = {};
     if (labelId !== null) {
       const result = await cacheManager.queryLabel(labelId, includeChildren, scopeTimestamp);
       // Discard if a newer push started for this port
       if (state.pushGeneration !== myGeneration) return;
-      portCount = result.count;
       portCoLabelCounts = result.coLabelCounts;
     }
     const portCounts = await cacheManager.getLabelCounts(undefined, scopeTimestamp);
     // Discard if a newer push started for this port
     if (state.pushGeneration !== myGeneration) return;
     try {
-      port.postMessage({ type: "filterResults", labelId, count: portCount, coLabelCounts: portCoLabelCounts, counts: portCounts, filterConfig: portFilterConfig, partial: !cacheManager.isInitialBuildComplete() });
+      port.postMessage({ type: "filterResults", labelId, coLabelCounts: portCoLabelCounts, counts: portCounts, filterConfig: portFilterConfig, partial: !cacheManager.isInitialBuildComplete() });
     } catch { /* port may be dead */ }
   })().catch(() => { /* swallow errors */ });
 }
@@ -81,7 +79,7 @@ cacheManager.setResultCallback(relayResultPush);
 let labelsPushed = false;
 cacheManager.setProgressCallback((progress: CacheProgress) => {
   // Push labels to all ports when they first become available (cold start)
-  if (!labelsPushed && progress.phase === "labels") {
+  if (!labelsPushed && (progress.phase === "labels" || progress.phase === "complete")) {
     const labels = cacheManager.getLabels();
     if (labels.length > 0) {
       labelsPushed = true;
@@ -111,7 +109,17 @@ function applySharedSettings(settings: Record<string, unknown>): void {
     cacheManager.updateSystemLabelSettings(settings.ca_show_starred as boolean ?? cacheManager.showStarred, settings.ca_show_important as boolean ?? cacheManager.showImportant);
     if (cacheManager.isOrchestratorRunning()) cacheManager.wakeOrchestrator();
   }
-  if ("ca_include_children" in settings) includeChildren = settings.ca_include_children as boolean;
+  if ("ca_include_children" in settings) {
+    includeChildren = settings.ca_include_children as boolean;
+    // Re-apply filter config and re-navigate Gmail tabs with updated includeChildren
+    const config = cacheManager.getFilterConfig();
+    cacheManager.setFilterConfig({ ...config, includeChildren });
+    for (const [, s] of portState) {
+      if (s.lastSelection && s.gmailTabId !== null && s.gmailTabUrl) {
+        navigateToSelection(s.gmailTabId, s.gmailTabUrl, s.lastSelection);
+      }
+    }
+  }
   if ("ca_concurrency" in settings) cacheManager.setConcurrency(settings.ca_concurrency as number);
   if ("ca_pin_mode" in settings) pinMode = settings.ca_pin_mode as PinMode;
   if ("ca_return_to_inbox" in settings) returnToInbox = settings.ca_return_to_inbox as boolean;
@@ -165,6 +173,7 @@ function getScopeForWindow(windowId?: number): number | null | undefined {
 /** Start the orchestrator for a Gmail account. Idempotent — if already running for the same account, does nothing. On account change, stops and restarts. */
 export function startOrchestrator(accountPath: string, scopeTimestamp?: number | null): void {
   if (cacheManager.isOrchestratorRunning() && currentAccountPath === accountPath) return;
+  labelsPushed = false;
   // Invalidate any in-flight pushResultsForPort() calls for all ports so stale data
   // from the previous account doesn't leak through after the switch.
   for (const [, state] of portState) state.pushGeneration++;
@@ -240,6 +249,27 @@ async function closePanel(tabId: number): Promise<void> {
   }
 }
 
+/** Convert a scope timestamp to a date string for Gmail search queries. Returns null if timestamp is null. */
+function scopeDateString(scopeTimestamp: number | null): string | null {
+  if (scopeTimestamp === null) return null;
+  const d = new Date(scopeTimestamp);
+  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Navigate a Gmail tab to match a selection. If labelId is set, navigates to the label view; otherwise navigates to the scope/all view. */
+function navigateToSelection(tabId: number, tabUrl: string, sel: PortSelection): void {
+  const base = `https://mail.google.com${gmailAccountPath(tabUrl)}`;
+  const scope = scopeDateString(sel.scopeTimestamp);
+  if (sel.labelId) {
+    navigateGmailToLabel(tabId, base, sel.labelId, scope);
+  } else {
+    navGeneration.set(tabId, (navGeneration.get(tabId) ?? 0) + 1);
+    const url = buildGmailUrl(base, null, scope);
+    lastExtensionNavHash.set(tabId, urlHash(url));
+    chrome.tabs.update(tabId, { url });
+  }
+}
+
 /** Navigate a Gmail tab to show the given label. Uses cached labels for URL building; falls back to loadLabels if empty. A generation guard prevents stale loadLabels callbacks from overriding a newer navigation after rapid label changes. */
 function navigateGmailToLabel(tabId: number, base: string, labelId: string, scope: string | null): void {
   const gen = (navGeneration.get(tabId) ?? 0) + 1;
@@ -299,7 +329,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; windowId?: number }) => {
+  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -315,6 +345,11 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           const wasAlreadyRunning = cacheManager.isOrchestratorRunning() && currentAccountPath === account;
           port.postMessage({ type: "resultsReady", accountPath: account });
           startOrchestrator(account, getScopeForWindow(message.windowId));
+          // Apply pending selection — selectionChanged may have arrived before
+          // gmailTabId was set, so its navigation was skipped. Navigate now.
+          if (state.lastSelection) {
+            navigateToSelection(tab.id, tab.url!, state.lastSelection);
+          }
           // When the orchestrator is already warm, push cached labels and counts immediately
           if (wasAlreadyRunning) {
             const labels = cacheManager.getLabels();
@@ -334,23 +369,11 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       state.onSearchTab = true;
       const labelId = message.labelId ?? null;
       const scopeTimestamp = message.scopeTimestamp ?? null;
-      const scope = message.scope ?? null;
       state.lastSelection = { labelId, scopeTimestamp };
       state.lastScopeTimestamp = scopeTimestamp;
       // Navigate Gmail immediately — independent of cache manager
       if (state.gmailTabId !== null && state.gmailTabUrl) {
-        const base = `https://mail.google.com${gmailAccountPath(state.gmailTabUrl)}`;
-        if (labelId === null) {
-          // Invalidate any pending navigateGmailToLabel callbacks so a stale loadLabels
-          // completion doesn't navigate back to the old label after deselection.
-          navGeneration.set(state.gmailTabId, (navGeneration.get(state.gmailTabId) ?? 0) + 1);
-          const url = buildGmailUrl(base, null, scope);
-          lastExtensionNavHash.set(state.gmailTabId, urlHash(url));
-          chrome.tabs.update(state.gmailTabId, { url });
-        } else {
-          // Best-effort navigation with currently available labels
-          navigateGmailToLabel(state.gmailTabId, base, labelId, scope);
-        }
+        navigateToSelection(state.gmailTabId, state.gmailTabUrl, state.lastSelection!);
       }
       // Inform cache manager — it will push results via callback when data is available
       cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp });
@@ -409,9 +432,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (lastHash && (currentHash === lastHash || currentHash.startsWith(lastHash + "/"))) {
       // Hash matches (or is a sub-path of) what the extension navigated to — not a user action
     } else if (isGmailListView(changeInfo.url)) {
-      // User navigated to a different list view — clear stored hash and notify sidepanel
+      // User navigated to a different list view — clear stored hash, mark filters off, and notify sidepanel
       lastExtensionNavHash.delete(tabId);
-      if (tab.windowId !== undefined) broadcastToWindow(tab.windowId, { type: "userNavigated" });
+      if (tab.windowId !== undefined) {
+        for (const [, s] of portState) {
+          if (s.windowId === tab.windowId) s.onSearchTab = false;
+        }
+        broadcastToWindow(tab.windowId, { type: "userNavigated" });
+      }
     }
   }
   if (portState.size === 0) return;

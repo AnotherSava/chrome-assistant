@@ -17,7 +17,6 @@ export interface CacheProgress {
 
 export interface LabelQueryResult {
   labelId: string;
-  count: number;
   coLabelCounts: Record<string, number>;
 }
 
@@ -25,7 +24,6 @@ export type ProgressCallback = (progress: CacheProgress) => void;
 
 export interface ResultPush {
   labelId: string | null;
-  count: number;
   coLabelCounts: Record<string, number>;
   counts: Record<string, { own: number; inclusive: number }>;
   filterConfig: FilterConfig;
@@ -659,7 +657,6 @@ export class CacheManager {
     this.loopPromise = null;
   }
 
-  /** Stop the orchestrator loop. */
   /** Clear all cached data (IndexedDB + in-memory state) and stop the orchestrator. Call start() after to rebuild from scratch. */
   async reset(): Promise<void> {
     this.stop();
@@ -680,6 +677,7 @@ export class CacheManager {
     this.lastProgressWasComplete = false;
   }
 
+  /** Stop the orchestrator loop. */
   stop(): void {
     this.orchestratorRunning = false;
     // Invalidate any in-flight fire-and-forget pushResults() calls so they don't
@@ -780,7 +778,7 @@ export class CacheManager {
       if (count > 0) coLabelCounts[label.id] = count;
     }
 
-    return { labelId, count: selectedMsgIds.size, coLabelCounts };
+    return { labelId, coLabelCounts };
   }
 
   /** Mark a label as processed so decide() skips it.
@@ -864,20 +862,18 @@ export class CacheManager {
     if (config.scopeTimestamp !== null && !this.scopedIdSets.has(config.scopeTimestamp)) return;
     const myGeneration = ++this.pushGeneration;
     try {
-      let count = 0;
       let coLabelCounts: Record<string, number> = {};
       if (config.labelId !== null) {
         const result = await this.queryLabel(config.labelId, config.includeChildren, config.scopeTimestamp);
         // Discard if a newer pushResults call started or filter config changed during async work
         if (this.pushGeneration !== myGeneration) return;
-        count = result.count;
         coLabelCounts = result.coLabelCounts;
       }
       const counts = await this.getLabelCounts(undefined, config.scopeTimestamp);
       // Discard if a newer pushResults call started or filter config changed during async work
       if (this.pushGeneration !== myGeneration) return;
       const allProcessed = this.buildLabelQueryList().every(l => this.processedLabels.has(l.id));
-      this.onResult({ labelId: config.labelId, count, coLabelCounts, counts, filterConfig: config, partial: !allProcessed });
+      this.onResult({ labelId: config.labelId, coLabelCounts, counts, filterConfig: config, partial: !allProcessed });
     } catch {
       // Swallow errors — push is best-effort
     }

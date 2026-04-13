@@ -40,9 +40,11 @@ let concurrency = 10;
 let cachedLabels: GmailLabel[] | null = null;
 let labelCounts: Record<string, { own: number; inclusive: number }> | null = null;
 let lastCacheProgress: { phase: string; labelsTotal: number; labelsDone: number; currentLabel?: string; error?: string } | null = null;
-let lastLabelResult: { labelId: string; count: number; coLabelCounts: Record<string, number> } | null = null;
+let lastLabelResult: { labelId: string; coLabelCounts: Record<string, number> } | null = null;
 /** Whether the last pushed results are partial (initial build in progress) — don't hide zero-count labels from partial results */
 let lastResultsPartial = true;
+/** Whether labels have been rendered at least once — used to skip labelsReady render on reconnect */
+let labelsRendered = false;
 
 const LABELS_HIDDEN = new Set(["CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
 /** System labels shown in fixed order before user labels */
@@ -106,12 +108,6 @@ export function scopeToTimestamp(scopeValue: string): number | null {
   return d.getTime();
 }
 
-function scopeToDate(): string | null {
-  const ts = scopeToTimestamp(scopeValue);
-  if (ts === null) return null;
-  const d = new Date(ts);
-  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-}
 
 // ---------------------------------------------------------------------------
 // Public API — port & settings
@@ -138,11 +134,9 @@ export function setLabelColumns(value: number): void {
 export function setIncludeChildren(value: boolean): void {
   includeChildren = value;
   saveSetting("ca_include_children", includeChildren);
-  if (activeLabelId) {
-    sendSelectionChanged();
-  } else {
-    refreshLabelsIfVisible();
-  }
+  // SW reacts via onSettingChanged — re-navigates Gmail and pushes updated results.
+  // Local re-render only needed when no label is active (no push will come).
+  if (!activeLabelId) refreshLabelsIfVisible();
 }
 
 export function setShowCounts(value: boolean): void {
@@ -182,7 +176,7 @@ export function setScopeValue(value: string): void {
 function sendSelectionChanged(): void {
   if (!port) return;
   updateCacheProgress();
-  port.postMessage({ type: "selectionChanged", labelId: activeLabelId, scope: scopeToDate(), scopeTimestamp: cachedScopeTimestamp });
+  port.postMessage({ type: "selectionChanged", labelId: activeLabelId, scopeTimestamp: cachedScopeTimestamp });
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +265,13 @@ function splitIntoColumns(nodes: LabelTreeNode[], numColumns: number): LabelTree
 function getLabelCount(labelId: string): number | null {
   if (!showCounts) return null;
   if (activeLabelId && lastLabelResult) {
-    if (labelId === activeLabelId) return lastLabelResult.count;
+    if (labelId === activeLabelId) {
+      // Active label count comes from labelCounts (same source as all other labels)
+      if (!labelCounts) return null;
+      const entry = labelCounts[labelId];
+      if (!entry) return null;
+      return includeChildren ? entry.inclusive : entry.own;
+    }
     const count = lastLabelResult.coLabelCounts[labelId];
     return count !== undefined ? count : null;
   }
@@ -333,7 +333,7 @@ function selectLabel(labelId: string | null): void {
 
   document.querySelectorAll<HTMLElement>(".label-link").forEach((l) => l.classList.remove("active"));
   if (labelId) {
-    document.querySelector<HTMLElement>(`.label-link[data-label-id="${labelId}"]`)?.classList.add("active");
+    document.querySelector<HTMLElement>(`.label-link[data-label-id="${CSS.escape(labelId)}"]`)?.classList.add("active");
   } else {
     renderFilteredLabels();
   }
@@ -372,6 +372,7 @@ function setupFilterBar(): void {
 }
 
 function renderLabels(labels: GmailLabel[]): void {
+  labelsRendered = true;
   try {
     const contentEl = document.getElementById("content");
     if (!contentEl) return;
@@ -558,6 +559,7 @@ export function reset(): void {
   activeLabelName = null;
   lastLabelResult = null;
   lastCacheProgress = null;
+  labelsRendered = false;
   saveSetting("ca_active_label", null);
   saveSetting("ca_active_label_name", null);
 }
@@ -566,7 +568,7 @@ export function reset(): void {
 // Public API — message handling (returns true if handled)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; seq?: number; filterConfig?: Record<string, unknown>; partial?: boolean }): boolean {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean }): boolean {
   if (message.type === "labelsReady" && message.labels) {
     cachedLabels = message.labels;
     if (message.counts) labelCounts = message.counts;
@@ -583,10 +585,9 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ph
         saveSetting("ca_active_label_name", activeLabelName);
       }
     }
-    // When a label is active but no query result yet (e.g. panel just reopened),
-    // skip rendering — the upcoming filterResults push will render the filtered view
-    // directly, avoiding a flash of all-labels before co-label filtering kicks in.
-    if (!activeLabelId || lastLabelResult) refreshLabelsIfVisible();
+    // If labels are already displayed, keep the current view — filterResults will
+    // re-render with fresh data. If nothing is displayed yet, render immediately.
+    if (!labelsRendered) refreshLabelsIfVisible();
     return true;
   }
 
@@ -603,7 +604,7 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ph
       lastResultsPartial = !!message.partial;
     }
     if (message.labelId !== undefined && message.labelId !== null && message.labelId === activeLabelId && (!fc || (fc.labelId === activeLabelId && fc.scopeTimestamp === cachedScopeTimestamp && fc.includeChildren === includeChildren))) {
-      lastLabelResult = { labelId: message.labelId, count: message.count ?? 0, coLabelCounts: message.coLabelCounts ?? {} };
+      lastLabelResult = { labelId: message.labelId, coLabelCounts: message.coLabelCounts ?? {} };
       labelResultChanged = true;
     }
     if (labelResultChanged || (countsChanged && !lastResultsPartial)) {

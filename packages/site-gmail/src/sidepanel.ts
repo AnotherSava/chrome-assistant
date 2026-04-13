@@ -5,7 +5,7 @@ import type { PinMode, GmailLabel } from "@core/types.js";
 import * as searchTab from "./search-tab.js";
 
 // Re-export for tests
-export { scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue } from "./search-tab.js";
+export { scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue, reset as resetSearchTab } from "./search-tab.js";
 
 let currentTab: "summary" | "search" = "search";
 let onGmailPage = false;
@@ -196,11 +196,7 @@ function buildDisplayPanel(): void {
   const countsCheck = document.getElementById("show-counts-check") as HTMLInputElement;
   countsCheck.addEventListener("change", () => {
     searchTab.setShowCounts(countsCheck.checked);
-    if (countsCheck.checked) {
-      searchTab.renderIfReady();
-    } else if (currentTab === "search") {
-      searchTab.renderIfReady();
-    }
+    if (currentTab === "search") searchTab.renderIfReady();
   });
   const starredCheck = document.getElementById("show-starred-check") as HTMLInputElement;
   starredCheck.addEventListener("change", () => {
@@ -272,7 +268,7 @@ function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): 
     showSummary();
   } else {
     switchZoomContext("gmail");
-    searchTab.activate(true);
+    searchTab.activate();
   }
 }
 
@@ -331,7 +327,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; count?: number; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; complete?: boolean; seq?: number; filterConfig?: Record<string, unknown>; partial?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;

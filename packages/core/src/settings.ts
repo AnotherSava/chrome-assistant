@@ -27,7 +27,7 @@ export function onSettingChanged(callback: (changes: Record<string, unknown>) =>
     const parsed: Record<string, unknown> = {};
     for (const [key, change] of Object.entries(changes)) {
       if (change.newValue !== undefined) {
-        try { parsed[key] = JSON.parse(change.newValue as string); } catch { parsed[key] = change.newValue; }
+        try { parsed[key] = JSON.parse(change.newValue as string); } catch { /* skip unparseable values — consistent with loadSettings */ }
       }
     }
     if (Object.keys(parsed).length > 0) callback(parsed);
