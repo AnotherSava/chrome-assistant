@@ -31,7 +31,7 @@ const mockPort = {
     connect: vi.fn(() => mockPort),
     id: "test-extension-id",
   },
-  storage: { session: { get: vi.fn(), set: vi.fn() } },
+  storage: { local: { get: vi.fn().mockResolvedValue({}), set: vi.fn() }, onChanged: { addListener: vi.fn() } },
   sidePanel: { setPanelBehavior: vi.fn() },
   commands: { getAll: vi.fn((cb: Function) => cb([])) },
   action: { setTitle: vi.fn(), onClicked: { addListener: vi.fn() } },
@@ -42,7 +42,9 @@ const mockPort = {
 };
 
 setupDOM();
-const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue } = await import("../src/sidepanel.js");
+const mod = await import("../src/sidepanel.js");
+await mod.ready;
+const { handleMessage, scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue } = mod;
 
 describe("handleMessage", () => {
   beforeEach(() => {
@@ -50,10 +52,10 @@ describe("handleMessage", () => {
     vi.clearAllMocks();
   });
 
-  it("handles resultsReady by requesting labels", () => {
+  it("handles resultsReady by showing tab bar", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    // Should post fetchLabels to background
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "fetchLabels" }));
+    const tabBar = document.getElementById("tab-bar");
+    expect(tabBar?.style.display).not.toBe("none");
   });
 
   it("handles labelsReady by rendering labels", () => {
@@ -180,15 +182,16 @@ describe("handleMessage", () => {
     expect(content?.innerHTML).toContain("Personal");
   });
 
-  it("handles account change by clearing state", () => {
+  it("handles account change by clearing labels", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [{ id: "Label_1", name: "Work", type: "user" }] });
 
-    // Switch account
+    // Switch account — old labels should be cleared
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/1/" });
 
-    // Should request new labels
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "fetchLabels" }));
+    // Content should show loading (old labels cleared, new ones not yet pushed)
+    const content = document.getElementById("content");
+    expect(content?.innerHTML).toContain("Loading");
   });
 
   it("does not re-query from sidepanel when cache completes (service worker handles it)", () => {
@@ -262,52 +265,22 @@ describe("sendSelectionChanged with include children", () => {
     setIncludeChildren(true);
   });
 
-  it("sends selectionChanged with includeChildren true when setting is on", () => {
-    // Default includeChildren is true (from loadSetting default)
-    handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
-    handleMessage({ type: "labelsReady", labels: [
-      { id: "L1", name: "Games", type: "user" },
-      { id: "L2", name: "Games/18xx", type: "user" },
-      { id: "L3", name: "Games/Chess", type: "user" },
-      { id: "L4", name: "Work", type: "user" },
-    ] });
-    vi.clearAllMocks();
-
-    // Click parent label "Games"
-    const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
-    link?.click();
-
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "selectionChanged",
-      labelId: "L1",
-      includeChildren: true,
-    }));
-  });
-
-  it("sends selectionChanged with includeChildren false when setting is off", () => {
-    setIncludeChildren(false);
-
+  it("sends selectionChanged without includeChildren (read from shared settings by SW)", () => {
     handleMessage({ type: "resultsReady", accountPath: "/mail/u/0/" });
     handleMessage({ type: "labelsReady", labels: [
       { id: "L1", name: "Games", type: "user" },
       { id: "L2", name: "Games/18xx", type: "user" },
       { id: "L3", name: "Work", type: "user" },
     ] });
-
-    // Deselect any previously active label (state persists across tests)
-    const activeLink = document.querySelector('.label-link.active') as HTMLAnchorElement;
-    if (activeLink) activeLink.click();
     vi.clearAllMocks();
 
-    // Click parent label "Games"
     const link = document.querySelector('[data-label-id="L1"]') as HTMLAnchorElement;
     link?.click();
 
-    expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
-      type: "selectionChanged",
-      labelId: "L1",
-      includeChildren: false,
-    }));
+    const call = mockPostMessage.mock.calls.find((c: unknown[]) => (c[0] as Record<string, unknown>).type === "selectionChanged");
+    expect(call).toBeDefined();
+    expect((call![0] as Record<string, unknown>).labelId).toBe("L1");
+    expect((call![0] as Record<string, unknown>)).not.toHaveProperty("includeChildren");
   });
 });
 

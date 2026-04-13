@@ -1,12 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// Mock @core/settings module — background.ts imports loadSettings and onSettingChanged
+vi.mock("@core/settings.js", () => ({
+  loadSettings: vi.fn().mockResolvedValue({}),
+  onSettingChanged: vi.fn(),
+  saveSetting: vi.fn(),
+}));
+
 // Mock cache-manager module before background.ts imports it
 vi.mock("../src/cache-manager.js", () => {
   const mockStart = vi.fn().mockResolvedValue(undefined);
   const mockStop = vi.fn();
   const mockIsOrchestratorRunning = vi.fn().mockReturnValue(false);
   const mockSetFilterConfig = vi.fn();
-  const mockGetFilterConfig = vi.fn().mockReturnValue({ labelId: null, includeChildren: false, scopeTimestamp: null });
+  const mockGetFilterConfig = vi.fn().mockReturnValue({ labelId: null, includeChildren: true, scopeTimestamp: null });
   const mockWakeOrchestrator = vi.fn();
   const mockQueryLabel = vi.fn().mockResolvedValue({ labelId: "INBOX", count: 5, coLabelCounts: { STARRED: 1 } });
   const mockGetLabelCounts = vi.fn().mockResolvedValue({ INBOX: { own: 10, inclusive: 10 } });
@@ -37,6 +44,9 @@ vi.mock("../src/cache-manager.js", () => {
       loadLabels: mockLoadLabels,
       isScopeReady: mockIsScopeReady,
       requestScopeFetch: mockRequestScopeFetch,
+      setConcurrency: vi.fn(),
+      reset: vi.fn().mockResolvedValue(undefined),
+      isInitialBuildComplete: vi.fn().mockReturnValue(true),
       showStarred: false,
       showImportant: false,
     })),
@@ -50,7 +60,7 @@ const alarmsCreateMock = vi.fn();
 let onConnectListener: ((port: unknown) => void) | null = null;
 const tabsUpdateMock = vi.fn().mockResolvedValue(undefined);
 (globalThis as Record<string, unknown>).chrome = {
-  storage: { session: { get: noop, set: noop } },
+  storage: { session: { get: noop, set: noop }, local: { get: vi.fn().mockResolvedValue({}), set: vi.fn() }, onChanged: { addListener: noop } },
   sidePanel: { setPanelBehavior: noop },
   commands: { getAll: noop, onCommand: { addListener: noop } },
   action: { setTitle: noop, onClicked: { addListener: noop } },
@@ -171,7 +181,7 @@ describe("startOrchestrator", () => {
     const { port, sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await flush();
     (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue([{ id: "Label_1", name: "Work", type: "user" }]);
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: null, scopeTimestamp: null });
     await flush();
     port.postMessage.mockClear();
 
@@ -202,7 +212,7 @@ describe("startOrchestrator", () => {
   it("sets initial filter config when scope is provided", () => {
     const scope = Date.now() - 7 * 24 * 60 * 60 * 1000;
     startOrchestrator("/mail/u/0/", scope);
-    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: false, scopeTimestamp: scope }, true);
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: true, scopeTimestamp: scope }, true);
   });
 
   it("does not set filter config when scope is undefined", () => {
@@ -244,10 +254,10 @@ describe("selectionChanged handler", () => {
     const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 1 });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: null, scopeTimestamp: null, seq: 1 });
     await flush();
 
-    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: false, scopeTimestamp: null });
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: true, scopeTimestamp: null });
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("label") });
     // Service worker no longer calls queryLabel directly — cache manager pushes results
     expect(cacheManager.queryLabel).not.toHaveBeenCalled();
@@ -257,21 +267,21 @@ describe("selectionChanged handler", () => {
     const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: null, scopeTimestamp: null, seq: 2 });
+    sendMessage({ type: "selectionChanged", labelId: null, scope: null, scopeTimestamp: null, seq: 2 });
     await new Promise(r => setTimeout(r, 0));
 
-    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: false, scopeTimestamp: null });
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: null, includeChildren: true, scopeTimestamp: null });
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: "https://mail.google.com/mail/u/0/#all" });
   });
 
-  it("selectionChanged with includeChildren resolves descendant names for Gmail URL", async () => {
+  it("selectionChanged resolves descendant names for Gmail URL when includeChildren is on", async () => {
     const labels = [{ id: "Label_1", name: "Work", type: "user" }, { id: "Label_2", name: "Work/Projects", type: "user" }];
     (cacheManager.getLabels as ReturnType<typeof vi.fn>).mockReturnValue(labels);
     const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
     tabsUpdateMock.mockClear();
 
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: true, scope: null, scopeTimestamp: null, seq: 3 });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: null, scopeTimestamp: null, seq: 3 });
     await new Promise(r => setTimeout(r, 0));
 
     const url = tabsUpdateMock.mock.calls[0][1].url as string;
@@ -290,7 +300,7 @@ describe("selectionChanged handler", () => {
     await new Promise(r => setTimeout(r, 0));
     tabsUpdateMock.mockClear();
 
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null, seq: 10 });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: null, scopeTimestamp: null, seq: 10 });
     await flush();
 
     expect(cacheManager.loadLabels).toHaveBeenCalled();
@@ -301,7 +311,7 @@ describe("selectionChanged handler", () => {
     const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    sendMessage({ type: "selectionChanged", labelId: null, includeChildren: false, scope: "2024/01/01", scopeTimestamp: null, seq: 4 });
+    sendMessage({ type: "selectionChanged", labelId: null, scope: "2024/01/01", scopeTimestamp: null, seq: 4 });
     await new Promise(r => setTimeout(r, 0));
 
     expect(tabsUpdateMock).toHaveBeenCalledWith(42, { url: expect.stringContaining("search") });
@@ -315,7 +325,7 @@ describe("selectionChanged handler", () => {
     await new Promise(r => setTimeout(r, 0));
     tabsUpdateMock.mockClear();
 
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: null, scopeTimestamp: null });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: null, scopeTimestamp: null });
     await flush();
 
     // Navigation happened immediately with selectionChanged
@@ -323,7 +333,7 @@ describe("selectionChanged handler", () => {
     tabsUpdateMock.mockClear();
 
     // Result push does NOT trigger navigation
-    resultCallback({ labelId: "Label_1", count: 5, coLabelCounts: { INBOX: 2 }, counts: { Label_1: { own: 5, inclusive: 5 } }, filterConfig: { labelId: "Label_1", includeChildren: false, scopeTimestamp: null } });
+    resultCallback({ labelId: "Label_1", count: 5, coLabelCounts: { INBOX: 2 }, counts: { Label_1: { own: 5, inclusive: 5 } }, filterConfig: { labelId: "Label_1", includeChildren: true, scopeTimestamp: null } });
     await flush();
 
     expect(tabsUpdateMock).not.toHaveBeenCalled();
@@ -344,7 +354,7 @@ describe("result push relay", () => {
     await new Promise(r => setTimeout(r, 0));
     port.postMessage.mockClear();
 
-    const filterConfig = { labelId: "Label_1", includeChildren: false, scopeTimestamp: null };
+    const filterConfig = { labelId: "Label_1", includeChildren: true, scopeTimestamp: null };
     resultCallback({ labelId: "Label_1", count: 10, coLabelCounts: { INBOX: 5 }, counts: { Label_1: { own: 10, inclusive: 10 }, INBOX: { own: 50, inclusive: 50 } }, filterConfig });
 
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "filterResults", labelId: "Label_1", count: 10, coLabelCounts: { INBOX: 5 }, counts: { Label_1: { own: 10, inclusive: 10 }, INBOX: { own: 50, inclusive: 50 } }, filterConfig }));
@@ -355,7 +365,7 @@ describe("result push relay", () => {
     await new Promise(r => setTimeout(r, 0));
     port.postMessage.mockClear();
 
-    const filterConfig = { labelId: null, includeChildren: false, scopeTimestamp: null };
+    const filterConfig = { labelId: null, includeChildren: true, scopeTimestamp: null };
     resultCallback({ labelId: null, count: 0, coLabelCounts: {}, counts: { INBOX: { own: 50, inclusive: 50 } }, filterConfig });
 
     expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "filterResults", labelId: null, counts: { INBOX: { own: 50, inclusive: 50 } } }));
@@ -369,7 +379,7 @@ describe("result push relay", () => {
     port1.postMessage.mockClear();
     port2.postMessage.mockClear();
 
-    const filterConfig = { labelId: "INBOX", includeChildren: false, scopeTimestamp: null };
+    const filterConfig = { labelId: "INBOX", includeChildren: true, scopeTimestamp: null };
     resultCallback({ labelId: "INBOX", count: 10, coLabelCounts: {}, counts: { INBOX: { own: 10, inclusive: 10 } }, filterConfig });
 
     expect(port1.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "filterResults" }));
@@ -409,33 +419,12 @@ describe("orchestrator filter config propagation", () => {
     const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
     await new Promise(r => setTimeout(r, 0));
 
-    sendMessage({ type: "selectionChanged", labelId: "Label_1", includeChildren: false, scope: "2024/01/01", scopeTimestamp, seq: 1 });
+    sendMessage({ type: "selectionChanged", labelId: "Label_1", scope: "2024/01/01", scopeTimestamp, seq: 1 });
     await flush();
 
-    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: false, scopeTimestamp });
+    expect(cacheManager.setFilterConfig).toHaveBeenCalledWith({ labelId: "Label_1", includeChildren: true, scopeTimestamp });
   });
 
-  it("syncSettings updates system label settings and wakes orchestrator", async () => {
-    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(true);
-    const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
-    await new Promise(r => setTimeout(r, 0));
-
-    sendMessage({ type: "syncSettings", showStarred: true, showImportant: false });
-
-    expect(cacheManager.updateSystemLabelSettings).toHaveBeenCalledWith(true, false);
-    expect(cacheManager.wakeOrchestrator).toHaveBeenCalled();
-  });
-
-  it("syncSettings does not wake orchestrator when not running", async () => {
-    (cacheManager.isOrchestratorRunning as ReturnType<typeof vi.fn>).mockReturnValue(false);
-    const { sendMessage } = createConnectedPort(42, "https://mail.google.com/mail/u/0/#inbox");
-    await new Promise(r => setTimeout(r, 0));
-
-    sendMessage({ type: "syncSettings", showStarred: true, showImportant: false });
-
-    expect(cacheManager.updateSystemLabelSettings).toHaveBeenCalledWith(true, false);
-    expect(cacheManager.wakeOrchestrator).not.toHaveBeenCalled();
-  });
 });
 
 describe("warm-connect with scope but no selection", () => {
@@ -463,7 +452,8 @@ describe("warm-connect with scope but no selection", () => {
     const tabsQuery = (globalThis as unknown as { chrome: { tabs: { query: ReturnType<typeof vi.fn> } } }).chrome.tabs.query;
     tabsQuery.mockResolvedValueOnce([{ id: 42, url: "https://mail.google.com/mail/u/0/#inbox", windowId: 1 }]);
     const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    messageListener!({ type: "initWindow", windowId: 1, scopeTimestamp });
+    messageListener!({ type: "initWindow", windowId: 1 });
+    messageListener!({ type: "selectionChanged", labelId: null, scopeTimestamp });
     await flush();
 
     expect(cacheManager.requestScopeFetch).toHaveBeenCalledWith(scopeTimestamp);
@@ -487,12 +477,13 @@ describe("warm-connect with scope but no selection", () => {
     const tabsQuery = (globalThis as unknown as { chrome: { tabs: { query: ReturnType<typeof vi.fn> } } }).chrome.tabs.query;
     tabsQuery.mockResolvedValueOnce([{ id: 42, url: "https://mail.google.com/mail/u/0/#inbox", windowId: 1 }]);
     const scopeTimestamp = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    messageListener!({ type: "initWindow", windowId: 1, scopeTimestamp });
+    messageListener!({ type: "initWindow", windowId: 1 });
+    messageListener!({ type: "selectionChanged", labelId: null, scopeTimestamp });
     await flush();
     port.postMessage.mockClear();
 
     // Push results with a DIFFERENT (null) scope — should NOT be relayed directly
-    const filterConfig = { labelId: null, includeChildren: false, scopeTimestamp: null };
+    const filterConfig = { labelId: null, includeChildren: true, scopeTimestamp: null };
     resultCallback({ labelId: null, count: 0, coLabelCounts: {}, counts: { INBOX: { own: 50, inclusive: 50 } }, filterConfig });
     await flush();
 

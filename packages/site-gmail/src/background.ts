@@ -1,11 +1,12 @@
 import type { PinMode } from "@core/types.js";
-import { fetchLabels, type GmailLabel, buildSearchQuery } from "./gmail-api.js";
+import { loadSettings, onSettingChanged } from "@core/settings.js";
+import { type GmailLabel, buildSearchQuery } from "./gmail-api.js";
 import { CacheManager, type CacheProgress, type ResultPush } from "./cache-manager.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
 
-interface PortSelection { labelId: string | null; includeChildren: boolean; scopeTimestamp: number | null }
-interface PortState { returnToInbox: boolean; onFiltersTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null; lastScopeTimestamp: number | null | undefined; lastSelection: PortSelection | null; pushGeneration: number }
+interface PortSelection { labelId: string | null; scopeTimestamp: number | null }
+interface PortState { onSearchTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null; lastScopeTimestamp: number | null | undefined; lastSelection: PortSelection | null; pushGeneration: number }
 const portState = new Map<chrome.runtime.Port, PortState>();
 const pendingReturnToInbox = new Map<number, ReturnType<typeof setTimeout>>();
 /** Last hash fragment the extension navigated each tab to via selectionChanged — used to suppress userNavigated for our own navigations. */
@@ -13,6 +14,8 @@ const lastExtensionNavHash = new Map<number, string>();
 /** Per-tab generation counter for navigateGmailToLabel — prevents stale loadLabels callbacks from navigating to an outdated label after rapid label changes. Keyed by tabId to avoid cross-tab interference in multi-window scenarios. */
 const navGeneration = new Map<number, number>();
 let pinMode: PinMode = "pinned";
+let returnToInbox = true;
+let includeChildren = true;
 
 const cacheManager = new CacheManager();
 let currentAccountPath: string | null = null;
@@ -32,7 +35,7 @@ function relayResultPush(result: ResultPush): void {
     const portScope = sel?.scopeTimestamp ?? state.lastScopeTimestamp;
     const effectivePortScope = portScope ?? null;
     // If this port's selection matches the pushed filterConfig, relay directly
-    if (sel ? (sel.labelId === filterConfig.labelId && sel.includeChildren === filterConfig.includeChildren && sel.scopeTimestamp === filterConfig.scopeTimestamp) : (effectivePortScope === filterConfig.scopeTimestamp)) {
+    if (sel ? (sel.labelId === filterConfig.labelId && sel.scopeTimestamp === filterConfig.scopeTimestamp) : (effectivePortScope === filterConfig.scopeTimestamp)) {
       // Bump generation to invalidate any in-flight pushResultsForPort() for this port
       state.pushGeneration++;
       try {
@@ -40,14 +43,14 @@ function relayResultPush(result: ResultPush): void {
       } catch { /* port may be dead */ }
     } else {
       // This port has a different selection or scope — compute its own results
-      pushResultsForPort(port, sel ?? { labelId: null, includeChildren: false, scopeTimestamp: effectivePortScope });
+      pushResultsForPort(port, sel ?? { labelId: null, scopeTimestamp: effectivePortScope });
     }
   }
 }
 
 /** Compute and send results for a specific port's selection. Skips when the port's scope hasn't been fetched yet — the orchestrator will push results once the scope arrives via requestScopeFetch. */
 function pushResultsForPort(port: chrome.runtime.Port, sel: PortSelection): void {
-  const { labelId, includeChildren, scopeTimestamp } = sel;
+  const { labelId, scopeTimestamp } = sel;
   // Guard: don't send unscoped data tagged as scoped — wait for scope fetch to complete
   if (!cacheManager.isScopeReady(scopeTimestamp)) return;
   const state = portState.get(port);
@@ -68,14 +71,26 @@ function pushResultsForPort(port: chrome.runtime.Port, sel: PortSelection): void
     // Discard if a newer push started for this port
     if (state.pushGeneration !== myGeneration) return;
     try {
-      port.postMessage({ type: "filterResults", labelId, count: portCount, coLabelCounts: portCoLabelCounts, counts: portCounts, filterConfig: portFilterConfig, partial: cacheManager.getCacheDepthTimestamp() === undefined });
+      port.postMessage({ type: "filterResults", labelId, count: portCount, coLabelCounts: portCoLabelCounts, counts: portCounts, filterConfig: portFilterConfig, partial: !cacheManager.isInitialBuildComplete() });
     } catch { /* port may be dead */ }
   })().catch(() => { /* swallow errors */ });
 }
 
 cacheManager.setResultCallback(relayResultPush);
 
+let labelsPushed = false;
 cacheManager.setProgressCallback((progress: CacheProgress) => {
+  // Push labels to all ports when they first become available (cold start)
+  if (!labelsPushed && progress.phase === "labels") {
+    const labels = cacheManager.getLabels();
+    if (labels.length > 0) {
+      labelsPushed = true;
+      const labelsWithNone = labels.some(l => l.id === "NONE") ? labels : [...labels, { id: "NONE", name: "No user labels", type: "system" }];
+      for (const [port] of portState) {
+        try { port.postMessage({ type: "labelsReady", labels: labelsWithNone }); } catch { /* port may be dead */ }
+      }
+    }
+  }
   for (const [port] of portState) {
     try { port.postMessage({ type: "cacheState", ...progress }); } catch { /* port may be dead */ }
   }
@@ -87,6 +102,25 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
   }
 });
 
+// Shared settings defaults — keys match the sidepanel's saveSetting calls
+const SHARED_SETTINGS_DEFAULTS = { ca_show_starred: false, ca_show_important: false, ca_include_children: true, ca_concurrency: 10, ca_pin_mode: "pinned" as PinMode, ca_return_to_inbox: true };
+
+/** Apply shared settings from chrome.storage.local to in-memory state. */
+function applySharedSettings(settings: Record<string, unknown>): void {
+  if ("ca_show_starred" in settings || "ca_show_important" in settings) {
+    cacheManager.updateSystemLabelSettings(settings.ca_show_starred as boolean ?? cacheManager.showStarred, settings.ca_show_important as boolean ?? cacheManager.showImportant);
+    if (cacheManager.isOrchestratorRunning()) cacheManager.wakeOrchestrator();
+  }
+  if ("ca_include_children" in settings) includeChildren = settings.ca_include_children as boolean;
+  if ("ca_concurrency" in settings) cacheManager.setConcurrency(settings.ca_concurrency as number);
+  if ("ca_pin_mode" in settings) pinMode = settings.ca_pin_mode as PinMode;
+  if ("ca_return_to_inbox" in settings) returnToInbox = settings.ca_return_to_inbox as boolean;
+}
+
+// Load shared settings on startup and listen for changes
+loadSettings(SHARED_SETTINGS_DEFAULTS).then(applySharedSettings);
+onSettingChanged(applySharedSettings);
+
 // Keep service worker alive during active cache fetch; restart orchestrator after SW suspension
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === CACHE_ALARM_NAME) {
@@ -95,24 +129,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       cacheManager.wakeOrchestrator();
     } else {
       // Service worker was suspended and restarted — restore account and restart orchestrator
-      chrome.storage.session.get(["accountPath", "showStarred", "showImportant"], (result) => {
+      chrome.storage.session.get("accountPath", (result) => {
         if (result.accountPath) {
-          // Restore system label settings before starting so buildLabelQueryList() includes them
-          if (result.showStarred || result.showImportant) {
-            cacheManager.showStarred = !!result.showStarred;
-            cacheManager.showImportant = !!result.showImportant;
-          }
           startOrchestrator(result.accountPath, getScopeForWindow());
         }
       });
     }
-  }
-});
-
-// Restore pinMode from session storage (survives service worker restarts)
-chrome.storage.session.get("pinMode", (result) => {
-  if (result.pinMode === "pinned" || result.pinMode === "autohide-site") {
-    pinMode = result.pinMode;
   }
 });
 
@@ -153,7 +175,7 @@ export function startOrchestrator(accountPath: string, scopeTimestamp?: number |
   // Skip the push to avoid emitting stale counts from the previous account — start() will
   // clear old data and push fresh results after labels load.
   if (scopeTimestamp !== undefined) {
-    cacheManager.setFilterConfig({ labelId: null, includeChildren: false, scopeTimestamp: scopeTimestamp ?? null }, true);
+    cacheManager.setFilterConfig({ labelId: null, includeChildren, scopeTimestamp: scopeTimestamp ?? null }, true);
   }
   chrome.alarms.create(CACHE_ALARM_NAME, { periodInMinutes: 0.4 });
   cacheManager.start(accountPath).catch((err) => {
@@ -219,7 +241,7 @@ async function closePanel(tabId: number): Promise<void> {
 }
 
 /** Navigate a Gmail tab to show the given label. Uses cached labels for URL building; falls back to loadLabels if empty. A generation guard prevents stale loadLabels callbacks from overriding a newer navigation after rapid label changes. */
-function navigateGmailToLabel(tabId: number, base: string, labelId: string, includeChildren: boolean, scope: string | null): void {
+function navigateGmailToLabel(tabId: number, base: string, labelId: string, scope: string | null): void {
   const gen = (navGeneration.get(tabId) ?? 0) + 1;
   navGeneration.set(tabId, gen);
   const labels = cacheManager.getLabels();
@@ -272,16 +294,14 @@ function broadcastToWindow(windowId: number, message: Record<string, unknown>): 
 chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
   if (port.name !== "sidepanel") return;
 
-  const state: PortState = { returnToInbox: true, onFiltersTab: true, gmailTabId: null, gmailTabUrl: null, windowId: null, lastScopeTimestamp: undefined, lastSelection: null, pushGeneration: 0 };
+  const state: PortState = { onSearchTab: true, gmailTabId: null, gmailTabUrl: null, windowId: null, lastScopeTimestamp: undefined, lastSelection: null, pushGeneration: 0 };
   portState.set(port, state);
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; mode?: string; labelId?: string; includeChildren?: boolean; scope?: string | null; scopeTimestamp?: number | null; returnToInbox?: boolean; onFiltersTab?: boolean; windowId?: number; seq?: number; showStarred?: boolean; showImportant?: boolean; concurrency?: number }) => {
+  port.onMessage.addListener((message: { type: string; labelId?: string; scope?: string | null; scopeTimestamp?: number | null; windowId?: number }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
-      // Capture scope from sidepanel's saved setting so the first orchestrator start uses it
-      if (message.scopeTimestamp !== undefined) state.lastScopeTimestamp = message.scopeTimestamp ?? null;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
         const tab = tabs[0];
         if (!tab?.id || !tab.url) return;
@@ -295,24 +315,27 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           const wasAlreadyRunning = cacheManager.isOrchestratorRunning() && currentAccountPath === account;
           port.postMessage({ type: "resultsReady", accountPath: account });
           startOrchestrator(account, getScopeForWindow(message.windowId));
-          // When the orchestrator is already warm, push current counts to the new port so it
-          // doesn't have to wait for a future push event (fixes late-connect missing counts).
+          // When the orchestrator is already warm, push cached labels and counts immediately
           if (wasAlreadyRunning) {
+            const labels = cacheManager.getLabels();
+            if (labels.length > 0) {
+              const labelsWithNone = labels.some(l => l.id === "NONE") ? labels : [...labels, { id: "NONE", name: "No user labels", type: "system" }];
+              try { port.postMessage({ type: "labelsReady", labels: labelsWithNone }); } catch { /* port may be dead */ }
+            }
             const scopeTimestamp = state.lastScopeTimestamp ?? null;
-            // Ensure the orchestrator knows about this port's scope so it gets fetched
             if (scopeTimestamp !== null) cacheManager.requestScopeFetch(scopeTimestamp);
-            pushResultsForPort(port, { labelId: null, includeChildren: false, scopeTimestamp });
+            pushResultsForPort(port, { labelId: null, scopeTimestamp });
           }
         } else {
           port.postMessage({ type: "notOnGmail" });
         }
       });
     } else if (message.type === "selectionChanged") {
+      state.onSearchTab = true;
       const labelId = message.labelId ?? null;
-      const includeChildren = message.includeChildren ?? false;
       const scopeTimestamp = message.scopeTimestamp ?? null;
       const scope = message.scope ?? null;
-      state.lastSelection = { labelId, includeChildren, scopeTimestamp };
+      state.lastSelection = { labelId, scopeTimestamp };
       state.lastScopeTimestamp = scopeTimestamp;
       // Navigate Gmail immediately — independent of cache manager
       if (state.gmailTabId !== null && state.gmailTabUrl) {
@@ -326,12 +349,13 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           chrome.tabs.update(state.gmailTabId, { url });
         } else {
           // Best-effort navigation with currently available labels
-          navigateGmailToLabel(state.gmailTabId, base, labelId, includeChildren, scope);
+          navigateGmailToLabel(state.gmailTabId, base, labelId, scope);
         }
       }
       // Inform cache manager — it will push results via callback when data is available
       cacheManager.setFilterConfig({ labelId, includeChildren, scopeTimestamp });
     } else if (message.type === "filtersOff") {
+      state.onSearchTab = false;
       // Navigate Gmail to inbox without changing selection state.
       // Invalidate pending navigateGmailToLabel callbacks so a stale loadLabels
       // completion doesn't override this inbox navigation.
@@ -342,37 +366,19 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         lastExtensionNavHash.set(state.gmailTabId, "inbox");
         chrome.tabs.update(state.gmailTabId, { url });
       }
-    } else if (message.type === "syncState") {
-      if (message.returnToInbox !== undefined) state.returnToInbox = message.returnToInbox;
-      if (message.onFiltersTab !== undefined) state.onFiltersTab = message.onFiltersTab;
-    } else
-    if (message.type === "setPinMode" && (message.mode === "pinned" || message.mode === "autohide-site")) {
-      pinMode = message.mode;
-      chrome.storage.session.set({ pinMode: message.mode });
-    } else if (message.type === "fetchLabels") {
-      const fetchSeq = message.seq;
-      fetchLabels().then((labels) => {
-        cacheManager.setLabels(labels);
-        const labelsWithNone = [...labels, { id: "NONE", name: "No user labels", type: "system" }];
-        const response: Record<string, unknown> = { type: "labelsReady", labels: labelsWithNone };
-        if (fetchSeq !== undefined) response.seq = fetchSeq;
-        port.postMessage(response);
-      }).catch(() => { port.postMessage({ type: "labelsError" }); });
-    } else if (message.type === "syncSettings") {
-      const showStarred = !!message.showStarred;
-      const showImportant = !!message.showImportant;
-      if (typeof message.concurrency === "number" && message.concurrency > 0) cacheManager.setConcurrency(message.concurrency);
-      cacheManager.updateSystemLabelSettings(showStarred, showImportant);
-      // Wake the orchestrator so it can fetch newly enabled system labels
-      if (cacheManager.isOrchestratorRunning()) {
-        cacheManager.wakeOrchestrator();
-      }
+    } else if (message.type === "resetCache") {
+      const account = currentAccountPath ?? (state.gmailTabUrl ? gmailAccountPath(state.gmailTabUrl) : null);
+      currentAccountPath = null;
+      labelsPushed = false;
+      cacheManager.reset().then(() => {
+        if (account) startOrchestrator(account, getScopeForWindow(state.windowId ?? undefined));
+      });
     }
   });
 
   port.onDisconnect.addListener(() => {
     const s = portState.get(port);
-    if (s?.returnToInbox && s.onFiltersTab && s.gmailTabId !== null && s.gmailTabUrl) {
+    if (returnToInbox && s?.onSearchTab && s.gmailTabId !== null && s.gmailTabUrl) {
       const tabId = s.gmailTabId;
       const base = `https://mail.google.com${gmailAccountPath(s.gmailTabUrl)}`;
       // Delay return-to-inbox so reconnects after service worker restarts can cancel it
