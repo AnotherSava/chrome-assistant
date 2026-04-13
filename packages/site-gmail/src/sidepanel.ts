@@ -173,7 +173,9 @@ document.addEventListener("mouseup", (e: MouseEvent) => {
 // ---------------------------------------------------------------------------
 
 const KEY_RETURN_TO_INBOX = "ca_return_to_inbox";
+const KEY_SHOW_SUMMARY_TAB = "ca_show_summary_tab";
 let returnToInbox: boolean = loadSetting(KEY_RETURN_TO_INBOX, true);
+let showSummaryTab: boolean = loadSetting(KEY_SHOW_SUMMARY_TAB, false);
 let displayPanelOpen = false;
 
 function closeDisplayPanel(): void {
@@ -188,11 +190,17 @@ function buildDisplayPanel(): void {
   const ds = searchTab.getDisplaySettings();
   const colOptions = [1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === ds.labelColumns ? " selected" : ""}>${n}</option>`).join("");
   const concurrencyOptions = [1, 3, 5, 10, 20].map((n) => `<option value="${n}"${n === ds.concurrency ? " selected" : ""}>${n}</option>`).join("");
-  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Search tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${ds.includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${ds.showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${ds.showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${ds.showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div><div class="display-row"><input type="checkbox" id="show-cache-progress-check"${ds.showCacheProgress ? " checked" : ""}><label for="show-cache-progress-check">Show background cache progress</label></div><div class="display-row"><label>API concurrency</label><select id="concurrency-select">${concurrencyOptions}</select></div>`;
+  panel.innerHTML = `<div class="display-row"><label>Columns</label><select id="col-select">${colOptions}</select></div><div class="display-row"><input type="checkbox" id="show-summary-tab-check"${showSummaryTab ? " checked" : ""}><label for="show-summary-tab-check">Show Summary tab</label></div><div class="display-row"><input type="checkbox" id="return-inbox-check"${returnToInbox ? " checked" : ""}><label for="return-inbox-check">Return to Inbox when Search tab closes</label></div><div class="display-row"><input type="checkbox" id="include-children-check"${ds.includeChildren ? " checked" : ""}><label for="include-children-check">Include sub-labels when selecting a parent</label></div><div class="display-row"><input type="checkbox" id="show-counts-check"${ds.showCounts ? " checked" : ""}><label for="show-counts-check">Show email counts</label></div><div class="display-row"><input type="checkbox" id="show-starred-check"${ds.showStarred ? " checked" : ""}><label for="show-starred-check">Show Starred</label></div><div class="display-row"><input type="checkbox" id="show-important-check"${ds.showImportant ? " checked" : ""}><label for="show-important-check">Show Important</label></div><div class="display-row"><input type="checkbox" id="show-cache-progress-check"${ds.showCacheProgress ? " checked" : ""}><label for="show-cache-progress-check">Show background cache progress</label></div><div class="display-row"><label>API concurrency</label><select id="concurrency-select">${concurrencyOptions}</select></div>`;
   const colSelect = document.getElementById("col-select") as HTMLSelectElement;
   colSelect.addEventListener("change", () => {
     searchTab.setLabelColumns(parseInt(colSelect.value, 10));
     if (currentTab === "search") searchTab.loadLabels();
+  });
+  const summaryTabCheck = document.getElementById("show-summary-tab-check") as HTMLInputElement;
+  summaryTabCheck.addEventListener("change", () => {
+    showSummaryTab = summaryTabCheck.checked;
+    saveSetting(KEY_SHOW_SUMMARY_TAB, showSummaryTab);
+    updateSummaryTabVisibility();
   });
   const returnCheck = document.getElementById("return-inbox-check") as HTMLInputElement;
   returnCheck.addEventListener("change", () => {
@@ -267,6 +275,12 @@ function showTabBar(visible: boolean): void {
   if (tabBar) tabBar.style.display = visible ? "" : "none";
 }
 
+function updateSummaryTabVisibility(): void {
+  const summaryBtn = document.querySelector<HTMLElement>('.tab[data-tab="summary"]');
+  if (summaryBtn) summaryBtn.style.display = showSummaryTab ? "" : "none";
+  if (!showSummaryTab && currentTab === "summary") switchTab("search");
+}
+
 function showContent(html: string): void {
   const contentEl = document.getElementById("content");
   if (contentEl) contentEl.innerHTML = html;
@@ -294,6 +308,7 @@ function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): 
 document.querySelectorAll<HTMLElement>(".tab").forEach((t) => {
   t.addEventListener("click", () => { switchTab(t.dataset.tab as "summary" | "search"); });
 });
+updateSummaryTabVisibility();
 
 // ---------------------------------------------------------------------------
 // Messaging helpers
