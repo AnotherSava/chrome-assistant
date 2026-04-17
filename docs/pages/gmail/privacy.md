@@ -1,9 +1,9 @@
 ---
 layout: default
-title: Privacy Policy
+title: Gmail — Privacy Policy
 ---
 
-[Home](..) | [Gmail](gmail/) | [Privacy](privacy)
+[Home](../..) | [Gmail](.) | [Privacy](privacy) | [Development](../development)
 
 ---
 
@@ -13,14 +13,21 @@ title: Privacy Policy
 
 ## Data collection
 
-Gmail Assistant does **not** collect, transmit, or store any personal data. There are no analytics, telemetry, or tracking of any kind. The extension does not make network requests to any servers other than `mail.google.com` and Google's OAuth/API endpoints (which your browser already connects to when using Gmail).
+Gmail Assistant does **not** collect or transmit any personal data. There are no analytics, telemetry, or tracking of any kind, and no data leaves your browser. The extension's only outbound network traffic is to Google's OAuth and Gmail API endpoints — using a read-only OAuth scope, so it cannot send emails, create drafts, or modify any content in your account (see [OAuth2 scope](#oauth2-scope) below).
+
+## Local data storage
+
+To function, the extension stores data locally on your device. This data never leaves your browser — it is not sent to any server, including ours.
+
+- **Message and label index** (IndexedDB): message IDs and the labels attached to each message, fetched from the Gmail API. Used to compute co-label counts and answer queries instantly without re-fetching. Scoped per Gmail account.
+- **Display preferences** (`chrome.storage.local`): column count, scope selection, include-children toggle, show-counts toggle, show Starred / Important toggles, zoom level, pin mode.
+
+You can clear all stored data at any time by clicking the refresh (↻) button in the side panel toolbar to reset the cache, or by removing the extension from Chrome.
 
 ## How the extension works
 
-- The extension uses Gmail API (read-only) to fetch your label list and message IDs for building a local cache of label associations.
+- The extension uses the Gmail API (read-only) to fetch your label list and message IDs for building the local cache.
 - All processing happens locally in your browser — label indexes and co-label counts are computed on your device and never sent anywhere.
-- The local cache is stored in your browser's IndexedDB and never leaves your device.
-- Display preferences (such as column count, scope, and toggle states) are saved in your browser's local extension storage and never leave your device.
 
 ## Permissions
 

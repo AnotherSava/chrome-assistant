@@ -1,47 +1,16 @@
 # Chrome Assistant
 
-A family of Chrome extensions sharing a common side panel framework. Each site is built as an independent extension. Currently supports Gmail.
+A family of Chrome extensions sharing a common side panel framework. Each site is built as an independent extension. <br>Currently supports Gmail. [BGA Assistant](https://github.com/AnotherSava/bga-assistant) (for [Board Game Arena](https://boardgamearena.com)) is a separate project for now, pending integration into this monorepo.
 
-## Gmail Assistant
+## [Gmail](https://anothersava.github.io/chrome-assistant/pages/gmail)
+A side panel extension for Gmail that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by location and time scope, and jump to filtered views with one click. Dynamic label filtering (only shows labels that appear on matching messages) is powered by a progressive background cache.
 
-A side panel extension for Gmail that provides quick label-based filtering and navigation.
+![Gmail Assistant](docs/screenshots/main.png)
 
-**Features:**
-- Browse all your Gmail labels in a multi-column layout
-- Click a label to filter the Gmail page by that label
-- Include sub-labels: selecting a parent label shows messages from all its children too (configurable)
-- System labels (Inbox, Sent, Starred, Important) shown alongside user labels
-- Filter by time scope
-- Dynamic label filtering — only shows labels that appear on matching messages, powered by a progressive message metadata cache
-- Auto-hide side panel when leaving Gmail
-- Zoom controls with per-context persistence
-- Configurable keyboard shortcut to toggle the side panel
+<!-- Install from [Chrome Web Store](https://chromewebstore.google.com/detail/gmail-assistant/TODO) -->
 
-**Requires:** Google account authorization (Gmail read-only access via OAuth2).
+See full project documentation at **[anothersava.github.io/chrome-assistant](https://anothersava.github.io/chrome-assistant/)**:
 
-## Development
-
-```bash
-npm install
-npm run dev        # watch mode (Gmail)
-npm run build      # production build (Gmail)
-npm run test       # run tests
-npm run lint       # type check
-npm run package    # build + create Chrome Web Store ZIP
-```
-
-### Per-site builds
-
-```bash
-npm run build:gmail   # build Gmail extension
-npm run dev:gmail     # watch mode for Gmail
-```
-
-## Installation
-
-Load as an unpacked extension in Chrome:
-
-1. `npm run build`
-2. Open `chrome://extensions/`
-3. Enable "Developer mode"
-4. Click "Load unpacked" and select `packages/site-gmail/`
+- [Installation and usage](https://anothersava.github.io/chrome-assistant/)
+  - [Gmail](https://anothersava.github.io/chrome-assistant/pages/gmail)
+- [Developer guide](https://anothersava.github.io/chrome-assistant/pages/development)

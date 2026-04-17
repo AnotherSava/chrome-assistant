@@ -1,0 +1,23 @@
+sequenceDiagram
+    participant SP as Sidepanel
+    participant SW as Service Worker
+    participant CM as Cache Manager
+    participant Gmail as Gmail Tab
+
+    Note over SP,Gmail: Label Selection / Deselection
+    SP->>SW: selectionChanged {labelId, scopeTimestamp}
+    Note right of SW: labelId set → label hash<br/>labelId null → #all or scoped search
+    SW->>Gmail: tabs.update(url)
+    SW->>CM: setFilterConfig({labelId, includeChildren, scopeTimestamp})
+    CM->>CM: pushResults — queryLabel + getLabelCounts
+    CM->>SW: resultCallback(filterResults)
+    SW->>SP: filterResults {count, coLabelCounts, counts, partial}
+    Note right of SP: coLabelCounts only present when labelId set
+
+    Note over SP,Gmail: Search Tab Close
+    SP->>SW: filtersOff
+    SW->>Gmail: tabs.update(url) — #inbox
+
+    Note over SP,Gmail: User Navigation
+    Gmail->>SW: tabs.onUpdated (hash change)
+    SW->>SP: userNavigated (if not extension-initiated)
