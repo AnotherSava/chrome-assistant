@@ -153,7 +153,7 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
 chrome.commands.getAll((commands) => {
   const cmd = commands.find((c) => c.name === "toggle-sidepanel");
   if (cmd?.shortcut) {
-    chrome.action.setTitle({ title: `Gmail Assistant (${cmd.shortcut})` });
+    chrome.action.setTitle({ title: `Another Gmail Assistant (${cmd.shortcut})` });
   }
 });
 

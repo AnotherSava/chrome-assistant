@@ -26,7 +26,7 @@ npm run build
 1. Open Chrome and navigate to `chrome://extensions`
 2. Enable "Developer mode" (toggle in the top-right corner)
 3. Click "Load unpacked" and select `packages/site-gmail/`
-4. The Gmail Assistant icon appears in the Chrome toolbar
+4. The Another Gmail Assistant icon appears in the Chrome toolbar
 
 ## Commands
 

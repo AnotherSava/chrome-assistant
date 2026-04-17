@@ -9,11 +9,11 @@ title: Gmail — Privacy Policy
 
 # Privacy Policy
 
-**Gmail Assistant** is a browser extension that provides label-based filtering and navigation for [Gmail](https://mail.google.com). This policy explains how the extension handles your data.
+**Another Gmail Assistant** is a browser extension that provides label-based filtering and navigation for [Gmail](https://mail.google.com). This policy explains how the extension handles your data.
 
 ## Data collection
 
-Gmail Assistant does **not** collect or transmit any personal data. There are no analytics, telemetry, or tracking of any kind, and no data leaves your browser. The extension's only outbound network traffic is to Google's OAuth and Gmail API endpoints — using a read-only OAuth scope, so it cannot send emails, create drafts, or modify any content in your account (see [OAuth2 scope](#oauth2-scope) below).
+Another Gmail Assistant does **not** collect or transmit any personal data. There are no analytics, telemetry, or tracking of any kind, and no data leaves your browser. The extension's only outbound network traffic is to Google's OAuth and Gmail API endpoints — using a read-only OAuth scope, so it cannot send emails, create drafts, or modify any content in your account (see [OAuth2 scope](#oauth2-scope) below).
 
 ## Local data storage
 
@@ -45,9 +45,13 @@ You can clear all stored data at any time by clicking the refresh (↻) button i
 
 The extension requests `gmail.readonly` — read-only access to your Gmail account. It cannot send, delete, or modify emails or settings.
 
+In practice, the extension only reads message IDs and label IDs from the Gmail API `messages.list` and `labels.list` endpoints. It never calls `messages.get`, so it never reads message bodies, subjects, headers, snippets, or attachments. The local cache stores only `{ messageId → [labelIds] }` mappings.
+
+The narrower `gmail.metadata` scope was evaluated but does not support the search operators (`after:`, `before:`, `has:nouserlabels`) required for time-scope filtering and the "no user labels" feature.
+
 ## Third-party services
 
-Gmail Assistant does not communicate with any third-party services. All fonts and assets are bundled with the extension.
+Another Gmail Assistant does not communicate with any third-party services. All fonts and assets are bundled with the extension.
 
 ## Changes
 

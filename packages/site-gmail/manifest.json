@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Gmail Assistant",
+  "name": "Another Gmail Assistant",
   "version": "1.0.0",
-  "description": "A Chrome extension for Gmail, part of Another Chrome Assistant project",
+  "description": "Browse Gmail labels in a multi-column side panel. Click to filter. Narrow by time scope. Fast, local, private.",
   "homepage_url": "https://anothersava.github.io/chrome-assistant/",
   "permissions": [
     "activeTab",

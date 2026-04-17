@@ -4,11 +4,15 @@ export function renderHelp(): string {
   return `
 <div class="help">
   <div class="help-hero">
-    <div class="help-hero-title">Gmail Assistant</div>
-    <div class="help-hero-sub">A Chrome extension for <a href="https://mail.google.com" target="_blank">Gmail</a>, part of <a href="https://github.com/AnotherSava/chrome-assistant" target="_blank">Another Chrome Assistant</a> project</div>
+    <div class="help-hero-title">Another Gmail Assistant</div>
+    <div class="help-hero-sub">A Chrome extension for <a href="https://mail.google.com" target="_blank">Gmail</a>, part of <a href="https://anothersava.github.io/chrome-assistant/" target="_blank">Another Chrome Assistant</a> project</div>
   </div>
 
   <p>A side panel assistant for Gmail that provides quick label-based filtering and navigation. Browse your labels, narrow by location and time scope, and jump to filtered views with one click.</p>
+
+  <div class="help-section" style="background:#2a2418;border:1px solid #5a4a1f;border-radius:4px;padding:10px">
+    <div style="color:#ffd27a"><b>Private beta.</b> Gmail sign-in is gated to allowlisted test users while the app is unverified by Google. If sign-in fails with an "access blocked" error, email <a href="mailto:oleg.savelev@gmail.com" style="color:#ffd27a">oleg.savelev@gmail.com</a> or open a <a href="https://github.com/AnotherSava/chrome-assistant/issues" target="_blank" style="color:#ffd27a">GitHub issue</a> to be added.</div>
+  </div>
 
   <div class="help-section">
     <div class="help-section-title">How to use</div>
