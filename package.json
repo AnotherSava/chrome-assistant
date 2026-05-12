@@ -2,7 +2,7 @@
   "name": "chrome-assistant",
   "version": "0.0.0",
   "private": true,
-  "description": "Chrome extension — Another Gmail Assistant",
+  "description": "Chrome extension — Another Assistant for Gmail",
   "license": "MIT",
   "type": "module",
   "scripts": {

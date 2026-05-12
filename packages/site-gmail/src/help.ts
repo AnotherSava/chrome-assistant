@@ -4,7 +4,7 @@ export function renderHelp(): string {
   return `
 <div class="help">
   <div class="help-hero">
-    <div class="help-hero-title">Another Gmail Assistant</div>
+    <div class="help-hero-title">Another Assistant for Gmail</div>
     <div class="help-hero-sub">A Chrome extension for <a href="https://mail.google.com" target="_blank">Gmail</a>, part of <a href="https://anothersava.github.io/chrome-assistant/" target="_blank">Another Chrome Assistant</a> project</div>
   </div>
 

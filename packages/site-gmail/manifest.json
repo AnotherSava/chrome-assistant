@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Another Gmail Assistant",
+  "name": "Another Assistant for Gmail",
   "version": "1.0.0",
   "description": "Browse Gmail labels in a multi-column side panel. Click to filter. Narrow by time scope. Fast, local, private.",
   "homepage_url": "https://anothersava.github.io/chrome-assistant/",

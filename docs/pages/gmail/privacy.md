@@ -9,11 +9,11 @@ title: Gmail — Privacy Policy
 
 # Privacy Policy
 
-**Another Gmail Assistant** is a browser extension that provides label-based filtering and navigation for [Gmail](https://mail.google.com). This policy explains how the extension handles your data.
+**Another Assistant for Gmail** is a browser extension that provides label-based filtering and navigation for [Gmail](https://mail.google.com). This policy explains how the extension handles your data.
 
 ## Data collection
 
-Another Gmail Assistant does **not** collect or transmit any personal data. There are no analytics, telemetry, or tracking of any kind, and no data leaves your browser. The extension's only outbound network traffic is to Google's OAuth and Gmail API endpoints — using a read-only OAuth scope, so it cannot send emails, create drafts, or modify any content in your account (see [OAuth2 scope](#oauth2-scope) below).
+Another Assistant for Gmail does **not** collect or transmit any personal data. There are no analytics, telemetry, or tracking of any kind, and no data leaves your browser. The extension's only outbound network traffic is to Google's OAuth and Gmail API endpoints — using a read-only OAuth scope, so it cannot send emails, create drafts, or modify any content in your account (see [OAuth2 scope](#oauth2-scope) below).
 
 ## Local data storage
 
@@ -51,7 +51,7 @@ The narrower `gmail.metadata` scope was evaluated but does not support the searc
 
 ## Third-party services
 
-Another Gmail Assistant does not communicate with any third-party services. All fonts and assets are bundled with the extension.
+Another Assistant for Gmail does not communicate with any third-party services. All fonts and assets are bundled with the extension.
 
 ## Changes
 
