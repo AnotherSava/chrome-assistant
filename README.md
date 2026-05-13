@@ -7,7 +7,7 @@ A side panel extension for Gmail that provides quick label-based filtering and n
 
 ![Another Assistant for Gmail](docs/screenshots/main.png)
 
-Install from [Chrome Web Store](https://chromewebstore.google.com/detail/TODO) (unlisted).
+Install from [Chrome Web Store](https://chromewebstore.google.com/detail/another-assistant-for-gma/hmkfblmfbeakcddfocbnochpmbaiaakl) (unlisted).
 
 > **Private beta.** Installing the extension is open to anyone with the link above, but Gmail sign-in is gated to allowlisted test users while the app is unverified by Google. Email `oleg.savelev@gmail.com` or open a [GitHub issue](https://github.com/AnotherSava/chrome-assistant/issues) to be added (up to 100 users total).
 
