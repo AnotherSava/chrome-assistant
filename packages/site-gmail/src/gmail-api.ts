@@ -146,3 +146,51 @@ export function formatLabelForQuery(labelName: string): string {
   return `"${labelName.replace(/"/g, "").replace(/[/ ]/g, "-").toLowerCase()}"`;
 }
 
+export interface MessageMetadata { id: string; subject: string; from: string; date: number }
+
+interface MessageGetResponse {
+  id: string;
+  internalDate?: string;
+  payload?: { headers?: { name: string; value: string }[] };
+}
+
+function parseHeader(headers: { name: string; value: string }[] | undefined, name: string): string {
+  if (!headers) return "";
+  const lower = name.toLowerCase();
+  for (const h of headers) {
+    if (h.name.toLowerCase() === lower) return h.value;
+  }
+  return "";
+}
+
+/** Fetch metadata (subject, from, date) for one message. */
+async function fetchOneMessageMetadata(id: string, token: string): Promise<MessageMetadata> {
+  const path = `/messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`;
+  const data = await gmailFetch<MessageGetResponse>(path, token);
+  return { id: data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0 };
+}
+
+/** Fetch metadata for many messages. Runs up to `concurrency` requests in parallel. Calls onProgress after each completed fetch with running totals. */
+export async function fetchMessagesMetadata(ids: string[], concurrency: number = 10, onProgress?: (done: number, total: number) => void): Promise<MessageMetadata[]> {
+  if (ids.length === 0) return [];
+  const token = await getAuthToken();
+  const results: MessageMetadata[] = new Array(ids.length);
+  let nextIndex = 0;
+  let done = 0;
+  const workers: Promise<void>[] = [];
+  const workerCount = Math.min(concurrency, ids.length);
+  for (let w = 0; w < workerCount; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = nextIndex++;
+        if (i >= ids.length) return;
+        results[i] = await fetchOneMessageMetadata(ids[i], token);
+        done++;
+        if (onProgress) onProgress(done, ids.length);
+      }
+    })());
+  }
+  await Promise.all(workers);
+  return results;
+}
+

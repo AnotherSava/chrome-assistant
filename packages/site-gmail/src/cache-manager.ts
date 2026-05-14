@@ -220,6 +220,12 @@ export class CacheManager {
     this.showImportant = showImportant;
   }
 
+  /** Read the full (unscoped) cached message ID list for a label, or an empty array if not yet cached. */
+  async getCachedLabelIds(labelId: string): Promise<string[]> {
+    const ids = await db.getMeta<string[]>(`labelIdx:${labelId}`);
+    return ids ?? [];
+  }
+
   /** Get label index filtered by scope. When expectedScope is set and a cached scoped ID set exists, intersects the full label index with the scope set. Falls back to unscoped IndexedDB if no cached set is available. */
   private async getLabelIndex(labelId: string, expectedScope?: number | null): Promise<string[] | undefined> {
     if (expectedScope !== undefined && expectedScope !== null) {

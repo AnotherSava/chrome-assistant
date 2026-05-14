@@ -33,7 +33,7 @@ export function renderHelp(): string {
     <div class="help-section-title">Tabs</div>
     <div class="help-sections-grid">
       <div class="help-grid-item"><span class="help-grid-label">Search</span><span> Browse Gmail labels in a multi-column layout. Click a label to search the Gmail page. Combine with Location and Scope dropdowns for precise searching. Labels are dynamically filtered to show only those that appear on matching messages — a background cache builds progressively so subsequent searching is instant.</span></div>
-      <div class="help-grid-item"><span class="help-grid-label">Summary</span><span> Email summary view (coming soon).</span></div>
+      <div class="help-grid-item"><span class="help-grid-label">Summary</span><span> Curated views of labelled messages, organised into sub-tabs: <b>Deals</b> (messages with the <code>ads/deal</code> label) and <b>Reminders</b> (messages with both <code>notifications/calendar</code> and <code>pending</code>, grouped by event title — click a row to open all matching messages in Gmail).</span></div>
     </div>
   </div>
 

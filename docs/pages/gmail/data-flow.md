@@ -29,6 +29,8 @@ title: Gmail — Data Flow
 | `selectionChanged` | User selected/deselected a label or changed scope. Carries `{ labelId, scopeTimestamp }`. Service worker converts timestamp to date string for Gmail URLs, navigates Gmail, and calls `cacheManager.setFilterConfig()`. Also signals the search tab is active. `includeChildren` is read from `chrome.storage.local` by the SW. |
 | `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled). Also signals the search tab is inactive. |
 | `resetCache` | Clear IndexedDB cache and restart the orchestrator from scratch |
+| `getLabelMessageIds` | Summary tab asks for the cached message IDs of a label. Carries `{ labelId, requestId }`; service worker replies with `labelMessageIds`. |
+| `openMessage` | Navigate the Gmail tab to a URL (single message or search). Carries `{ url }`. |
 
 ## Message Types (service worker → sidepanel)
 
@@ -40,6 +42,7 @@ title: Gmail — Data Flow
 | `filterResults` | Pushed results from cache manager — carries `labelId`, `count`, `coLabelCounts`, `counts`, `filterConfig`, `partial` |
 | `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle) |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
+| `labelMessageIds` | Reply to `getLabelMessageIds`. Carries `{ requestId, labelId, ids }`. |
 
 ## Key Flows
 

@@ -3,6 +3,7 @@ import { ICON_PANEL, ICON_PANEL_1 } from "@core/icons.js";
 import { loadSettings, saveSetting } from "@core/settings.js";
 import type { PinMode, GmailLabel } from "@core/types.js";
 import * as searchTab from "./search-tab.js";
+import * as summaryTab from "./summary-tab.js";
 
 // Re-export for tests
 export { scopeToTimestamp, setIncludeChildren, setShowCounts, setShowStarred, setShowImportant, setScopeValue, reset as resetSearchTab } from "./search-tab.js";
@@ -256,7 +257,8 @@ function showContent(html: string): void {
 
 function showSummary(): void {
   switchZoomContext("gmail");
-  showContent('<div class="status">Summary is coming soon...</div>');
+  summaryTab.setLabels(searchTab.getCachedLabels());
+  void summaryTab.activate();
 }
 
 function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): void {
@@ -267,6 +269,7 @@ function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): 
     if (!skipNavigation && returnToInbox && onGmailPage) sendFiltersOff();
     showSummary();
   } else {
+    summaryTab.deactivate();
     switchZoomContext("gmail");
     searchTab.activate();
   }
@@ -333,8 +336,11 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     onGmailPage = true;
     // Detect Gmail account changes and reset state to avoid cross-account contamination
     const accountChanged = message.accountPath !== undefined && currentAccountPath !== null && message.accountPath !== currentAccountPath;
-    if (message.accountPath !== undefined) currentAccountPath = message.accountPath;
-    if (accountChanged) searchTab.reset();
+    if (message.accountPath !== undefined) {
+      currentAccountPath = message.accountPath;
+      summaryTab.setAccountPath(message.accountPath);
+    }
+    if (accountChanged) { searchTab.reset(); summaryTab.reset(); }
     // Auto-dismiss help if it was shown because user was on a non-Gmail page
     if (isShowingHelp() && !wasOffGmail && !accountChanged) return;
     showTabBar(true);
@@ -346,6 +352,10 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     }
   } else if (message.type === "labelsReady") {
     searchTab.handleMessage(message);
+    if (currentTab === "summary") {
+      summaryTab.setLabels(searchTab.getCachedLabels());
+      void summaryTab.activate();
+    }
     return;
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
@@ -354,7 +364,10 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
   } else if (message.type === "notOnGmail") {
     onGmailPage = false;
     searchTab.reset();
+    summaryTab.reset();
     if (!isShowingHelp()) showHelp();
+  } else if (message.type === "labelMessageIds") {
+    summaryTab.handleMessage(message as { type: string; requestId?: string; ids?: string[] });
   } else {
     // Delegate remaining messages (filterResults, cacheState, fetchError) to search tab
     searchTab.handleMessage(message);
@@ -370,7 +383,7 @@ const SIDEPANEL_SETTINGS_DEFAULTS = { [KEY_ZOOM]: {} as Record<string, number>, 
 
 export const ready = (async () => {
   // Load sidepanel settings and search tab settings in parallel
-  const [shellSettings] = await Promise.all([loadSettings(SIDEPANEL_SETTINGS_DEFAULTS), searchTab.init()]);
+  const [shellSettings] = await Promise.all([loadSettings(SIDEPANEL_SETTINGS_DEFAULTS), searchTab.init(), summaryTab.init()]);
   zoomLevels = shellSettings[KEY_ZOOM];
   currentPinMode = shellSettings[KEY_PIN_MODE] as PinMode;
   returnToInbox = shellSettings[KEY_RETURN_TO_INBOX];
@@ -385,6 +398,7 @@ export const ready = (async () => {
         const port = chrome.runtime.connect(undefined, { name: "sidepanel" });
         activePort = port;
         searchTab.setPort(port);
+        summaryTab.setPort(port);
         reconnectDelay = 1000;
         port.onMessage.addListener(handleMessage);
         chrome.windows.getCurrent().then((win) => {
@@ -394,6 +408,7 @@ export const ready = (async () => {
         port.onDisconnect.addListener(() => {
           activePort = null;
           searchTab.setPort(null);
+          summaryTab.setPort(null);
           if (!chrome.runtime?.id) return;
           setTimeout(connectToBackground, reconnectDelay);
           reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);

@@ -329,7 +329,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number }) => {
+  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number; requestId?: string; url?: string }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -389,6 +389,22 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         lastExtensionNavHash.set(state.gmailTabId, "inbox");
         chrome.tabs.update(state.gmailTabId, { url });
       }
+    } else if (message.type === "openMessage" && message.url !== undefined) {
+      const url = message.url;
+      if (state.gmailTabId !== null) {
+        const tabId = state.gmailTabId;
+        navGeneration.set(tabId, (navGeneration.get(tabId) ?? 0) + 1);
+        lastExtensionNavHash.set(tabId, urlHash(url));
+        chrome.tabs.update(tabId, { url, active: true }).catch(() => {});
+      }
+    } else if (message.type === "getLabelMessageIds" && message.labelId !== undefined && message.requestId !== undefined) {
+      const labelId = message.labelId;
+      const requestId = message.requestId;
+      cacheManager.getCachedLabelIds(labelId).then((ids) => {
+        try { port.postMessage({ type: "labelMessageIds", requestId, labelId, ids }); } catch { /* port may be dead */ }
+      }).catch((err) => {
+        try { port.postMessage({ type: "labelMessageIds", requestId, labelId, ids: [], error: err instanceof Error ? err.message : String(err) }); } catch { /* port may be dead */ }
+      });
     } else if (message.type === "resetCache") {
       const account = currentAccountPath ?? (state.gmailTabUrl ? gmailAccountPath(state.gmailTabUrl) : null);
       currentAccountPath = null;
