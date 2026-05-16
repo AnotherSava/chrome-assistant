@@ -147,11 +147,19 @@ export function formatLabelForQuery(labelName: string): string {
 }
 
 export interface MessageMetadata { id: string; subject: string; from: string; date: number }
+export interface MessageFull extends MessageMetadata { body: string }
+
+interface MessagePart {
+  mimeType?: string;
+  body?: { data?: string };
+  parts?: MessagePart[];
+  headers?: { name: string; value: string }[];
+}
 
 interface MessageGetResponse {
   id: string;
   internalDate?: string;
-  payload?: { headers?: { name: string; value: string }[] };
+  payload?: MessagePart;
 }
 
 function parseHeader(headers: { name: string; value: string }[] | undefined, name: string): string {
@@ -163,18 +171,55 @@ function parseHeader(headers: { name: string; value: string }[] | undefined, nam
   return "";
 }
 
-/** Fetch metadata (subject, from, date) for one message. */
+function decodeBase64Url(data: string): string {
+  const padded = data + "=".repeat((4 - (data.length % 4)) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function findPart(part: MessagePart, mimeType: string): MessagePart | null {
+  if (part.mimeType === mimeType && part.body?.data) return part;
+  for (const child of part.parts ?? []) {
+    const found = findPart(child, mimeType);
+    if (found) return found;
+  }
+  return null;
+}
+
+function stripHtml(html: string): string {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script, style").forEach((el) => el.remove());
+  return (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+function extractBodyText(payload: MessagePart | undefined): string {
+  if (!payload) return "";
+  const html = findPart(payload, "text/html");
+  if (html?.body?.data) return stripHtml(decodeBase64Url(html.body.data));
+  const plain = findPart(payload, "text/plain");
+  if (plain?.body?.data) return decodeBase64Url(plain.body.data);
+  return "";
+}
+
 async function fetchOneMessageMetadata(id: string, token: string): Promise<MessageMetadata> {
   const path = `/messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`;
   const data = await gmailFetch<MessageGetResponse>(path, token);
   return { id: data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0 };
 }
 
-/** Fetch metadata for many messages. Runs up to `concurrency` requests in parallel. Calls onProgress after each completed fetch with running totals. */
-export async function fetchMessagesMetadata(ids: string[], concurrency: number = 10, onProgress?: (done: number, total: number) => void): Promise<MessageMetadata[]> {
+async function fetchOneMessageFull(id: string, token: string): Promise<MessageFull> {
+  const path = `/messages/${encodeURIComponent(id)}?format=full`;
+  const data = await gmailFetch<MessageGetResponse>(path, token);
+  return { id: data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0, body: extractBodyText(data.payload) };
+}
+
+async function fetchMessagesConcurrent<T>(ids: string[], concurrency: number, fetchOne: (id: string, token: string) => Promise<T>, onProgress?: (done: number, total: number) => void): Promise<T[]> {
   if (ids.length === 0) return [];
   const token = await getAuthToken();
-  const results: MessageMetadata[] = new Array(ids.length);
+  const results: T[] = new Array(ids.length);
   let nextIndex = 0;
   let done = 0;
   const workers: Promise<void>[] = [];
@@ -184,7 +229,7 @@ export async function fetchMessagesMetadata(ids: string[], concurrency: number =
       while (true) {
         const i = nextIndex++;
         if (i >= ids.length) return;
-        results[i] = await fetchOneMessageMetadata(ids[i], token);
+        results[i] = await fetchOne(ids[i], token);
         done++;
         if (onProgress) onProgress(done, ids.length);
       }
@@ -192,5 +237,15 @@ export async function fetchMessagesMetadata(ids: string[], concurrency: number =
   }
   await Promise.all(workers);
   return results;
+}
+
+/** Fetch metadata (subject, from, date) for many messages. */
+export async function fetchMessagesMetadata(ids: string[], concurrency: number = 10, onProgress?: (done: number, total: number) => void): Promise<MessageMetadata[]> {
+  return fetchMessagesConcurrent(ids, concurrency, fetchOneMessageMetadata, onProgress);
+}
+
+/** Fetch full messages (metadata + decoded body text) for many messages. */
+export async function fetchMessagesFull(ids: string[], concurrency: number = 5, onProgress?: (done: number, total: number) => void): Promise<MessageFull[]> {
+  return fetchMessagesConcurrent(ids, concurrency, fetchOneMessageFull, onProgress);
 }
 

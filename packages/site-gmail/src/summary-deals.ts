@@ -1,6 +1,8 @@
 import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
-import { fetchMessagesMetadata, type MessageMetadata } from "./gmail-api.js";
+import { fetchMessagesFull, type MessageFull } from "./gmail-api.js";
+import { extractExpiryDate } from "./expiry.js";
+import { extractMaxDiscount } from "./discount.js";
 
 const PANE_ID = "sub-deals";
 const TARGET_LABEL_NAME = "ads/deal";
@@ -93,18 +95,29 @@ function renderProgress(done: number, total: number): void {
   if (el) el.textContent = `Loading ${done} / ${total}…`;
 }
 
-function renderEmails(messages: MessageMetadata[]): void {
-  messages.sort((a, b) => b.date - a.date);
-  setCount(messages.length);
-  if (messages.length === 0) {
+function renderEmails(messages: MessageFull[]): void {
+  const annotated = messages.map((m) => {
+    const text = `${m.subject} ${m.body}`;
+    return { m, expiry: extractExpiryDate(text), discount: extractMaxDiscount(text) };
+  });
+  annotated.sort((a, b) => {
+    if (a.expiry !== null && b.expiry !== null) return b.expiry - a.expiry;
+    if (a.expiry !== null) return -1;
+    if (b.expiry !== null) return 1;
+    return b.m.date - a.m.date;
+  });
+  setCount(annotated.length);
+  if (annotated.length === 0) {
     showContent('<div class="status">No emails in this label.</div>');
     return;
   }
-  const rows = messages.map((m) => {
+  const rows = annotated.map(({ m, expiry, discount }) => {
     const subject = m.subject || "(no subject)";
-    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(m.id)}"><span class="summary-from">${escapeHtml(extractName(m.from))}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-date">${escapeHtml(formatDate(m.date))}</span></div>`;
+    const expiryLabel = expiry !== null ? formatDate(expiry) : "?";
+    const discountLabel = discount !== null ? `$${discount}` : "";
+    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(m.id)}"><span class="summary-from">${escapeHtml(extractName(m.from))}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
   }).join("");
-  showContent(`<div class="summary-list">${rows}</div>`);
+  showContent(`<div class="summary-list deals">${rows}</div>`);
   document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
     row.addEventListener("click", () => {
       const id = row.dataset.msgId;
@@ -149,7 +162,7 @@ export async function activate(): Promise<void> {
   }
 
   try {
-    const messages = await fetchMessagesMetadata(ids, 10, (done, total) => {
+    const messages = await fetchMessagesFull(ids, 5, (done, total) => {
       if (generation === renderGeneration && isActive) renderProgress(done, total);
     });
     if (generation !== renderGeneration || !isActive) return;

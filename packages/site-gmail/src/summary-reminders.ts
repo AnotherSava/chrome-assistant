@@ -2,7 +2,7 @@ import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
 import { fetchMessagesMetadata, formatLabelForQuery, type MessageMetadata } from "./gmail-api.js";
 
-interface ReminderGroup { subject: string; count: number; latestDate: number }
+interface ReminderGroup { subject: string; count: number; latestDate: number; messageId: string | null }
 
 const PANE_ID = "sub-reminders";
 const TARGET_LABEL_NAMES = ["notifications/calendar", "pending"];
@@ -90,6 +90,10 @@ function buildGroupSearchUrl(subject: string): string {
   return `https://mail.google.com${accountPath}#search/${encodeURIComponent(query)}`;
 }
 
+function buildMessageUrl(messageId: string): string {
+  return `https://mail.google.com${accountPath}#all/${encodeURIComponent(messageId)}`;
+}
+
 function groupBySubject(messages: MessageMetadata[]): ReminderGroup[] {
   const map = new Map<string, ReminderGroup>();
   for (const m of messages) {
@@ -97,9 +101,10 @@ function groupBySubject(messages: MessageMetadata[]): ReminderGroup[] {
     const existing = map.get(subject);
     if (existing) {
       existing.count++;
+      existing.messageId = null;
       if (m.date > existing.latestDate) existing.latestDate = m.date;
     } else {
-      map.set(subject, { subject, count: 1, latestDate: m.date });
+      map.set(subject, { subject, count: 1, latestDate: m.date, messageId: m.id });
     }
   }
   return [...map.values()];
@@ -124,21 +129,27 @@ function renderEmails(messages: MessageMetadata[]): void {
   groups.sort((a, b) => b.latestDate - a.latestDate);
   const rows = groups.map((g) => {
     const display = g.count > 1 ? `${g.subject} (+${g.count - 1})` : g.subject;
-    return `<div class="summary-row reminders-row" data-subject="${escapeHtml(g.subject)}"><span class="summary-subject">${escapeHtml(display)}</span><span class="summary-date">${escapeHtml(formatDate(g.latestDate))}</span></div>`;
+    const idAttr = g.messageId !== null ? ` data-msg-id="${escapeHtml(g.messageId)}"` : "";
+    return `<div class="summary-row reminders-row" data-subject="${escapeHtml(g.subject)}"${idAttr}><span class="summary-subject">${escapeHtml(display)}</span><span class="summary-date">${escapeHtml(formatDate(g.latestDate))}</span></div>`;
   }).join("");
-  showContent(`<div class="summary-list">${rows}</div>`);
+  showContent(`<div class="summary-list reminders">${rows}</div>`);
   document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
     row.addEventListener("click", () => {
+      const messageId = row.dataset.msgId;
+      if (messageId) {
+        openUrl(buildMessageUrl(messageId));
+        return;
+      }
       const subject = row.dataset.subject;
-      if (subject !== undefined) openGroupSearch(subject);
+      if (subject !== undefined) openUrl(buildGroupSearchUrl(subject));
     });
   });
 }
 
-function openGroupSearch(subject: string): void {
+function openUrl(url: string): void {
   if (!port) return;
   try {
-    port.postMessage({ type: "openMessage", url: buildGroupSearchUrl(subject) });
+    port.postMessage({ type: "openMessage", url });
   } catch { /* port may be dead */ }
 }
 

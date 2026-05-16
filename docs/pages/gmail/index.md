@@ -46,7 +46,7 @@ When you select a parent label, its children are included by default — so sele
 - **Cache reset**: one-click refresh button rebuilds the cache from scratch
 - **Multi-account**: detects Gmail account path (`/mail/u/0/`, `/mail/u/1/`, …) and maintains a separate cache per account
 - **Return to inbox**: optionally navigates Gmail back to Inbox when the side panel closes
-- **Summary tab**: curated views of labelled messages — **Deals** (messages with the `ads/deal` label) and **Reminders** (messages with both `notifications/calendar` and `pending`, grouped by event title; clicking a row opens all matching messages in Gmail)
+- **Summary tab**: curated views of labelled messages — **Deals** (messages with the `ads/deal` label, with auto-extracted max discount and expiry date columns, sorted by expiry) and **Reminders** (messages with both `notifications/calendar` and `pending`, grouped by event title; single-message rows open that message, grouped rows open a Gmail search of the group)
 
 ### Standard features
 
