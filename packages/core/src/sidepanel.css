@@ -81,6 +81,8 @@ body {
   cursor: pointer;
 }
 .summary-row:hover { background: #262626; }
+.summary-row.active { background: #2a3a52; border-left: 2px solid #7db8f0; padding-left: 4px; }
+.summary-row.active:hover { background: #314568; }
 .summary-from { color: #ddd; font-size: 12px; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .summary-subject { color: #c5d6e8; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .summary-discount { color: #9ec99e; font-size: 11px; white-space: nowrap; font-weight: bold; text-align: right; }

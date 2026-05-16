@@ -321,6 +321,13 @@ function broadcastToWindow(windowId: number, message: Record<string, unknown>): 
   }
 }
 
+function broadcastGmailHash(windowId: number, url: string | null | undefined): void {
+  const onGmail = !!url && isGmail(url);
+  const hash = onGmail ? urlHash(url!) : "";
+  const isListView = !onGmail || isGmailListView(url!);
+  broadcastToWindow(windowId, { type: "gmailHashChanged", hash, isListView });
+}
+
 chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
   if (port.name !== "sidepanel") return;
 
@@ -344,6 +351,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           const account = gmailAccountPath(tab.url);
           const wasAlreadyRunning = cacheManager.isOrchestratorRunning() && currentAccountPath === account;
           port.postMessage({ type: "resultsReady", accountPath: account });
+          try { port.postMessage({ type: "gmailHashChanged", hash: urlHash(tab.url), isListView: isGmailListView(tab.url) }); } catch { /* port may be dead */ }
           startOrchestrator(account, getScopeForWindow(message.windowId));
           // Apply pending selection — selectionChanged may have arrived before
           // gmailTabId was set, so its navigation was skipped. Navigate now.
@@ -457,6 +465,13 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         broadcastToWindow(tab.windowId, { type: "userNavigated" });
       }
     }
+    // Keep stored URL fresh for hash-only navigations and notify sidepanel for row highlighting
+    if (tab.windowId !== undefined) {
+      for (const [, s] of portState) {
+        if (s.windowId === tab.windowId && s.gmailTabId === tabId) s.gmailTabUrl = changeInfo.url;
+      }
+      broadcastGmailHash(tab.windowId, changeInfo.url);
+    }
   }
   if (portState.size === 0) return;
   if (changeInfo.status === "complete") {
@@ -470,10 +485,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         if (!lastHash || (currentHash !== lastHash && !currentHash.startsWith(lastHash + "/"))) {
           broadcastToWindow(tab.windowId, { type: "resultsReady", accountPath: account });
         }
+        broadcastGmailHash(tab.windowId, tab.url);
         startOrchestrator(account, getScopeForWindow(tab.windowId));
       } else {
         updateGmailTab(tab.windowId, null, null);
         broadcastToWindow(tab.windowId, { type: "notOnGmail" });
+        broadcastGmailHash(tab.windowId, null);
         if (pinMode !== "pinned") closePanel(tabId);
       }
     }
@@ -492,10 +509,12 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
       const account = gmailAccountPath(tab.url);
       updateGmailTab(activeInfo.windowId, activeInfo.tabId, tab.url ?? null);
       broadcastToWindow(activeInfo.windowId, { type: "resultsReady", accountPath: account });
+      broadcastGmailHash(activeInfo.windowId, tab.url);
       startOrchestrator(account, getScopeForWindow(activeInfo.windowId));
     } else {
       updateGmailTab(activeInfo.windowId, null, null);
       broadcastToWindow(activeInfo.windowId, { type: "notOnGmail" });
+      broadcastGmailHash(activeInfo.windowId, null);
       if (pinMode !== "pinned") closePanel(activeInfo.tabId);
     }
   } catch { /* tab may not exist */ }

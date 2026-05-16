@@ -57,6 +57,11 @@ export function setAccountPath(path: string): void {
   remindersView.setAccountPath(path);
 }
 
+export function setGmailHash(hash: string, isListView: boolean): void {
+  dealsView.setGmailHash(hash, isListView);
+  remindersView.setGmailHash(hash, isListView);
+}
+
 export function reset(): void {
   dealsView.reset();
   remindersView.reset();

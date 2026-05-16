@@ -2,7 +2,7 @@ import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
 import { fetchMessagesMetadata, formatLabelForQuery, type MessageMetadata } from "./gmail-api.js";
 
-interface ReminderGroup { subject: string; count: number; latestDate: number; messageId: string | null }
+interface ReminderGroup { subject: string; count: number; latestDate: number; threadId: string | null }
 
 const PANE_ID = "sub-reminders";
 const TARGET_LABEL_NAMES = ["notifications/calendar", "pending"];
@@ -15,6 +15,7 @@ let renderGeneration = 0;
 let lastRenderedLabelKey: string | null = null;
 let lastCount: number | null = null;
 let countListener: ((count: number | null) => void) | null = null;
+let activeRowKey: string | null = null;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -38,6 +39,35 @@ export function setLabels(labels: GmailLabel[] | null): void {
 
 export function setAccountPath(path: string): void {
   accountPath = path;
+}
+
+export function setGmailHash(hash: string, isListView: boolean): void {
+  const pane = document.getElementById(PANE_ID);
+  // Grouped rows: match the search URL Gmail preserves verbatim.
+  if (pane && hash) {
+    const groupRow = [...pane.querySelectorAll<HTMLElement>(".summary-row[data-match-hash]")].find((row) => {
+      const mh = row.dataset.matchHash;
+      return mh !== undefined && (hash === mh || hash.startsWith(mh + "/"));
+    });
+    if (groupRow) {
+      activeRowKey = groupRow.dataset.matchHash ?? null;
+      updateActiveRow();
+      return;
+    }
+  }
+  // Single-message rows: Gmail rewrites the URL ID, so keep the clicked row highlighted
+  // until Gmail navigates to a list view (Inbox, label, etc.).
+  if (isListView) activeRowKey = null;
+  updateActiveRow();
+}
+
+function updateActiveRow(): void {
+  const pane = document.getElementById(PANE_ID);
+  if (!pane) return;
+  pane.querySelectorAll<HTMLElement>(".summary-row").forEach((row) => {
+    const key = row.dataset.matchHash ?? row.dataset.msgId ?? null;
+    row.classList.toggle("active", activeRowKey !== null && key === activeRowKey);
+  });
 }
 
 function showContent(html: string): void {
@@ -83,11 +113,18 @@ function cleanSubject(subject: string): string {
   return cleaned || subject;
 }
 
-function buildGroupSearchUrl(subject: string): string {
+function buildGroupQuery(subject: string): string {
   const labelClauses = TARGET_LABEL_NAMES.map(n => `label:${formatLabelForQuery(n)}`);
   const subjectClause = `subject:"${subject.replace(/"/g, "")}"`;
-  const query = [...labelClauses, subjectClause].join(" ");
-  return `https://mail.google.com${accountPath}#search/${encodeURIComponent(query)}`;
+  return [...labelClauses, subjectClause].join(" ");
+}
+
+function buildGroupSearchUrl(subject: string): string {
+  return `https://mail.google.com${accountPath}#search/${encodeURIComponent(buildGroupQuery(subject))}`;
+}
+
+function buildGroupMatchHash(subject: string): string {
+  return `search/${buildGroupQuery(subject)}`;
 }
 
 function buildMessageUrl(messageId: string): string {
@@ -101,10 +138,10 @@ function groupBySubject(messages: MessageMetadata[]): ReminderGroup[] {
     const existing = map.get(subject);
     if (existing) {
       existing.count++;
-      existing.messageId = null;
+      existing.threadId = null;
       if (m.date > existing.latestDate) existing.latestDate = m.date;
     } else {
-      map.set(subject, { subject, count: 1, latestDate: m.date, messageId: m.id });
+      map.set(subject, { subject, count: 1, latestDate: m.date, threadId: m.threadId });
     }
   }
   return [...map.values()];
@@ -129,21 +166,30 @@ function renderEmails(messages: MessageMetadata[]): void {
   groups.sort((a, b) => b.latestDate - a.latestDate);
   const rows = groups.map((g) => {
     const display = g.count > 1 ? `${g.subject} (+${g.count - 1})` : g.subject;
-    const idAttr = g.messageId !== null ? ` data-msg-id="${escapeHtml(g.messageId)}"` : "";
-    return `<div class="summary-row reminders-row" data-subject="${escapeHtml(g.subject)}"${idAttr}><span class="summary-subject">${escapeHtml(display)}</span><span class="summary-date">${escapeHtml(formatDate(g.latestDate))}</span></div>`;
+    const idAttr = g.threadId !== null ? ` data-msg-id="${escapeHtml(g.threadId)}"` : "";
+    const matchAttr = g.threadId === null ? ` data-match-hash="${escapeHtml(buildGroupMatchHash(g.subject))}"` : "";
+    return `<div class="summary-row reminders-row" data-subject="${escapeHtml(g.subject)}"${idAttr}${matchAttr}><span class="summary-subject">${escapeHtml(display)}</span><span class="summary-date">${escapeHtml(formatDate(g.latestDate))}</span></div>`;
   }).join("");
   showContent(`<div class="summary-list reminders">${rows}</div>`);
   document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
     row.addEventListener("click", () => {
       const messageId = row.dataset.msgId;
       if (messageId) {
+        activeRowKey = messageId;
+        updateActiveRow();
         openUrl(buildMessageUrl(messageId));
         return;
       }
       const subject = row.dataset.subject;
-      if (subject !== undefined) openUrl(buildGroupSearchUrl(subject));
+      const matchHash = row.dataset.matchHash;
+      if (subject !== undefined && matchHash !== undefined) {
+        activeRowKey = matchHash;
+        updateActiveRow();
+        openUrl(buildGroupSearchUrl(subject));
+      }
     });
   });
+  updateActiveRow();
 }
 
 function openUrl(url: string): void {
@@ -214,6 +260,7 @@ export function reset(): void {
   renderGeneration++;
   pendingRequests.clear();
   setCount(null);
+  activeRowKey = null;
 }
 
 export function handleMessage(message: { type: string; requestId?: string; ids?: string[] }): boolean {

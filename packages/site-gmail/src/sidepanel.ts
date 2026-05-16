@@ -330,7 +330,7 @@ document.getElementById("btn-help")?.addEventListener("click", () => {
 // Port connection to background (messages received via port.onMessage)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean }): void {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; accountPath?: string; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean; hash?: string; isListView?: boolean }): void {
   if (message.type === "resultsReady") {
     const wasOffGmail = !onGmailPage;
     onGmailPage = true;
@@ -366,6 +366,8 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "labelMessageIds") {
     summaryTab.handleMessage(message as { type: string; requestId?: string; ids?: string[] });
+  } else if (message.type === "gmailHashChanged") {
+    summaryTab.setGmailHash(message.hash ?? "", message.isListView ?? true);
   } else {
     // Delegate remaining messages (filterResults, cacheState, fetchError) to search tab
     searchTab.handleMessage(message);

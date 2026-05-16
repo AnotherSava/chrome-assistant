@@ -146,7 +146,7 @@ export function formatLabelForQuery(labelName: string): string {
   return `"${labelName.replace(/"/g, "").replace(/[/ ]/g, "-").toLowerCase()}"`;
 }
 
-export interface MessageMetadata { id: string; subject: string; from: string; date: number }
+export interface MessageMetadata { id: string; threadId: string; subject: string; from: string; date: number }
 export interface MessageFull extends MessageMetadata { body: string }
 
 interface MessagePart {
@@ -158,6 +158,7 @@ interface MessagePart {
 
 interface MessageGetResponse {
   id: string;
+  threadId?: string;
   internalDate?: string;
   payload?: MessagePart;
 }
@@ -207,13 +208,13 @@ function extractBodyText(payload: MessagePart | undefined): string {
 async function fetchOneMessageMetadata(id: string, token: string): Promise<MessageMetadata> {
   const path = `/messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`;
   const data = await gmailFetch<MessageGetResponse>(path, token);
-  return { id: data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0 };
+  return { id: data.id, threadId: data.threadId ?? data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0 };
 }
 
 async function fetchOneMessageFull(id: string, token: string): Promise<MessageFull> {
   const path = `/messages/${encodeURIComponent(id)}?format=full`;
   const data = await gmailFetch<MessageGetResponse>(path, token);
-  return { id: data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0, body: extractBodyText(data.payload) };
+  return { id: data.id, threadId: data.threadId ?? data.id, subject: parseHeader(data.payload?.headers, "Subject"), from: parseHeader(data.payload?.headers, "From"), date: data.internalDate ? parseInt(data.internalDate, 10) : 0, body: extractBodyText(data.payload) };
 }
 
 async function fetchMessagesConcurrent<T>(ids: string[], concurrency: number, fetchOne: (id: string, token: string) => Promise<T>, onProgress?: (done: number, total: number) => void): Promise<T[]> {

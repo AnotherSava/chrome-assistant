@@ -43,6 +43,7 @@ title: Gmail — Data Flow
 | `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle) |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
 | `labelMessageIds` | Reply to `getLabelMessageIds`. Carries `{ requestId, labelId, ids }`. |
+| `gmailHashChanged` | Gmail tab URL changed (or sidepanel just connected). Carries `{ hash, isListView }` — the decoded hash and whether it is a list view. Summary tab uses this to keep the clicked row highlighted until Gmail navigates away to a list view. |
 
 ## Key Flows
 

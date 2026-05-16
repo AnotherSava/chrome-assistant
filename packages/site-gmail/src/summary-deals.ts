@@ -15,6 +15,7 @@ let renderGeneration = 0;
 let lastRenderedLabelId: string | null = null;
 let lastCount: number | null = null;
 let countListener: ((count: number | null) => void) | null = null;
+let activeRowKey: string | null = null;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -38,6 +39,21 @@ export function setLabels(labels: GmailLabel[] | null): void {
 
 export function setAccountPath(path: string): void {
   accountPath = path;
+}
+
+export function setGmailHash(_hash: string, isListView: boolean): void {
+  // Gmail rewrites the message hash to its own internal ID, so we can't match by hash.
+  // Instead, keep the clicked row highlighted until Gmail navigates to a list view.
+  if (isListView) activeRowKey = null;
+  updateActiveRow();
+}
+
+function updateActiveRow(): void {
+  const pane = document.getElementById(PANE_ID);
+  if (!pane) return;
+  pane.querySelectorAll<HTMLElement>(".summary-row").forEach((row) => {
+    row.classList.toggle("active", activeRowKey !== null && row.dataset.msgId === activeRowKey);
+  });
 }
 
 function showContent(html: string): void {
@@ -115,15 +131,19 @@ function renderEmails(messages: MessageFull[]): void {
     const subject = m.subject || "(no subject)";
     const expiryLabel = expiry !== null ? formatDate(expiry) : "?";
     const discountLabel = discount !== null ? `$${discount}` : "";
-    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(m.id)}"><span class="summary-from">${escapeHtml(extractName(m.from))}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
+    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(m.threadId)}"><span class="summary-from">${escapeHtml(extractName(m.from))}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
   }).join("");
   showContent(`<div class="summary-list deals">${rows}</div>`);
   document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
     row.addEventListener("click", () => {
       const id = row.dataset.msgId;
-      if (id) openMessage(id);
+      if (!id) return;
+      activeRowKey = id;
+      updateActiveRow();
+      openMessage(id);
     });
   });
+  updateActiveRow();
 }
 
 function openMessage(messageId: string): void {
@@ -185,6 +205,7 @@ export function reset(): void {
   renderGeneration++;
   pendingRequests.clear();
   setCount(null);
+  activeRowKey = null;
 }
 
 export function handleMessage(message: { type: string; requestId?: string; ids?: string[] }): boolean {
