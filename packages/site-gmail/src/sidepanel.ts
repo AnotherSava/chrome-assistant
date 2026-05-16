@@ -363,8 +363,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     if (currentTab !== "summary") switchTab("summary", true);
   } else if (message.type === "notOnGmail") {
     onGmailPage = false;
-    searchTab.reset();
-    summaryTab.reset();
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "labelMessageIds") {
     summaryTab.handleMessage(message as { type: string; requestId?: string; ids?: string[] });
