@@ -1,9 +1,13 @@
 import type { CacheMessage } from "@core/types.js";
 
 const DB_NAME = "gmail-cache";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const MESSAGES_STORE = "messages";
 const META_STORE = "meta";
+export const SUMMARY_DEALS_STORE = "summary-deals";
+export const SUMMARY_REMINDERS_STORE = "summary-reminders";
+
+const ALL_STORES = [MESSAGES_STORE, META_STORE, SUMMARY_DEALS_STORE, SUMMARY_REMINDERS_STORE];
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -18,6 +22,12 @@ export function openDatabase(indexedDB: IDBFactory = globalThis.indexedDB): Prom
       }
       if (!db.objectStoreNames.contains(META_STORE)) {
         db.createObjectStore(META_STORE, { keyPath: "key" });
+      }
+      if (!db.objectStoreNames.contains(SUMMARY_DEALS_STORE)) {
+        db.createObjectStore(SUMMARY_DEALS_STORE, { keyPath: "messageId" });
+      }
+      if (!db.objectStoreNames.contains(SUMMARY_REMINDERS_STORE)) {
+        db.createObjectStore(SUMMARY_REMINDERS_STORE, { keyPath: "messageId" });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -100,9 +110,40 @@ export async function setMeta(key: string, value: unknown): Promise<void> {
 export async function clearAll(): Promise<void> {
   const db = await openDatabase();
   return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction([MESSAGES_STORE, META_STORE], "readwrite");
-    tx.objectStore(MESSAGES_STORE).clear();
-    tx.objectStore(META_STORE).clear();
+    const tx = db.transaction(ALL_STORES, "readwrite");
+    for (const name of ALL_STORES) tx.objectStore(name).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getSummaryRecords<T extends { messageId: string }>(storeName: string, ids: string[]): Promise<Map<string, T>> {
+  if (ids.length === 0) return new Map();
+  const db = await openDatabase();
+  return new Promise<Map<string, T>>((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const store = tx.objectStore(storeName);
+    const results = new Map<string, T>();
+    let completed = 0;
+    for (const id of ids) {
+      const request = store.get(id);
+      request.onsuccess = () => {
+        if (request.result) results.set(id, request.result as T);
+        completed++;
+        if (completed === ids.length) resolve(results);
+      };
+      request.onerror = () => reject(request.error);
+    }
+  });
+}
+
+export async function putSummaryRecords<T extends { messageId: string }>(storeName: string, records: T[]): Promise<void> {
+  if (records.length === 0) return;
+  const db = await openDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    for (const r of records) store.put(r);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

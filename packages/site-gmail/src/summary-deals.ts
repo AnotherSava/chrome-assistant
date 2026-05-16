@@ -1,8 +1,19 @@
 import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
-import { fetchMessagesFull, type MessageFull } from "./gmail-api.js";
+import { fetchMessagesFull } from "./gmail-api.js";
 import { extractExpiryDate } from "./expiry.js";
 import { extractMaxDiscount } from "./discount.js";
+import { getSummaryRecords, putSummaryRecords, SUMMARY_DEALS_STORE } from "./cache-db.js";
+
+export interface DealsCacheRecord {
+  messageId: string;
+  threadId: string;
+  fromName: string;
+  subject: string;
+  date: number;
+  expiry: number | null;
+  discount: number | null;
+}
 
 const PANE_ID = "sub-deals";
 const TARGET_LABEL_NAME = "ads/deal";
@@ -111,27 +122,23 @@ function renderProgress(done: number, total: number): void {
   if (el) el.textContent = `Loading ${done} / ${total}…`;
 }
 
-function renderEmails(messages: MessageFull[]): void {
-  const annotated = messages.map((m) => {
-    const text = `${m.subject} ${m.body}`;
-    return { m, expiry: extractExpiryDate(text), discount: extractMaxDiscount(text) };
-  });
-  annotated.sort((a, b) => {
+function renderRecords(records: DealsCacheRecord[]): void {
+  const sorted = [...records].sort((a, b) => {
     if (a.expiry !== null && b.expiry !== null) return b.expiry - a.expiry;
     if (a.expiry !== null) return -1;
     if (b.expiry !== null) return 1;
-    return b.m.date - a.m.date;
+    return b.date - a.date;
   });
-  setCount(annotated.length);
-  if (annotated.length === 0) {
+  setCount(sorted.length);
+  if (sorted.length === 0) {
     showContent('<div class="status">No emails in this label.</div>');
     return;
   }
-  const rows = annotated.map(({ m, expiry, discount }) => {
-    const subject = m.subject || "(no subject)";
-    const expiryLabel = expiry !== null ? formatDate(expiry) : "?";
-    const discountLabel = discount !== null ? `$${discount}` : "";
-    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(m.threadId)}"><span class="summary-from">${escapeHtml(extractName(m.from))}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
+  const rows = sorted.map((r) => {
+    const subject = r.subject || "(no subject)";
+    const expiryLabel = r.expiry !== null ? formatDate(r.expiry) : "?";
+    const discountLabel = r.discount !== null ? `$${r.discount}` : "";
+    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(r.threadId)}"><span class="summary-from">${escapeHtml(r.fromName)}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
   }).join("");
   showContent(`<div class="summary-list deals">${rows}</div>`);
   document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
@@ -177,16 +184,30 @@ export async function activate(): Promise<void> {
   const ids = await requestLabelMessageIds(label.id);
   if (generation !== renderGeneration || !isActive) return;
   if (ids.length === 0) {
-    renderEmails([]);
+    renderRecords([]);
     return;
   }
 
   try {
-    const messages = await fetchMessagesFull(ids, 5, (done, total) => {
-      if (generation === renderGeneration && isActive) renderProgress(done, total);
-    });
+    const cached = await getSummaryRecords<DealsCacheRecord>(SUMMARY_DEALS_STORE, ids);
     if (generation !== renderGeneration || !isActive) return;
-    renderEmails(messages);
+    const missingIds = ids.filter((id) => !cached.has(id));
+
+    if (missingIds.length > 0) {
+      const fetched = await fetchMessagesFull(missingIds, 5, (done, total) => {
+        if (generation === renderGeneration && isActive) renderProgress(done, total);
+      });
+      if (generation !== renderGeneration || !isActive) return;
+      const newRecords: DealsCacheRecord[] = fetched.map((m) => {
+        const text = `${m.subject} ${m.body}`;
+        return { messageId: m.id, threadId: m.threadId, fromName: extractName(m.from), subject: m.subject, date: m.date, expiry: extractExpiryDate(text), discount: extractMaxDiscount(text) };
+      });
+      await putSummaryRecords(SUMMARY_DEALS_STORE, newRecords);
+      for (const r of newRecords) cached.set(r.messageId, r);
+    }
+
+    const records = ids.map((id) => cached.get(id)).filter((r): r is DealsCacheRecord => r !== undefined);
+    renderRecords(records);
     lastRenderedLabelId = label.id;
   } catch (err) {
     if (generation !== renderGeneration || !isActive) return;

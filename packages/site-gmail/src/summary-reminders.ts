@@ -1,6 +1,14 @@
 import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
-import { fetchMessagesMetadata, formatLabelForQuery, type MessageMetadata } from "./gmail-api.js";
+import { fetchMessagesMetadata, formatLabelForQuery } from "./gmail-api.js";
+import { getSummaryRecords, putSummaryRecords, SUMMARY_REMINDERS_STORE } from "./cache-db.js";
+
+export interface RemindersCacheRecord {
+  messageId: string;
+  threadId: string;
+  subject: string;
+  date: number;
+}
 
 interface ReminderGroup { subject: string; count: number; latestDate: number; threadId: string | null }
 
@@ -131,17 +139,17 @@ function buildMessageUrl(messageId: string): string {
   return `https://mail.google.com${accountPath}#all/${encodeURIComponent(messageId)}`;
 }
 
-function groupBySubject(messages: MessageMetadata[]): ReminderGroup[] {
+function groupBySubject(records: RemindersCacheRecord[]): ReminderGroup[] {
   const map = new Map<string, ReminderGroup>();
-  for (const m of messages) {
-    const subject = cleanSubject(m.subject || "(no subject)");
+  for (const r of records) {
+    const subject = r.subject || "(no subject)";
     const existing = map.get(subject);
     if (existing) {
       existing.count++;
       existing.threadId = null;
-      if (m.date > existing.latestDate) existing.latestDate = m.date;
+      if (r.date > existing.latestDate) existing.latestDate = r.date;
     } else {
-      map.set(subject, { subject, count: 1, latestDate: m.date, threadId: m.threadId });
+      map.set(subject, { subject, count: 1, latestDate: r.date, threadId: r.threadId });
     }
   }
   return [...map.values()];
@@ -156,13 +164,13 @@ function renderProgress(done: number, total: number): void {
   if (el) el.textContent = `Loading ${done} / ${total}…`;
 }
 
-function renderEmails(messages: MessageMetadata[]): void {
-  setCount(messages.length);
-  if (messages.length === 0) {
+function renderRecords(records: RemindersCacheRecord[]): void {
+  setCount(records.length);
+  if (records.length === 0) {
     showContent('<div class="status">No emails in this label.</div>');
     return;
   }
-  const groups = groupBySubject(messages);
+  const groups = groupBySubject(records);
   groups.sort((a, b) => b.latestDate - a.latestDate);
   const rows = groups.map((g) => {
     const display = g.count > 1 ? `${g.subject} (+${g.count - 1})` : g.subject;
@@ -232,16 +240,27 @@ export async function activate(): Promise<void> {
   }
   const ids = [...intersection];
   if (ids.length === 0) {
-    renderEmails([]);
+    renderRecords([]);
     return;
   }
 
   try {
-    const messages = await fetchMessagesMetadata(ids, 10, (done, total) => {
-      if (generation === renderGeneration && isActive) renderProgress(done, total);
-    });
+    const cached = await getSummaryRecords<RemindersCacheRecord>(SUMMARY_REMINDERS_STORE, ids);
     if (generation !== renderGeneration || !isActive) return;
-    renderEmails(messages);
+    const missingIds = ids.filter((id) => !cached.has(id));
+
+    if (missingIds.length > 0) {
+      const fetched = await fetchMessagesMetadata(missingIds, 10, (done, total) => {
+        if (generation === renderGeneration && isActive) renderProgress(done, total);
+      });
+      if (generation !== renderGeneration || !isActive) return;
+      const newRecords: RemindersCacheRecord[] = fetched.map((m) => ({ messageId: m.id, threadId: m.threadId, subject: cleanSubject(m.subject), date: m.date }));
+      await putSummaryRecords(SUMMARY_REMINDERS_STORE, newRecords);
+      for (const r of newRecords) cached.set(r.messageId, r);
+    }
+
+    const records = ids.map((id) => cached.get(id)).filter((r): r is RemindersCacheRecord => r !== undefined);
+    renderRecords(records);
     lastRenderedLabelKey = labelKey;
   } catch (err) {
     if (generation !== renderGeneration || !isActive) return;
