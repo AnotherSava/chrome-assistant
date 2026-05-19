@@ -13,6 +13,38 @@ body {
   font-size: 13px;
   padding: 20px;
 }
+.status.error {
+  color: #f0a0a0;
+  background: rgba(196, 68, 68, 0.1);
+  border-left: 3px solid #c44;
+  padding: 12px 16px;
+  margin: 8px 4px;
+  border-radius: 2px;
+  word-break: break-word;
+}
+.status.error::before {
+  content: "Error: ";
+  font-weight: bold;
+  color: #ff7878;
+}
+.status.error .hint {
+  display: block;
+  margin-top: 10px;
+  color: #d8c890;
+  line-height: 1.5;
+}
+.status.error .hint::before {
+  content: "Try: ";
+  font-weight: bold;
+  color: #e6d090;
+}
+.status.error .hint a {
+  color: #9bc9ff;
+  text-decoration: underline;
+}
+.status.error .hint a:hover {
+  color: #b8d8ff;
+}
 
 /* Tab bar — fills space left of toolbar */
 .tab-bar {

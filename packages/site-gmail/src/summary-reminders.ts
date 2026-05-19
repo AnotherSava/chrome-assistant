@@ -1,5 +1,6 @@
 import { escapeHtml } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
+import { buildErrorHtml, type ErrorHint } from "@core/error-display.js";
 import { fetchMessagesMetadata, formatLabelForQuery } from "./gmail-api.js";
 import { getSummaryRecords, putSummaryRecords, SUMMARY_REMINDERS_STORE } from "./cache-db.js";
 
@@ -24,6 +25,8 @@ let lastRenderedLabelKey: string | null = null;
 let lastCount: number | null = null;
 let countListener: ((count: number | null) => void) | null = null;
 let activeRowKey: string | null = null;
+let lastFetchError: string | null = null;
+let lastFetchHint: ErrorHint | null = null;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -43,6 +46,7 @@ export function setPort(p: chrome.runtime.Port | null): void {
 
 export function setLabels(labels: GmailLabel[] | null): void {
   cachedLabels = labels;
+  if (labels !== null) { lastFetchError = null; lastFetchHint = null; }
 }
 
 export function setAccountPath(path: string): void {
@@ -159,6 +163,10 @@ function renderEmptyState(message: string): void {
   showContent(`<div class="status">${escapeHtml(message)}</div>`);
 }
 
+function renderErrorState(message: string, hint: ErrorHint | null = null): void {
+  showContent(buildErrorHtml(message, hint));
+}
+
 function renderProgress(done: number, total: number): void {
   const el = document.getElementById("reminders-loading");
   if (el) el.textContent = `Loading ${done} / ${total}…`;
@@ -212,7 +220,8 @@ export async function activate(): Promise<void> {
   const generation = ++renderGeneration;
 
   if (!cachedLabels) {
-    renderEmptyState("Loading labels…");
+    if (lastFetchError) renderErrorState(lastFetchError, lastFetchHint);
+    else renderEmptyState("Loading labels…");
     return;
   }
   const labels = findTargetLabels();
@@ -264,7 +273,7 @@ export async function activate(): Promise<void> {
     lastRenderedLabelKey = labelKey;
   } catch (err) {
     if (generation !== renderGeneration || !isActive) return;
-    renderEmptyState(`Failed to load emails: ${err instanceof Error ? err.message : String(err)}`);
+    renderErrorState(`Failed to load emails: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -280,9 +289,11 @@ export function reset(): void {
   pendingRequests.clear();
   setCount(null);
   activeRowKey = null;
+  lastFetchError = null;
+  lastFetchHint = null;
 }
 
-export function handleMessage(message: { type: string; requestId?: string; ids?: string[] }): boolean {
+export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
   if (message.type === "labelMessageIds" && message.requestId !== undefined) {
     const resolver = pendingRequests.get(message.requestId);
     if (resolver) {
@@ -290,6 +301,14 @@ export function handleMessage(message: { type: string; requestId?: string; ids?:
       resolver(message.ids ?? []);
       return true;
     }
+  }
+  if (message.type === "fetchError") {
+    lastRenderedLabelKey = null;
+    renderGeneration++;
+    lastFetchError = message.errorText ?? "Failed to load labels.";
+    lastFetchHint = message.hint ?? null;
+    if (isActive) renderErrorState(lastFetchError, lastFetchHint);
+    return true;
   }
   return false;
 }

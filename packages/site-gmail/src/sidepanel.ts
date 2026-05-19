@@ -368,8 +368,11 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     summaryTab.handleMessage(message as { type: string; requestId?: string; ids?: string[] });
   } else if (message.type === "gmailHashChanged") {
     summaryTab.setGmailHash(message.hash ?? "", message.isListView ?? true);
+  } else if (message.type === "fetchError") {
+    searchTab.handleMessage(message);
+    summaryTab.handleMessage(message);
   } else {
-    // Delegate remaining messages (filterResults, cacheState, fetchError) to search tab
+    // Delegate remaining messages (filterResults, cacheState) to search tab
     searchTab.handleMessage(message);
   }
 }

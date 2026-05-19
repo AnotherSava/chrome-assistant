@@ -1,6 +1,7 @@
 import { escapeHtml } from "@core/icons.js";
 import { loadSettings, saveSetting } from "@core/settings.js";
 import type { GmailLabel } from "@core/types.js";
+import { buildErrorHtml, type ErrorHint } from "@core/error-display.js";
 
 interface LabelTreeNode { name: string; fullName: string; id: string; type: string; children: LabelTreeNode[] }
 
@@ -45,6 +46,9 @@ let lastLabelResult: { labelId: string; coLabelCounts: Record<string, number> } 
 let lastResultsPartial = true;
 /** Whether labels have been rendered at least once — used to skip labelsReady render on reconnect */
 let labelsRendered = false;
+/** Most recent fatal startup error — shown in place of "Loading labels..." until labels arrive. */
+let lastFetchError: string | null = null;
+let lastFetchHint: ErrorHint | null = null;
 
 const LABELS_HIDDEN = new Set(["CHAT", "DRAFT", "SPAM", "TRASH", "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR", "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"]);
 /** System labels shown in fixed order before user labels */
@@ -537,6 +541,8 @@ export function activate(): void {
   if (cachedLabels) {
     sendSelectionChanged();
     renderFilteredLabels();
+  } else if (lastFetchError) {
+    showContent(buildErrorHtml(lastFetchError, lastFetchHint));
   } else {
     showContent('<div class="status">Loading labels...</div>');
   }
@@ -551,6 +557,8 @@ export function deactivate(): void {
 export function renderIfReady(): void {
   if (cachedLabels) {
     renderFilteredLabels();
+  } else if (lastFetchError) {
+    showContent(buildErrorHtml(lastFetchError, lastFetchHint));
   } else {
     showContent('<div class="status">Loading labels...</div>');
   }
@@ -565,6 +573,8 @@ export function reset(): void {
   lastLabelResult = null;
   lastCacheProgress = null;
   labelsRendered = false;
+  lastFetchError = null;
+  lastFetchHint = null;
   saveSetting("ca_active_label", null);
   saveSetting("ca_active_label_name", null);
 }
@@ -573,9 +583,11 @@ export function reset(): void {
 // Public API — message handling (returns true if handled)
 // ---------------------------------------------------------------------------
 
-export function handleMessage(message: { type: string; labels?: GmailLabel[]; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean }): boolean {
+export function handleMessage(message: { type: string; labels?: GmailLabel[]; phase?: string; labelsTotal?: number; labelsDone?: number; currentLabel?: string; errorText?: string; hint?: ErrorHint | null; labelId?: string; coLabelCounts?: Record<string, number>; counts?: Record<string, { own: number; inclusive: number }>; filterConfig?: Record<string, unknown>; partial?: boolean }): boolean {
   if (message.type === "labelsReady" && message.labels) {
     cachedLabels = message.labels;
+    lastFetchError = null;
+    lastFetchHint = null;
     if (message.counts) labelCounts = message.counts;
     // Validate and refresh saved label against the current account's labels
     if (activeLabelId !== null) {
@@ -628,7 +640,9 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ph
   }
 
   if (message.type === "fetchError") {
-    showContent('<div class="status">Failed to fetch emails. Try refreshing the page.</div>');
+    lastFetchError = message.errorText ?? "Failed to fetch emails.";
+    lastFetchHint = message.hint ?? null;
+    if (isActive) showContent(buildErrorHtml(lastFetchError, lastFetchHint));
     return true;
   }
 

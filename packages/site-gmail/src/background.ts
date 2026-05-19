@@ -1,9 +1,37 @@
 import type { PinMode } from "@core/types.js";
 import { loadSettings, onSettingChanged } from "@core/settings.js";
+import type { ErrorHint } from "@core/error-display.js";
 import { type GmailLabel, buildSearchQuery } from "./gmail-api.js";
 import { CacheManager, type CacheProgress, type ResultPush } from "./cache-manager.js";
 
 const GMAIL_PATTERN = /^https:\/\/mail\.google\.com\//;
+const CHROME_WEB_STORE_URL = "https://chromewebstore.google.com/detail/another-assistant-for-gma/hmkfblmfbeakcddfocbnochpmbaiaakl";
+
+/** Cached install type — populated at SW startup. "development" = loaded unpacked, "normal" = Chrome Web Store. chrome.management.getSelf() is the one management method that doesn't require the "management" permission. */
+let installType: chrome.management.ExtensionInfo["installType"] | null = null;
+chrome.management.getSelf().then((info) => { installType = info.installType; }).catch(() => {});
+
+function buildFetchErrorHint(errorText: string): ErrorHint | null {
+  if (/bad client id/i.test(errorText)) {
+    if (installType === "development") {
+      return {
+        text: "The extension is loaded unpacked, so it has a locally-generated ID that isn't authorized for this OAuth client in Google Cloud Console.",
+      };
+    }
+    return {
+      text: "The extension's ID doesn't match the OAuth client registration. Try reinstalling the published version:",
+      linkText: "Chrome Web Store listing",
+      linkUrl: CHROME_WEB_STORE_URL,
+    };
+  }
+  if (/OAuth2 not granted|user.+(denied|cancel)/i.test(errorText)) {
+    return { text: "Click the extension icon and grant access to Gmail when the consent screen appears." };
+  }
+  if (/Failed to fetch|NetworkError|net::ERR/i.test(errorText)) {
+    return { text: "Check your internet connection and reload Gmail." };
+  }
+  return null;
+}
 
 interface PortSelection { labelId: string | null; scopeTimestamp: number | null }
 interface PortState { onSearchTab: boolean; gmailTabId: number | null; gmailTabUrl: string | null; windowId: number | null; lastScopeTimestamp: number | null | undefined; lastSelection: PortSelection | null; pushGeneration: number }
@@ -78,8 +106,10 @@ cacheManager.setResultCallback(relayResultPush);
 
 let labelsPushed = false;
 cacheManager.setProgressCallback((progress: CacheProgress) => {
-  // Push labels to all ports when they first become available (cold start)
-  if (!labelsPushed && (progress.phase === "labels" || progress.phase === "complete")) {
+  // Push labels to all ports the first time the cache manager reports progress —
+  // labels are loaded in cacheManager.start() before the loop, so they're available
+  // on any progress event regardless of phase (including "scope" during scope fetch).
+  if (!labelsPushed) {
     const labels = cacheManager.getLabels();
     if (labels.length > 0) {
       labelsPushed = true;
@@ -190,7 +220,13 @@ export function startOrchestrator(accountPath: string, scopeTimestamp?: number |
   cacheManager.start(accountPath).catch((err) => {
     console.warn("Orchestrator start failed:", err);
     currentAccountPath = null;
+    labelsPushed = false;
     chrome.alarms.clear(CACHE_ALARM_NAME).catch(() => {});
+    const errorText = err instanceof Error ? err.message : String(err);
+    const hint = buildFetchErrorHint(errorText);
+    for (const [port] of portState) {
+      try { port.postMessage({ type: "fetchError", errorText, hint }); } catch { /* port may be dead */ }
+    }
   });
 }
 
