@@ -28,6 +28,8 @@ npm run build
 3. Click "Load unpacked" and select `packages/site-gmail/`
 4. The Another Assistant for Gmail icon appears in the Chrome toolbar
 
+The extension's ID is pinned to the Chrome Web Store-published ID (`hmkfblmfbeakcddfocbnochpmbaiaakl`) via the `"key"` field in `packages/site-gmail/manifest.json`. Every unpacked install on every machine produces this same ID, matching the OAuth client registered in Google Cloud Console — so OAuth works for both unpacked dev builds and CWS-installed end users with no per-machine setup.
+
 ## Commands
 
 - `npm run build` — production build for all sites
@@ -64,7 +66,7 @@ packages/
       sidepanel.css               shared side panel styles (dark theme, top bar, labels, help, zoom)
     tests/                        unit tests for core modules
   site-gmail/
-    manifest.json                 Gmail extension manifest (v3, side panel, OAuth2)
+    manifest.json                 Gmail extension manifest (v3, side panel, OAuth2, "key" for pinned ID)
     sidepanel.html                Side panel HTML entry point
     vite.config.ts                Gmail-specific Vite config
     src/
@@ -83,6 +85,21 @@ assets/
 ### Path aliases
 
 `@core` resolves to `packages/core/` and is configured in both `vite.config.base.ts` (for builds) and `vite.config.ts` (for tests). Site packages import shared code via `@core/settings.js`, `@core/icons.js`, etc.
+
+## OAuth setup
+
+The Gmail extension uses `chrome.identity.getAuthToken()` against an OAuth 2.0 Chrome Extension client registered in Google Cloud Console. The client is bound to a single **Item ID**, which must match the extension ID Chrome assigns at runtime.
+
+**For contributors using the committed OAuth client:** No setup required. The `"key"` field pins your unpacked ID to the published CWS ID, which matches the registered Item ID.
+
+**For forks using their own OAuth client:**
+
+1. Remove the `"key"` field from `manifest.json` so your unpacked install gets a unique ID.
+2. Read that ID from `chrome://extensions`.
+3. In Google Cloud Console, create a Chrome Extension OAuth client with that string as the **Item ID**.
+4. Replace `manifest.json`'s `oauth2.client_id` with your new client_id.
+
+**Troubleshooting `bad client id`:** If OAuth fails with `OAuth2 request failed: Service responded with error: 'bad client id: …'`, the extension's runtime ID (`chrome://extensions`) doesn't match the **Item ID** in the OAuth client at <https://console.cloud.google.com/auth/clients>. Update either side to reconcile. After Cloud Console edits, wait 5–60 min for propagation, then from the service worker's devtools console run `chrome.identity.clearAllCachedAuthTokens(() => {})` and fully quit/reopen Chrome.
 
 ## Architecture reference
 

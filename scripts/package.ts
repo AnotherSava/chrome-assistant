@@ -32,7 +32,12 @@ function addDir(dirPath: string, zipPrefix?: string, exclude?: (name: string) =>
   }
 }
 
-addFile("packages/site-gmail/manifest.json", "manifest.json");
+// Strip the top-level "key" field — used locally to pin the unpacked extension ID
+// to match the registered OAuth client, but the Chrome Web Store rejects uploads
+// that include it.
+const packagedManifest = { ...manifest };
+delete packagedManifest.key;
+zip.file("manifest.json", JSON.stringify(packagedManifest, null, 2) + "\n");
 addDir("packages/site-gmail/dist", "dist", (name) => name.endsWith(".map"));
 
 const outName = `gmail-assistant-${version}.zip`;
