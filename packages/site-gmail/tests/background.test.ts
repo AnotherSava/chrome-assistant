@@ -68,6 +68,7 @@ const tabsUpdateMock = vi.fn().mockResolvedValue(undefined);
   tabs: { onUpdated: { addListener: noop }, onActivated: { addListener: noop }, query: vi.fn(), update: tabsUpdateMock, get: vi.fn() },
   identity: { getAuthToken: noop, removeCachedAuthToken: noop },
   alarms: { create: alarmsCreateMock, clear: alarmsClearMock, get: vi.fn().mockResolvedValue(undefined), onAlarm: { addListener: noop } },
+  management: { getSelf: vi.fn().mockResolvedValue({ installType: "normal" }) },
 };
 
 const { buildGmailUrl, startOrchestrator, _resetCacheState, cacheManager } = await import("../src/background.js");

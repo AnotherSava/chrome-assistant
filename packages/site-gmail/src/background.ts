@@ -15,7 +15,7 @@ function buildFetchErrorHint(errorText: string): ErrorHint | null {
   if (/bad client id/i.test(errorText)) {
     if (installType === "development") {
       return {
-        text: "The extension is loaded unpacked, so it has a locally-generated ID that isn't authorized for this OAuth client in Google Cloud Console.",
+        text: "Chrome may be using an extension ID from before the manifest \"key\" was set. Remove the extension from chrome://extensions and load unpacked again — the reload button (and Extensions Reloader) doesn't recompute the ID.",
       };
     }
     return {
