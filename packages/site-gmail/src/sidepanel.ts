@@ -258,7 +258,7 @@ function showContent(html: string): void {
 function showSummary(): void {
   switchZoomContext("gmail");
   summaryTab.setLabels(searchTab.getCachedLabels());
-  void summaryTab.activate();
+  summaryTab.activate();
 }
 
 function switchTab(tab: "summary" | "search", skipNavigation: boolean = false): void {

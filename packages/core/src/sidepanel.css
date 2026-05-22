@@ -98,6 +98,19 @@ body {
 }
 .sub-tab:hover { color: #bbb; }
 .sub-tab.active { color: #ddd; border-bottom-color: #7db8f0; }
+.summary-undo-btn {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #777;
+  cursor: pointer;
+  padding: 5px 8px;
+  display: flex;
+  align-items: center;
+  margin-bottom: -1px;
+}
+.summary-undo-btn:hover:not(:disabled) { color: #ddd; }
+.summary-undo-btn:disabled { color: #444; cursor: default; }
 
 /* Summary tab */
 .summary-list { display: grid; width: 100%; column-gap: 10px; }
@@ -116,9 +129,47 @@ body {
 .summary-row.active { background: #2a3a52; border-left: 2px solid #7db8f0; padding-left: 4px; }
 .summary-row.active:hover { background: #314568; }
 .summary-from { color: #ddd; font-size: 12px; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.summary-subject { color: #c5d6e8; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.summary-subject { color: #c5d6e8; font-size: 12px; position: relative; overflow: hidden; min-width: 0; }
+.subject-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .summary-discount { color: #9ec99e; font-size: 11px; white-space: nowrap; font-weight: bold; text-align: right; }
 .summary-date { color: #888; font-size: 11px; white-space: nowrap; text-align: right; }
+
+.row-actions {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  visibility: hidden;
+  padding-left: 16px;
+  background: linear-gradient(to right, transparent 0, #1a1a1a 16px);
+}
+.summary-row:hover .row-actions { visibility: visible; background: linear-gradient(to right, transparent 0, #262626 16px); }
+.summary-row.active .row-actions { background: linear-gradient(to right, transparent 0, #2a3a52 16px); }
+.summary-row.active:hover .row-actions { background: linear-gradient(to right, transparent 0, #314568 16px); }
+.row-action-btn {
+  background: transparent;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: #888;
+  display: flex;
+  align-items: center;
+  border-radius: 3px;
+}
+.row-action-btn:hover { color: #ddd; background: rgba(255, 255, 255, 0.08); }
+.row-action-btn[data-action="delete"]:hover { color: #ff8888; background: rgba(255, 80, 80, 0.12); }
+
+.action-error-banner {
+  background: #4a1f1f;
+  color: #ffb0b0;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
 
 /* Label tree */
 .label-tree { list-style: none; margin: 0; padding: 0; }

@@ -149,6 +149,36 @@ export async function putSummaryRecords<T extends { messageId: string }>(storeNa
   });
 }
 
+export async function deleteSummaryRecords(storeName: string, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const db = await openDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    for (const id of ids) store.delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function removeFromLabelIndex(labelId: string, idsToRemove: string[]): Promise<void> {
+  if (idsToRemove.length === 0) return;
+  const existing = await getMeta<string[]>(`labelIdx:${labelId}`);
+  if (!existing) return;
+  const removeSet = new Set(idsToRemove);
+  const filtered = existing.filter((id) => !removeSet.has(id));
+  if (filtered.length !== existing.length) await setMeta(`labelIdx:${labelId}`, filtered);
+}
+
+export async function addToLabelIndex(labelId: string, idsToAdd: string[]): Promise<void> {
+  if (idsToAdd.length === 0) return;
+  const existing = await getMeta<string[]>(`labelIdx:${labelId}`);
+  const merged = existing ? [...existing] : [];
+  const existingSet = new Set(merged);
+  for (const id of idsToAdd) if (!existingSet.has(id)) merged.push(id);
+  await setMeta(`labelIdx:${labelId}`, merged);
+}
+
 export async function getMessageCount(): Promise<number> {
   const db = await openDatabase();
   return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.count());

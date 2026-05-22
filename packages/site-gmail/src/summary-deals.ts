@@ -1,10 +1,11 @@
-import { escapeHtml } from "@core/icons.js";
+import { escapeHtml, ICON_ARCHIVE, ICON_TRASH } from "@core/icons.js";
 import type { GmailLabel } from "@core/types.js";
 import { buildErrorHtml, type ErrorHint } from "@core/error-display.js";
-import { fetchMessagesFull } from "./gmail-api.js";
+import { fetchMessagesFull, archiveMessages, unarchiveMessages, trashMessages, untrashMessages, formatLabelForQuery } from "./gmail-api.js";
 import { extractExpiryDate } from "./expiry.js";
 import { extractMaxDiscount } from "./discount.js";
-import { getSummaryRecords, putSummaryRecords, SUMMARY_DEALS_STORE } from "./cache-db.js";
+import { getSummaryRecords, putSummaryRecords, deleteSummaryRecords, removeFromLabelIndex, addToLabelIndex, SUMMARY_DEALS_STORE } from "./cache-db.js";
+import { pushUndo } from "./undo-stack.js";
 
 export interface DealsCacheRecord {
   messageId: string;
@@ -17,19 +18,22 @@ export interface DealsCacheRecord {
 }
 
 const PANE_ID = "sub-deals";
-const TARGET_LABEL_NAME = "ads/deal";
+const TARGET_LABEL_NAMES = ["ads/deal", "pending"];
 
 let port: chrome.runtime.Port | null = null;
 let cachedLabels: GmailLabel[] | null = null;
 let accountPath: string = "/mail/u/0/";
 let isActive = false;
 let renderGeneration = 0;
-let lastRenderedLabelId: string | null = null;
+let lastRenderedLabelKey: string | null = null;
 let lastCount: number | null = null;
 let countListener: ((count: number | null) => void) | null = null;
 let activeRowKey: string | null = null;
 let lastFetchError: string | null = null;
 let lastFetchHint: ErrorHint | null = null;
+let currentRecords: DealsCacheRecord[] = [];
+let pendingLabelId: string | null = null;
+let dealLabelId: string | null = null;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -76,10 +80,10 @@ function showContent(html: string): void {
   if (pane) pane.innerHTML = html;
 }
 
-function findTargetLabel(): GmailLabel | null {
-  if (!cachedLabels) return null;
-  const lower = TARGET_LABEL_NAME.toLowerCase();
-  return cachedLabels.find((l) => l.name.toLowerCase() === lower) ?? null;
+function findTargetLabels(): GmailLabel[] {
+  if (!cachedLabels) return [];
+  const wanted = new Set(TARGET_LABEL_NAMES.map((n) => n.toLowerCase()));
+  return cachedLabels.filter((l) => wanted.has(l.name.toLowerCase()));
 }
 
 function requestLabelMessageIds(labelId: string): Promise<string[]> {
@@ -117,6 +121,26 @@ function buildMessageUrl(messageId: string): string {
   return `https://mail.google.com${accountPath}#all/${encodeURIComponent(messageId)}`;
 }
 
+function buildFilterQuery(): string {
+  return TARGET_LABEL_NAMES.map((n) => `label:${formatLabelForQuery(n)}`).join(" ");
+}
+
+export function sendGmailFilter(): void {
+  if (!port || !cachedLabels) return;
+  const labels = findTargetLabels();
+  if (labels.length < TARGET_LABEL_NAMES.length) return;
+  try {
+    port.postMessage({ type: "summaryFilter", query: buildFilterQuery() });
+  } catch { /* port may be dead */ }
+}
+
+function sendGmailRefresh(): void {
+  if (!port) return;
+  try {
+    port.postMessage({ type: "refreshGmailView" });
+  } catch { /* port may be dead */ }
+}
+
 function renderEmptyState(message: string): void {
   showContent(`<div class="status">${escapeHtml(message)}</div>`);
 }
@@ -130,8 +154,8 @@ function renderProgress(done: number, total: number): void {
   if (el) el.textContent = `Loading ${done} / ${total}…`;
 }
 
-function renderRecords(records: DealsCacheRecord[]): void {
-  const sorted = [...records].sort((a, b) => {
+function renderRecords(): void {
+  const sorted = [...currentRecords].sort((a, b) => {
     if (a.expiry !== null && b.expiry !== null) return b.expiry - a.expiry;
     if (a.expiry !== null) return -1;
     if (b.expiry !== null) return 1;
@@ -146,10 +170,13 @@ function renderRecords(records: DealsCacheRecord[]): void {
     const subject = r.subject || "(no subject)";
     const expiryLabel = r.expiry !== null ? formatDate(r.expiry) : "?";
     const discountLabel = r.discount !== null ? `$${r.discount}` : "";
-    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(r.threadId)}"><span class="summary-from">${escapeHtml(r.fromName)}</span><span class="summary-subject">${escapeHtml(subject)}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
+    const actions = `<span class="row-actions"><button class="row-action-btn" data-action="archive" data-message-id="${escapeHtml(r.messageId)}" title="Archive (remove pending)">${ICON_ARCHIVE}</button><button class="row-action-btn" data-action="delete" data-message-id="${escapeHtml(r.messageId)}" title="Move to Trash">${ICON_TRASH}</button></span>`;
+    return `<div class="summary-row deals-row" data-msg-id="${escapeHtml(r.threadId)}"><span class="summary-from">${escapeHtml(r.fromName)}</span><span class="summary-subject"><span class="subject-text">${escapeHtml(subject)}</span>${actions}</span><span class="summary-discount">${escapeHtml(discountLabel)}</span><span class="summary-date">${escapeHtml(expiryLabel)}</span></div>`;
   }).join("");
   showContent(`<div class="summary-list deals">${rows}</div>`);
-  document.querySelectorAll<HTMLElement>(`#${PANE_ID} .summary-row`).forEach((row) => {
+  const pane = document.getElementById(PANE_ID);
+  if (!pane) return;
+  pane.querySelectorAll<HTMLElement>(".summary-row").forEach((row) => {
     row.addEventListener("click", () => {
       const id = row.dataset.msgId;
       if (!id) return;
@@ -158,7 +185,107 @@ function renderRecords(records: DealsCacheRecord[]): void {
       openMessage(id);
     });
   });
+  pane.querySelectorAll<HTMLButtonElement>(".row-action-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const messageId = btn.dataset.messageId;
+      const action = btn.dataset.action;
+      if (!messageId) return;
+      const record = currentRecords.find((r) => r.messageId === messageId);
+      if (!record) return;
+      if (action === "archive") void handleArchive(record);
+      else if (action === "delete") void handleDelete(record);
+    });
+  });
   updateActiveRow();
+}
+
+function showActionError(message: string): void {
+  const pane = document.getElementById(PANE_ID);
+  if (!pane) return;
+  let banner = pane.querySelector<HTMLElement>(".action-error-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.className = "action-error-banner";
+    pane.insertBefore(banner, pane.firstChild);
+  }
+  banner.textContent = message;
+  const node = banner;
+  setTimeout(() => { if (node.parentNode) node.remove(); }, 4000);
+}
+
+async function handleArchive(record: DealsCacheRecord): Promise<void> {
+  if (!pendingLabelId) return;
+  const pendingId = pendingLabelId;
+  const messageIds = [record.messageId];
+  const originalIndex = currentRecords.indexOf(record);
+  currentRecords = currentRecords.filter((r) => r.messageId !== record.messageId);
+  renderRecords();
+  try {
+    await archiveMessages(messageIds, pendingId);
+  } catch (err) {
+    currentRecords.splice(originalIndex >= 0 ? originalIndex : currentRecords.length, 0, record);
+    renderRecords();
+    showActionError(`Archive failed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  await removeFromLabelIndex(pendingId, messageIds);
+  await deleteSummaryRecords(SUMMARY_DEALS_STORE, messageIds);
+  sendGmailRefresh();
+  pushUndo({
+    label: `Archive: ${record.subject || "(no subject)"}`,
+    undo: async () => {
+      try {
+        await unarchiveMessages(messageIds, pendingId);
+      } catch (err) {
+        showActionError(`Undo failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      }
+      await addToLabelIndex(pendingId, messageIds);
+      await putSummaryRecords(SUMMARY_DEALS_STORE, [record]);
+      currentRecords = [...currentRecords, record];
+      renderRecords();
+      sendGmailRefresh();
+    },
+  });
+}
+
+async function handleDelete(record: DealsCacheRecord): Promise<void> {
+  const messageIds = [record.messageId];
+  const originalIndex = currentRecords.indexOf(record);
+  const pendingId = pendingLabelId;
+  const dealId = dealLabelId;
+  currentRecords = currentRecords.filter((r) => r.messageId !== record.messageId);
+  renderRecords();
+  try {
+    await trashMessages(messageIds);
+  } catch (err) {
+    currentRecords.splice(originalIndex >= 0 ? originalIndex : currentRecords.length, 0, record);
+    renderRecords();
+    showActionError(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  if (pendingId) await removeFromLabelIndex(pendingId, messageIds);
+  if (dealId) await removeFromLabelIndex(dealId, messageIds);
+  await deleteSummaryRecords(SUMMARY_DEALS_STORE, messageIds);
+  sendGmailRefresh();
+  pushUndo({
+    label: `Delete: ${record.subject || "(no subject)"}`,
+    undo: async () => {
+      try {
+        await untrashMessages(messageIds);
+      } catch (err) {
+        showActionError(`Undo failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      }
+      if (pendingId) await addToLabelIndex(pendingId, messageIds);
+      if (dealId) await addToLabelIndex(dealId, messageIds);
+      await putSummaryRecords(SUMMARY_DEALS_STORE, [record]);
+      currentRecords = [...currentRecords, record];
+      renderRecords();
+      sendGmailRefresh();
+    },
+  });
 }
 
 function openMessage(messageId: string): void {
@@ -177,23 +304,35 @@ export async function activate(): Promise<void> {
     else renderEmptyState("Loading labels…");
     return;
   }
-  const label = findTargetLabel();
-  if (!label) {
-    lastRenderedLabelId = null;
+  const labels = findTargetLabels();
+  if (labels.length < TARGET_LABEL_NAMES.length) {
+    lastRenderedLabelKey = null;
     setCount(null);
-    renderEmptyState(`No label named "${TARGET_LABEL_NAME}" found in this account.`);
+    const present = new Set(labels.map((l) => l.name.toLowerCase()));
+    const missing = TARGET_LABEL_NAMES.filter((n) => !present.has(n.toLowerCase()));
+    renderEmptyState(`Missing label${missing.length === 1 ? "" : "s"}: ${missing.map((n) => `"${n}"`).join(", ")}.`);
     return;
   }
-  if (lastRenderedLabelId === label.id && document.getElementById(PANE_ID)?.querySelector(".summary-list")) {
+  pendingLabelId = labels.find((l) => l.name.toLowerCase() === "pending")?.id ?? null;
+  dealLabelId = labels.find((l) => l.name.toLowerCase() === "ads/deal")?.id ?? null;
+  const labelKey = labels.map((l) => l.id).sort().join(",");
+  if (lastRenderedLabelKey === labelKey && document.getElementById(PANE_ID)?.querySelector(".summary-list")) {
     return;
   }
 
   showContent('<div class="status" id="deals-loading">Loading…</div>');
 
-  const ids = await requestLabelMessageIds(label.id);
+  const idLists = await Promise.all(labels.map((l) => requestLabelMessageIds(l.id)));
   if (generation !== renderGeneration || !isActive) return;
+  let intersection = new Set(idLists[0] ?? []);
+  for (let i = 1; i < idLists.length; i++) {
+    const next = new Set(idLists[i]);
+    intersection = new Set([...intersection].filter((id) => next.has(id)));
+  }
+  const ids = [...intersection];
   if (ids.length === 0) {
-    renderRecords([]);
+    currentRecords = [];
+    renderRecords();
     return;
   }
 
@@ -215,9 +354,9 @@ export async function activate(): Promise<void> {
       for (const r of newRecords) cached.set(r.messageId, r);
     }
 
-    const records = ids.map((id) => cached.get(id)).filter((r): r is DealsCacheRecord => r !== undefined);
-    renderRecords(records);
-    lastRenderedLabelId = label.id;
+    currentRecords = ids.map((id) => cached.get(id)).filter((r): r is DealsCacheRecord => r !== undefined);
+    renderRecords();
+    lastRenderedLabelKey = labelKey;
   } catch (err) {
     if (generation !== renderGeneration || !isActive) return;
     renderErrorState(`Failed to load emails: ${err instanceof Error ? err.message : String(err)}`);
@@ -231,13 +370,16 @@ export function deactivate(): void {
 
 export function reset(): void {
   cachedLabels = null;
-  lastRenderedLabelId = null;
+  lastRenderedLabelKey = null;
   renderGeneration++;
   pendingRequests.clear();
   setCount(null);
   activeRowKey = null;
   lastFetchError = null;
   lastFetchHint = null;
+  currentRecords = [];
+  pendingLabelId = null;
+  dealLabelId = null;
 }
 
 export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
@@ -250,7 +392,7 @@ export function handleMessage(message: { type: string; requestId?: string; ids?:
     }
   }
   if (message.type === "fetchError") {
-    lastRenderedLabelId = null;
+    lastRenderedLabelKey = null;
     renderGeneration++;
     lastFetchError = message.errorText ?? "Failed to load labels.";
     lastFetchHint = message.hint ?? null;

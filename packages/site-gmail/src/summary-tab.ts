@@ -1,9 +1,10 @@
-import { escapeHtml } from "@core/icons.js";
+import { escapeHtml, ICON_UNDO } from "@core/icons.js";
 import { loadSettings, saveSetting } from "@core/settings.js";
 import type { GmailLabel } from "@core/types.js";
 import type { ErrorHint } from "@core/error-display.js";
 import * as dealsView from "./summary-deals.js";
 import * as remindersView from "./summary-reminders.js";
+import { clearUndo, popUndo, setUndoListener } from "./undo-stack.js";
 
 type SubTab = "deals" | "reminders";
 
@@ -71,6 +72,7 @@ export function reset(): void {
 export function deactivate(): void {
   dealsView.deactivate();
   remindersView.deactivate();
+  clearUndo();
 }
 
 export function activate(): void {
@@ -85,7 +87,8 @@ function ensureShellRendered(): void {
   contentEl.innerHTML = "";
   const bar = document.createElement("div");
   bar.className = "sub-tab-bar";
-  bar.innerHTML = SUB_TABS.map(t => `<button class="sub-tab" data-sub-tab="${t.id}">${escapeHtml(subTabLabel(t.id))}</button>`).join("");
+  const tabButtons = SUB_TABS.map(t => `<button class="sub-tab" data-sub-tab="${t.id}">${escapeHtml(subTabLabel(t.id))}</button>`).join("");
+  bar.innerHTML = `${tabButtons}<button class="summary-undo-btn" title="Undo last action" disabled>${ICON_UNDO}</button>`;
   contentEl.appendChild(bar);
   for (const t of SUB_TABS) {
     const pane = document.createElement("div");
@@ -97,12 +100,36 @@ function ensureShellRendered(): void {
   bar.querySelectorAll<HTMLButtonElement>(".sub-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       const tab = btn.dataset.subTab as SubTab;
-      if (tab === currentSubTab) return;
+      if (tab === currentSubTab) {
+        // Re-click on the active sub-tab: push its filter to the Gmail page.
+        if (tab === "deals") dealsView.sendGmailFilter();
+        else if (tab === "reminders") remindersView.sendGmailFilter();
+        return;
+      }
       currentSubTab = tab;
       saveSetting(KEY_SUB_TAB, tab);
+      clearUndo();
       showSubTab(tab);
     });
   });
+  const undoBtn = bar.querySelector<HTMLButtonElement>(".summary-undo-btn");
+  if (undoBtn) {
+    undoBtn.addEventListener("click", () => { void handleUndoClick(); });
+    setUndoListener((depth) => {
+      const el = document.querySelector<HTMLButtonElement>(".summary-undo-btn");
+      if (el) el.disabled = depth === 0;
+    });
+  }
+}
+
+async function handleUndoClick(): Promise<void> {
+  const entry = popUndo();
+  if (!entry) return;
+  try {
+    await entry.undo();
+  } catch {
+    // The view's undo callback already shows its own error.
+  }
 }
 
 function showSubTab(tab: SubTab): void {

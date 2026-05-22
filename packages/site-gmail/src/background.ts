@@ -234,6 +234,24 @@ function isGmail(url: string | undefined): boolean {
   return url !== undefined && GMAIL_PATTERN.test(url);
 }
 
+/** Click Gmail's own Refresh toolbar button via an injected script — re-queries the server without a full page reload. Falls back to chrome.tabs.reload if the button can't be located (e.g. non-English UI). */
+async function refreshGmailSearchUI(tabId: number): Promise<void> {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (): boolean => {
+        const btn = document.querySelector<HTMLElement>('[role="button"][aria-label="Refresh"]') ?? document.querySelector<HTMLElement>('[aria-label="Refresh"]');
+        if (!btn) return false;
+        btn.click();
+        return true;
+      },
+    });
+    if (results[0]?.result !== true) chrome.tabs.reload(tabId).catch(() => {});
+  } catch {
+    chrome.tabs.reload(tabId).catch(() => {});
+  }
+}
+
 function urlHash(url: string): string {
   const idx = url.indexOf("#");
   if (idx === -1) return "";
@@ -372,7 +390,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number; requestId?: string; url?: string }) => {
+  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number; requestId?: string; url?: string; query?: string | null }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -433,6 +451,22 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         lastExtensionNavHash.set(state.gmailTabId, "inbox");
         chrome.tabs.update(state.gmailTabId, { url });
       }
+    } else if (message.type === "summaryFilter") {
+      state.onSearchTab = false;
+      if (state.gmailTabId !== null && state.gmailTabUrl) {
+        const tabId = state.gmailTabId;
+        const base = `https://mail.google.com${gmailAccountPath(state.gmailTabUrl)}`;
+        const query = message.query ?? null;
+        navGeneration.set(tabId, (navGeneration.get(tabId) ?? 0) + 1);
+        const url = query ? `${base}#search/${encodeURIComponent(query)}` : `${base}#inbox`;
+        const targetHash = urlHash(url);
+        const currentHash = urlHash(state.gmailTabUrl);
+        lastExtensionNavHash.set(tabId, targetHash);
+        // Same URL: no-op (Gmail is already there). Different URL: SPA navigate.
+        if (currentHash !== targetHash) chrome.tabs.update(tabId, { url });
+      }
+    } else if (message.type === "refreshGmailView") {
+      if (state.gmailTabId !== null) void refreshGmailSearchUI(state.gmailTabId);
     } else if (message.type === "openMessage" && message.url !== undefined) {
       const url = message.url;
       if (state.gmailTabId !== null) {

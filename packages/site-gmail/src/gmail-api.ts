@@ -34,6 +34,18 @@ async function gmailFetch<T>(path: string, token: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function gmailPost(path: string, body: unknown): Promise<void> {
+  const token = await getAuthToken();
+  const init: RequestInit = { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  let response = await fetch(`${GMAIL_BASE}${path}`, init);
+  if (response.status === 401) {
+    const newToken = await refreshToken(token);
+    const retryInit: RequestInit = { ...init, headers: { Authorization: `Bearer ${newToken}`, "Content-Type": "application/json" } };
+    response = await fetch(`${GMAIL_BASE}${path}`, retryInit);
+  }
+  if (!response.ok) throw new Error(`Gmail API ${response.status}: ${response.statusText}`);
+}
+
 
 interface LabelsResponse {
   labels?: GmailLabel[];
@@ -248,5 +260,31 @@ export async function fetchMessagesMetadata(ids: string[], concurrency: number =
 /** Fetch full messages (metadata + decoded body text) for many messages. */
 export async function fetchMessagesFull(ids: string[], concurrency: number = 5, onProgress?: (done: number, total: number) => void): Promise<MessageFull[]> {
   return fetchMessagesConcurrent(ids, concurrency, fetchOneMessageFull, onProgress);
+}
+
+/** Batch-modify labels on a set of messages. Returns 204 on success. */
+export async function modifyMessageLabels(ids: string[], addLabelIds: string[], removeLabelIds: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await gmailPost("/messages/batchModify", { ids, addLabelIds, removeLabelIds });
+}
+
+/** Remove a label from messages (e.g. archive = remove "pending"). */
+export async function archiveMessages(ids: string[], pendingLabelId: string): Promise<void> {
+  await modifyMessageLabels(ids, [], [pendingLabelId]);
+}
+
+/** Re-add a label to messages (undo archive). */
+export async function unarchiveMessages(ids: string[], pendingLabelId: string): Promise<void> {
+  await modifyMessageLabels(ids, [pendingLabelId], []);
+}
+
+/** Move messages to Trash (recoverable, 30-day window). */
+export async function trashMessages(ids: string[]): Promise<void> {
+  await modifyMessageLabels(ids, ["TRASH"], []);
+}
+
+/** Restore messages from Trash (undo delete). */
+export async function untrashMessages(ids: string[]): Promise<void> {
+  await modifyMessageLabels(ids, [], ["TRASH"]);
 }
 

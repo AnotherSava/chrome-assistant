@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Another Assistant for Gmail",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Browse Gmail labels in a multi-column side panel. Click to filter. Narrow by time scope. Fast, local, private.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv1ljrK3d0OIi5Dhsh8twU8AyyGiN1uxFaQKMruJPLKujupjk/6o4VvEhoRKeEmM9/3vzdz8yMXEiNoINv98m5uQSBDOGjY8j/uL7dJQhphCYlOAWIZadk78+v85mrCFP7P2KZBolEFqiz+ikXylYKr+H4KZMyKLsfKe7NIVmbacb48eTCvw8spAFMhIEZ/i9Ko0Cr+0/zr+gB6axtadxhu+3J+saXGBrQGfatlhSML9OQaRi+WmxPwwz4CDjr+aTNZD78u9LUFdG5QRx7v4+tONMO41ZtZC9NVlhvG4R//0IG2L8nuMrWI+N9LKI2mwGnVHinxtBTsDQhlmS5JNaXwIDAQAB",
   "homepage_url": "https://anothersava.github.io/chrome-assistant/",
@@ -9,6 +9,7 @@
     "activeTab",
     "alarms",
     "identity",
+    "scripting",
     "sidePanel",
     "storage",
     "tabs"
@@ -19,7 +20,7 @@
   "oauth2": {
     "client_id": "726365485537-g0otc0f1bti0ekjo8bikm4h1ka67j6bp.apps.googleusercontent.com",
     "scopes": [
-      "https://www.googleapis.com/auth/gmail.readonly"
+      "https://www.googleapis.com/auth/gmail.modify"
     ]
   },
   "background": {
