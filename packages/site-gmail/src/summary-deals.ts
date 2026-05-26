@@ -34,6 +34,7 @@ let lastFetchHint: ErrorHint | null = null;
 let currentRecords: DealsCacheRecord[] = [];
 let pendingLabelId: string | null = null;
 let dealLabelId: string | null = null;
+let filterSentToGmail = false;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -61,9 +62,8 @@ export function setAccountPath(path: string): void {
 }
 
 export function setGmailHash(_hash: string, isListView: boolean): void {
-  // Gmail rewrites the message hash to its own internal ID, so we can't match by hash.
-  // Instead, keep the clicked row highlighted until Gmail navigates to a list view.
-  if (isListView) activeRowKey = null;
+  const pane = document.getElementById(PANE_ID);
+  if (isListView && pane?.querySelector(".summary-row")) activeRowKey = null;
   updateActiveRow();
 }
 
@@ -129,6 +129,7 @@ export function sendGmailFilter(): void {
   if (!port || !cachedLabels) return;
   const labels = findTargetLabels();
   if (labels.length < TARGET_LABEL_NAMES.length) return;
+  filterSentToGmail = true;
   try {
     port.postMessage({ type: "summaryFilter", query: buildFilterQuery() });
   } catch { /* port may be dead */ }
@@ -139,6 +140,19 @@ function sendGmailRefresh(): void {
   try {
     port.postMessage({ type: "refreshGmailView" });
   } catch { /* port may be dead */ }
+}
+
+function sendGmailInbox(): void {
+  if (!port) return;
+  try {
+    port.postMessage({ type: "filtersOff" });
+  } catch { /* port may be dead */ }
+}
+
+function navigateBackAfterAction(): void {
+  activeRowKey = null;
+  if (filterSentToGmail) sendGmailFilter();
+  else sendGmailInbox();
 }
 
 function renderEmptyState(message: string): void {
@@ -219,6 +233,7 @@ async function handleArchive(record: DealsCacheRecord): Promise<void> {
   const pendingId = pendingLabelId;
   const messageIds = [record.messageId];
   const originalIndex = currentRecords.indexOf(record);
+  const navigateBack = activeRowKey !== null && record.threadId === activeRowKey;
   currentRecords = currentRecords.filter((r) => r.messageId !== record.messageId);
   renderRecords();
   try {
@@ -231,7 +246,8 @@ async function handleArchive(record: DealsCacheRecord): Promise<void> {
   }
   await removeFromLabelIndex(pendingId, messageIds);
   await deleteSummaryRecords(SUMMARY_DEALS_STORE, messageIds);
-  sendGmailRefresh();
+  if (navigateBack) navigateBackAfterAction();
+  else sendGmailRefresh();
   pushUndo({
     label: `Archive: ${record.subject || "(no subject)"}`,
     undo: async () => {
@@ -255,6 +271,7 @@ async function handleDelete(record: DealsCacheRecord): Promise<void> {
   const originalIndex = currentRecords.indexOf(record);
   const pendingId = pendingLabelId;
   const dealId = dealLabelId;
+  const navigateBack = activeRowKey !== null && record.threadId === activeRowKey;
   currentRecords = currentRecords.filter((r) => r.messageId !== record.messageId);
   renderRecords();
   try {
@@ -268,7 +285,8 @@ async function handleDelete(record: DealsCacheRecord): Promise<void> {
   if (pendingId) await removeFromLabelIndex(pendingId, messageIds);
   if (dealId) await removeFromLabelIndex(dealId, messageIds);
   await deleteSummaryRecords(SUMMARY_DEALS_STORE, messageIds);
-  sendGmailRefresh();
+  if (navigateBack) navigateBackAfterAction();
+  else sendGmailRefresh();
   pushUndo({
     label: `Delete: ${record.subject || "(no subject)"}`,
     undo: async () => {
@@ -380,6 +398,7 @@ export function reset(): void {
   currentRecords = [];
   pendingLabelId = null;
   dealLabelId = null;
+  filterSentToGmail = false;
 }
 
 export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {

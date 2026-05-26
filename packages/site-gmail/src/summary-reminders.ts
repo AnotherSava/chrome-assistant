@@ -30,6 +30,7 @@ let lastFetchError: string | null = null;
 let lastFetchHint: ErrorHint | null = null;
 let currentRecords: RemindersCacheRecord[] = [];
 let remindLabelId: string | null = null;
+let filterSentToGmail = false;
 const pendingRequests = new Map<string, (ids: string[]) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
@@ -70,9 +71,7 @@ export function setGmailHash(hash: string, isListView: boolean): void {
       return;
     }
   }
-  // Single-message rows: Gmail rewrites the URL ID, so keep the clicked row highlighted
-  // until Gmail navigates to a list view (Inbox, label, etc.).
-  if (isListView) activeRowKey = null;
+  if (isListView && pane?.querySelector(".summary-row")) activeRowKey = null;
   updateActiveRow();
 }
 
@@ -153,6 +152,7 @@ function buildFilterQuery(): string {
 export function sendGmailFilter(): void {
   if (!port || !cachedLabels) return;
   if (!findTargetLabel()) return;
+  filterSentToGmail = true;
   try {
     port.postMessage({ type: "summaryFilter", query: buildFilterQuery() });
   } catch { /* port may be dead */ }
@@ -163,6 +163,25 @@ function sendGmailRefresh(): void {
   try {
     port.postMessage({ type: "refreshGmailView" });
   } catch { /* port may be dead */ }
+}
+
+function sendGmailInbox(): void {
+  if (!port) return;
+  try {
+    port.postMessage({ type: "filtersOff" });
+  } catch { /* port may be dead */ }
+}
+
+function wasViewingActionedRow(subject: string, affected: RemindersCacheRecord[]): boolean {
+  if (activeRowKey === null) return false;
+  if (affected.some((r) => r.threadId === activeRowKey)) return true;
+  return activeRowKey === buildGroupMatchHash(subject);
+}
+
+function navigateBackAfterAction(): void {
+  activeRowKey = null;
+  if (filterSentToGmail) sendGmailFilter();
+  else sendGmailInbox();
 }
 
 function groupBySubject(records: RemindersCacheRecord[]): ReminderGroup[] {
@@ -274,9 +293,11 @@ async function handleArchive(subject: string): Promise<void> {
     showActionError(`Archive failed: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
+  const navigateBack = wasViewingActionedRow(subject, affected);
   await removeFromLabelIndex(remindId, messageIds);
   await deleteSummaryRecords(SUMMARY_REMINDERS_STORE, messageIds);
-  sendGmailRefresh();
+  if (navigateBack) navigateBackAfterAction();
+  else sendGmailRefresh();
   pushUndo({
     label: `Archive: ${subject || "(no subject)"}${affected.length > 1 ? ` (${affected.length})` : ""}`,
     undo: async () => {
@@ -301,6 +322,7 @@ async function handleDelete(subject: string): Promise<void> {
   const messageIds = affected.map((r) => r.messageId);
   const affectedSet = new Set(messageIds);
   const remindId = remindLabelId;
+  const navigateBack = wasViewingActionedRow(subject, affected);
   currentRecords = currentRecords.filter((r) => !affectedSet.has(r.messageId));
   renderRecords();
   try {
@@ -313,7 +335,8 @@ async function handleDelete(subject: string): Promise<void> {
   }
   if (remindId) await removeFromLabelIndex(remindId, messageIds);
   await deleteSummaryRecords(SUMMARY_REMINDERS_STORE, messageIds);
-  sendGmailRefresh();
+  if (navigateBack) navigateBackAfterAction();
+  else sendGmailRefresh();
   pushUndo({
     label: `Delete: ${subject || "(no subject)"}${affected.length > 1 ? ` (${affected.length})` : ""}`,
     undo: async () => {
@@ -411,6 +434,7 @@ export function reset(): void {
   lastFetchHint = null;
   currentRecords = [];
   remindLabelId = null;
+  filterSentToGmail = false;
 }
 
 export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
