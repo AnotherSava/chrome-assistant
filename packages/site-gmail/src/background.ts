@@ -41,6 +41,9 @@ const pendingReturnToInbox = new Map<number, ReturnType<typeof setTimeout>>();
 const lastExtensionNavHash = new Map<number, string>();
 /** Per-tab generation counter for navigateGmailToLabel — prevents stale loadLabels callbacks from navigating to an outdated label after rapid label changes. Keyed by tabId to avoid cross-tab interference in multi-window scenarios. */
 const navGeneration = new Map<number, number>();
+/** Summary label-name lookups that arrived before labels finished loading. Flushed once labels are available, so Summary never has to know about the label list or wait on a push. */
+interface PendingLabelRequest { port: chrome.runtime.Port; labelName: string; requestId: string }
+let pendingLabelRequests: PendingLabelRequest[] = [];
 let pinMode: PinMode = "pinned";
 let returnToInbox = true;
 let includeChildren = true;
@@ -119,6 +122,8 @@ cacheManager.setProgressCallback((progress: CacheProgress) => {
       }
     }
   }
+  // Answer any Summary label-name lookups that were waiting for labels to load.
+  flushPendingLabelRequests();
   for (const [port] of portState) {
     try { port.postMessage({ type: "cacheState", ...progress }); } catch { /* port may be dead */ }
   }
@@ -228,6 +233,26 @@ export function startOrchestrator(accountPath: string, scopeTimestamp?: number |
       try { port.postMessage({ type: "fetchError", errorText, hint }); } catch { /* port may be dead */ }
     }
   });
+}
+
+/** Resolve a label name to its ID and cached message IDs against the live label list, replying on the port. Returns false (doing nothing) if the answer isn't final yet — labels still loading, or the label's index not yet built — so the caller can queue the request until it is. A name that resolves to no label is answered immediately (genuine absence). */
+function tryResolveLabelRequest(port: chrome.runtime.Port, labelName: string, requestId: string): boolean {
+  const labels = cacheManager.getLabels();
+  if (labels.length === 0) return false;
+  const lower = labelName.toLowerCase();
+  const labelId = labels.find((l) => l.name.toLowerCase() === lower)?.id ?? null;
+  if (labelId !== null && !cacheManager.isLabelReady(labelId)) return false;
+  void (async () => {
+    const ids = labelId ? await cacheManager.getCachedLabelIds(labelId) : [];
+    try { port.postMessage({ type: "labelMessageIds", requestId, labelId, ids }); } catch { /* port may be dead */ }
+  })();
+  return true;
+}
+
+/** Answer queued label-name lookups whose data has since become available; keep the rest queued. Called on every orchestrator progress event, so each request resolves as soon as its label finishes indexing. */
+function flushPendingLabelRequests(): void {
+  if (pendingLabelRequests.length === 0) return;
+  pendingLabelRequests = pendingLabelRequests.filter((req) => !tryResolveLabelRequest(req.port, req.labelName, req.requestId));
 }
 
 function isGmail(url: string | undefined): boolean {
@@ -390,7 +415,14 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
 
   // Window ID will be set by the "initWindow" message from the side panel
 
-  port.onMessage.addListener((message: { type: string; labelId?: string; scopeTimestamp?: number | null; windowId?: number; requestId?: string; url?: string; query?: string | null }) => {
+  const pushLabelsToPort = (): void => {
+    const labels = cacheManager.getLabels();
+    if (labels.length === 0) return;
+    const labelsWithNone = labels.some(l => l.id === "NONE") ? labels : [...labels, { id: "NONE", name: "No user labels", type: "system" }];
+    try { port.postMessage({ type: "labelsReady", labels: labelsWithNone }); } catch { /* port may be dead */ }
+  };
+
+  port.onMessage.addListener((message: { type: string; labelId?: string; labelName?: string; scopeTimestamp?: number | null; windowId?: number; requestId?: string; url?: string; query?: string | null }) => {
     if (message.type === "initWindow" && message.windowId !== undefined) {
       state.windowId = message.windowId;
       chrome.tabs.query({ active: true, windowId: message.windowId }).then((tabs) => {
@@ -414,11 +446,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
           }
           // When the orchestrator is already warm, push cached labels and counts immediately
           if (wasAlreadyRunning) {
-            const labels = cacheManager.getLabels();
-            if (labels.length > 0) {
-              const labelsWithNone = labels.some(l => l.id === "NONE") ? labels : [...labels, { id: "NONE", name: "No user labels", type: "system" }];
-              try { port.postMessage({ type: "labelsReady", labels: labelsWithNone }); } catch { /* port may be dead */ }
-            }
+            pushLabelsToPort();
             const scopeTimestamp = state.lastScopeTimestamp ?? null;
             if (scopeTimestamp !== null) cacheManager.requestScopeFetch(scopeTimestamp);
             pushResultsForPort(port, { labelId: null, scopeTimestamp });
@@ -475,14 +503,12 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
         lastExtensionNavHash.set(tabId, urlHash(url));
         chrome.tabs.update(tabId, { url, active: true }).catch(() => {});
       }
-    } else if (message.type === "getLabelMessageIds" && message.labelId !== undefined && message.requestId !== undefined) {
-      const labelId = message.labelId;
-      const requestId = message.requestId;
-      cacheManager.getCachedLabelIds(labelId).then((ids) => {
-        try { port.postMessage({ type: "labelMessageIds", requestId, labelId, ids }); } catch { /* port may be dead */ }
-      }).catch((err) => {
-        try { port.postMessage({ type: "labelMessageIds", requestId, labelId, ids: [], error: err instanceof Error ? err.message : String(err) }); } catch { /* port may be dead */ }
-      });
+    } else if (message.type === "getLabelMessageIds" && message.labelName !== undefined && message.requestId !== undefined) {
+      // Summary asks for a label by name; the background owns name→ID resolution against
+      // the live label list. If labels haven't loaded yet, queue until they do.
+      if (!tryResolveLabelRequest(port, message.labelName, message.requestId)) {
+        pendingLabelRequests.push({ port, labelName: message.labelName, requestId: message.requestId });
+      }
     } else if (message.type === "resetCache") {
       const account = currentAccountPath ?? (state.gmailTabUrl ? gmailAccountPath(state.gmailTabUrl) : null);
       currentAccountPath = null;
@@ -507,6 +533,7 @@ chrome.runtime.onConnect.addListener((port: chrome.runtime.Port) => {
       }, 2000);
       pendingReturnToInbox.set(tabId, timeoutId);
     }
+    pendingLabelRequests = pendingLabelRequests.filter((r) => r.port !== port);
     portState.delete(port);
   });
 });

@@ -29,7 +29,7 @@ title: Gmail — Data Flow
 | `selectionChanged` | User selected/deselected a label or changed scope. Carries `{ labelId, scopeTimestamp }`. Service worker converts timestamp to date string for Gmail URLs, navigates Gmail, and calls `cacheManager.setFilterConfig()`. Also signals the search tab is active. `includeChildren` is read from `chrome.storage.local` by the SW. |
 | `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled). Also signals the search tab is inactive. |
 | `resetCache` | Clear IndexedDB cache and restart the orchestrator from scratch |
-| `getLabelMessageIds` | Summary tab asks for the cached message IDs of a label. Carries `{ labelId, requestId }`; service worker replies with `labelMessageIds`. |
+| `getLabelMessageIds` | Summary tab asks for a label's cached message IDs **by name**. Carries `{ labelName, requestId }`; the service worker resolves the name to an ID against the live label list and replies with `labelMessageIds`, queuing the request until that label's index is built (so Summary never depends on the label-list push). |
 | `openMessage` | Navigate the Gmail tab to a URL (single message or search). Carries `{ url }`. |
 
 ## Message Types (service worker → sidepanel)
@@ -40,9 +40,9 @@ title: Gmail — Data Flow
 | `notOnGmail` | Active tab is not Gmail |
 | `labelsReady` | Label list pushed proactively — carries `labels` array (includes synthetic NONE label). Sent on warm reconnect (from cache manager's in-memory list) and on cold start (when initial build begins). |
 | `filterResults` | Pushed results from cache manager — carries `labelId`, `count`, `coLabelCounts`, `counts`, `filterConfig`, `partial` |
-| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle) |
+| `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`, and optional `errorText` when the current fetch is failing/backing off. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle). Consumed by Search (progress bar + ⚠) and Summary (a "retrying" note while a lookup waits on a stuck build). |
 | `userNavigated` | User navigated Gmail to a different list view (not caused by the extension) |
-| `labelMessageIds` | Reply to `getLabelMessageIds`. Carries `{ requestId, labelId, ids }`. |
+| `labelMessageIds` | Reply to `getLabelMessageIds`. Carries `{ requestId, labelId, ids }` where `labelId` is the resolved label ID (`null` if the name matches no label) and `ids` are its cached message IDs. |
 | `gmailHashChanged` | Gmail tab URL changed (or sidepanel just connected). Carries `{ hash, isListView }` — the decoded hash and whether it is a list view. Summary tab uses this to keep the clicked row highlighted until Gmail navigates away to a list view. |
 
 ## Key Flows

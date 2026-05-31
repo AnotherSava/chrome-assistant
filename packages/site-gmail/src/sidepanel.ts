@@ -257,7 +257,8 @@ function showContent(html: string): void {
 
 function showSummary(): void {
   switchZoomContext("gmail");
-  summaryTab.setLabels(searchTab.getCachedLabels());
+  // Summary resolves its fixed labels (remind / ads/deal+pending) by name through the
+  // background — it never needs the label list, so there's nothing to hand it here.
   summaryTab.activate();
 }
 
@@ -352,10 +353,6 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     }
   } else if (message.type === "labelsReady") {
     searchTab.handleMessage(message);
-    if (currentTab === "summary") {
-      summaryTab.setLabels(searchTab.getCachedLabels());
-      void summaryTab.activate();
-    }
     return;
   } else if (message.type === "userNavigated") {
     // User clicked a Gmail navigation link (Inbox, Sent, label, etc.) — switch to Summary
@@ -365,14 +362,19 @@ export function handleMessage(message: { type: string; labels?: GmailLabel[]; ac
     onGmailPage = false;
     if (!isShowingHelp()) showHelp();
   } else if (message.type === "labelMessageIds") {
-    summaryTab.handleMessage(message as { type: string; requestId?: string; ids?: string[] });
+    summaryTab.handleMessage(message as { type: string; requestId?: string; labelId?: string | null; ids?: string[] });
   } else if (message.type === "gmailHashChanged") {
     summaryTab.setGmailHash(message.hash ?? "", message.isListView ?? true);
   } else if (message.type === "fetchError") {
     searchTab.handleMessage(message);
     summaryTab.handleMessage(message);
+  } else if (message.type === "cacheState") {
+    // Both tabs need cache progress/errors: Search shows the progress bar, Summary surfaces
+    // a "retrying" note while a lookup waits on a stuck/erroring build.
+    searchTab.handleMessage(message);
+    summaryTab.handleMessage(message);
   } else {
-    // Delegate remaining messages (filterResults, cacheState) to search tab
+    // Delegate remaining messages (filterResults) to search tab
     searchTab.handleMessage(message);
   }
 }

@@ -269,6 +269,11 @@ export class CacheManager {
     return this.initialBuildComplete;
   }
 
+  /** Whether a label's cached message-ID index is final — either the initial build finished (all labels covered) or this specific label has already been indexed this build. Used to defer Summary lookups until the answer is real, not a premature empty set. */
+  isLabelReady(labelId: string): boolean {
+    return this.initialBuildComplete || this.processedLabels.has(labelId);
+  }
+
   /** Set the in-memory last refresh timestamp. */
   setLastRefreshTimestamp(timestamp: number | null): void {
     this.lastRefreshTimestamp = timestamp;

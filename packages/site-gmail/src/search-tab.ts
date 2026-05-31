@@ -121,12 +121,6 @@ export function setPort(p: chrome.runtime.Port | null): void {
   port = p;
 }
 
-/** Return the labels last received from the service worker (or null if none yet). */
-export function getCachedLabels(): GmailLabel[] | null {
-  return cachedLabels;
-}
-
-
 // ---------------------------------------------------------------------------
 // Public API — display settings (called by shell's display panel)
 // ---------------------------------------------------------------------------

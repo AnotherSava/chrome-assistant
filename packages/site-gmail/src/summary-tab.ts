@@ -1,6 +1,5 @@
 import { escapeHtml, ICON_UNDO } from "@core/icons.js";
 import { loadSettings, saveSetting } from "@core/settings.js";
-import type { GmailLabel } from "@core/types.js";
 import type { ErrorHint } from "@core/error-display.js";
 import * as dealsView from "./summary-deals.js";
 import * as remindersView from "./summary-reminders.js";
@@ -47,11 +46,6 @@ function updateSubTabBadge(tab: SubTab): void {
 export function setPort(p: chrome.runtime.Port | null): void {
   dealsView.setPort(p);
   remindersView.setPort(p);
-}
-
-export function setLabels(labels: GmailLabel[] | null): void {
-  dealsView.setLabels(labels);
-  remindersView.setLabels(labels);
 }
 
 export function setAccountPath(path: string): void {
@@ -147,7 +141,7 @@ function showSubTab(tab: SubTab): void {
   }
 }
 
-export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
+export function handleMessage(message: { type: string; requestId?: string; labelId?: string | null; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
   const dealsHandled = dealsView.handleMessage(message);
   const remindersHandled = remindersView.handleMessage(message);
   return dealsHandled || remindersHandled;

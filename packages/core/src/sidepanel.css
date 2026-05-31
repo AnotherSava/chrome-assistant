@@ -13,6 +13,12 @@ body {
   font-size: 13px;
   padding: 20px;
 }
+.status-subnote {
+  color: #c99;
+  font-size: 11px;
+  padding: 0 20px 16px;
+  cursor: help;
+}
 .status.error {
   color: #f0a0a0;
   background: rgba(196, 68, 68, 0.1);

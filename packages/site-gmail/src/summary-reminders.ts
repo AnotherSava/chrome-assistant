@@ -1,5 +1,4 @@
 import { escapeHtml, ICON_ARCHIVE, ICON_TRASH } from "@core/icons.js";
-import type { GmailLabel } from "@core/types.js";
 import { buildErrorHtml, type ErrorHint } from "@core/error-display.js";
 import { fetchMessagesMetadata, formatLabelForQuery, archiveMessages, unarchiveMessages, trashMessages, untrashMessages } from "./gmail-api.js";
 import { getSummaryRecords, putSummaryRecords, deleteSummaryRecords, removeFromLabelIndex, addToLabelIndex, SUMMARY_REMINDERS_STORE } from "./cache-db.js";
@@ -13,12 +12,13 @@ export interface RemindersCacheRecord {
 }
 
 interface ReminderGroup { subject: string; count: number; latestDate: number; threadId: string | null }
+/** A name→ID resolution from the background, plus the cached message IDs in that label. */
+interface LabelLookup { labelId: string | null; ids: string[] }
 
 const PANE_ID = "sub-reminders";
 const TARGET_LABEL_NAME = "remind";
 
 let port: chrome.runtime.Port | null = null;
-let cachedLabels: GmailLabel[] | null = null;
 let accountPath: string = "/mail/u/0/";
 let isActive = false;
 let renderGeneration = 0;
@@ -28,10 +28,11 @@ let countListener: ((count: number | null) => void) | null = null;
 let activeRowKey: string | null = null;
 let lastFetchError: string | null = null;
 let lastFetchHint: ErrorHint | null = null;
+let lastCacheError: string | null = null;
 let currentRecords: RemindersCacheRecord[] = [];
 let remindLabelId: string | null = null;
 let filterSentToGmail = false;
-const pendingRequests = new Map<string, (ids: string[]) => void>();
+const pendingRequests = new Map<string, (result: LabelLookup) => void>();
 
 export function setOnCount(fn: ((count: number | null) => void) | null): void {
   countListener = fn;
@@ -46,11 +47,6 @@ function setCount(count: number | null): void {
 
 export function setPort(p: chrome.runtime.Port | null): void {
   port = p;
-}
-
-export function setLabels(labels: GmailLabel[] | null): void {
-  cachedLabels = labels;
-  if (labels !== null) { lastFetchError = null; lastFetchHint = null; }
 }
 
 export function setAccountPath(path: string): void {
@@ -89,22 +85,16 @@ function showContent(html: string): void {
   if (pane) pane.innerHTML = html;
 }
 
-function findTargetLabel(): GmailLabel | null {
-  if (!cachedLabels) return null;
-  const lower = TARGET_LABEL_NAME.toLowerCase();
-  return cachedLabels.find((l) => l.name.toLowerCase() === lower) ?? null;
-}
-
-function requestLabelMessageIds(labelId: string): Promise<string[]> {
-  if (!port) return Promise.resolve([]);
+function requestLabelMessageIds(labelName: string): Promise<LabelLookup> {
+  if (!port) return Promise.resolve({ labelId: null, ids: [] });
   const requestId = `reminders-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  return new Promise<string[]>((resolve) => {
+  return new Promise<LabelLookup>((resolve) => {
     pendingRequests.set(requestId, resolve);
     try {
-      port!.postMessage({ type: "getLabelMessageIds", labelId, requestId });
+      port!.postMessage({ type: "getLabelMessageIds", labelName, requestId });
     } catch {
       pendingRequests.delete(requestId);
-      resolve([]);
+      resolve({ labelId: null, ids: [] });
     }
   });
 }
@@ -150,8 +140,7 @@ function buildFilterQuery(): string {
 }
 
 export function sendGmailFilter(): void {
-  if (!port || !cachedLabels) return;
-  if (!findTargetLabel()) return;
+  if (!port || remindLabelId === null) return;
   filterSentToGmail = true;
   try {
     port.postMessage({ type: "summaryFilter", query: buildFilterQuery() });
@@ -211,6 +200,13 @@ function renderErrorState(message: string, hint: ErrorHint | null = null): void 
 function renderProgress(done: number, total: number): void {
   const el = document.getElementById("reminders-loading");
   if (el) el.textContent = `Loading ${done} / ${total}…`;
+}
+
+/** Loading placeholder. While the background defers our lookup (cache still building), a cache
+ * fetch error is surfaced here as a "retrying" note so a stuck build is visible on this tab too. */
+function renderLoading(): void {
+  const note = lastCacheError ? `<div class="status-subnote" title="${escapeHtml(lastCacheError)}">⚠ Trouble reaching Gmail — retrying…</div>` : "";
+  showContent(`<div class="status" id="reminders-loading">Loading…</div>${note}`);
 }
 
 function renderRecords(): void {
@@ -366,28 +362,29 @@ export async function activate(): Promise<void> {
   isActive = true;
   const generation = ++renderGeneration;
 
-  if (!cachedLabels) {
-    if (lastFetchError) renderErrorState(lastFetchError, lastFetchHint);
-    else renderEmptyState("Loading labels…");
-    return;
-  }
-  const label = findTargetLabel();
-  if (!label) {
+  // Show the sticky fetch error if we have one, else a loading placeholder (only when
+  // nothing is rendered yet — the background may defer the reply until labels load, and we
+  // don't want to blank an existing list). Always (re)issue the request regardless, so a
+  // recovered orchestrator re-populates us without needing a separate re-activation.
+  const hadList = document.getElementById(PANE_ID)?.querySelector(".summary-list") !== null;
+  if (lastFetchError) renderErrorState(lastFetchError, lastFetchHint);
+  else if (!hadList) renderLoading();
+
+  const { labelId, ids } = await requestLabelMessageIds(TARGET_LABEL_NAME);
+  if (generation !== renderGeneration || !isActive) return;
+  if (labelId === null) {
     lastRenderedLabelKey = null;
+    remindLabelId = null;
     setCount(null);
     renderEmptyState(`No label named "${TARGET_LABEL_NAME}" found in this account.`);
     return;
   }
-  remindLabelId = label.id;
-  const labelKey = label.id;
-  if (lastRenderedLabelKey === labelKey && document.getElementById(PANE_ID)?.querySelector(".summary-list")) {
-    return;
-  }
-
-  showContent('<div class="status" id="reminders-loading">Loading…</div>');
-
-  const ids = await requestLabelMessageIds(label.id);
-  if (generation !== renderGeneration || !isActive) return;
+  // A real resolution means labels loaded fine — clear any sticky fetch error.
+  lastFetchError = null;
+  lastFetchHint = null;
+  remindLabelId = labelId;
+  if (lastRenderedLabelKey === labelId && hadList) return;
+  renderLoading();
   if (ids.length === 0) {
     currentRecords = [];
     renderRecords();
@@ -411,7 +408,7 @@ export async function activate(): Promise<void> {
 
     currentRecords = ids.map((id) => cached.get(id)).filter((r): r is RemindersCacheRecord => r !== undefined);
     renderRecords();
-    lastRenderedLabelKey = labelKey;
+    lastRenderedLabelKey = labelId;
   } catch (err) {
     if (generation !== renderGeneration || !isActive) return;
     renderErrorState(`Failed to load emails: ${err instanceof Error ? err.message : String(err)}`);
@@ -424,7 +421,6 @@ export function deactivate(): void {
 }
 
 export function reset(): void {
-  cachedLabels = null;
   lastRenderedLabelKey = null;
   renderGeneration++;
   pendingRequests.clear();
@@ -432,27 +428,39 @@ export function reset(): void {
   activeRowKey = null;
   lastFetchError = null;
   lastFetchHint = null;
+  lastCacheError = null;
   currentRecords = [];
   remindLabelId = null;
   filterSentToGmail = false;
 }
 
-export function handleMessage(message: { type: string; requestId?: string; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
+export function handleMessage(message: { type: string; requestId?: string; labelId?: string | null; ids?: string[]; errorText?: string; hint?: ErrorHint | null }): boolean {
   if (message.type === "labelMessageIds" && message.requestId !== undefined) {
     const resolver = pendingRequests.get(message.requestId);
     if (resolver) {
       pendingRequests.delete(message.requestId);
-      resolver(message.ids ?? []);
+      resolver({ labelId: message.labelId ?? null, ids: message.ids ?? [] });
       return true;
     }
   }
   if (message.type === "fetchError") {
+    // Don't bump renderGeneration: leave the in-flight activate's request alive so a later
+    // recovery (orchestrator restart flushing the queued lookup) resolves it and re-renders.
     lastRenderedLabelKey = null;
-    renderGeneration++;
     lastFetchError = message.errorText ?? "Failed to load labels.";
     lastFetchHint = message.hint ?? null;
     if (isActive) renderErrorState(lastFetchError, lastFetchHint);
     return true;
+  }
+  if (message.type === "cacheState") {
+    // Track the cache's current fetch error so a stuck/erroring build is surfaced in our
+    // loading placeholder (clears automatically when the next progress event has no error).
+    const err = message.errorText ?? null;
+    if (err !== lastCacheError) {
+      lastCacheError = err;
+      if (isActive && document.getElementById("reminders-loading")) renderLoading();
+    }
+    return false;
   }
   return false;
 }
