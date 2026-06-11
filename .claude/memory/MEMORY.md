@@ -1,0 +1,5 @@
+- [Rollup native module fix](feedback_rollup_fix.md) — after external tools run npm, reinstall @rollup/rollup-win32-x64-msvc immediately
+- [claude-mermaid Windows bug](reference_mermaid_windows_bug.md) — plugin fails with "spawn npx ENOENT", write .mmd files directly until upstream fix
+- [Icon regeneration workflow](reference_icon_regeneration.md) — re-render icon-{16,48,128}.png from icon.svg via @resvg/resvg-js (install with --no-save --force)
+- [Gmail extension published](project_published_gmail.md) — live unlisted on Chrome Web Store at hmkfblmfbeakcddfocbnochpmbaiaakl since 2026-05-12 (private beta, OAuth-gated)
+- [Summary tab plan](project_summary_tab_plan.md) — Deals (ads/deal ∩ pending) + Reminders (remind) sub-views shipped with archive/delete/undo; near-duplicates by design — defer abstraction until a third view appears
