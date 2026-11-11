@@ -11,7 +11,7 @@ title: Development
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20.19+, 22.12+ or 24+
 - Chrome 134+
 
 ### Install
@@ -110,7 +110,7 @@ The Gmail extension uses `chrome.identity.getAuthToken()` against an OAuth 2.0 C
 
 ## Testing
 
-Tests use vitest and run in a jsdom environment with `fake-indexeddb` and `chrome-types` shims.
+Tests use vitest and run in the Node environment, with `fake-indexeddb` standing in for IndexedDB; the side panel tests opt into happy-dom per file.
 
 ```
 npm test                        # Run all tests

@@ -27,7 +27,7 @@ vi.mock("../src/cache-manager.js", () => {
   const mockIsScopeReady = vi.fn().mockReturnValue(true);
   const mockRequestScopeFetch = vi.fn();
   return {
-    CacheManager: vi.fn().mockImplementation(() => ({
+    CacheManager: vi.fn().mockImplementation(function () { return {
       start: mockStart,
       stop: mockStop,
       isOrchestratorRunning: mockIsOrchestratorRunning,
@@ -49,7 +49,7 @@ vi.mock("../src/cache-manager.js", () => {
       isInitialBuildComplete: vi.fn().mockReturnValue(true),
       showStarred: false,
       showImportant: false,
-    })),
+    }; }),
   };
 });
 
