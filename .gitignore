@@ -10,18 +10,14 @@ dist/
 # Packaging
 *.zip
 
-# Ralphex
-.ralphex/
+# Test coverage and plans
 coverage/
 docs/plans/*
 !docs/plans/completed/
 !docs/plans/draft/
 
-# ralphex progress logs
-.ralphex/progress/
-
 # Draft documentation
 docs/draft/
 
 # Local convenience scripts (not committed)
-scripts/
+/scripts/
