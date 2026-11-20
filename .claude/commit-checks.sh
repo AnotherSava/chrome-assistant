@@ -26,13 +26,15 @@ status=0
 
 # Buffer each step and print its output only when it fails, so a pass is one line and a failure
 # shows everything the tool said. The pass line keeps the tool's last line, which for the
-# conventions checker names the rules it ran.
+# conventions checker names the rules it ran. A tool silent on success (tsc) reads "ok"; npm runs
+# with --silent so its command echo does not stand in for the tool's own output.
 run() {
-  local label="$1" out
+  local label="$1" out last
   shift
   out="$(mktemp)"
   if "$@" >"$out" 2>&1; then
-    echo "==> $label — $(sed 's/\x1b\[[0-9;]*m//g' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)"
+    last="$(sed 's/\x1b\[[0-9;]*m//g' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)"
+    echo "==> $label — ${last:-ok}"
   else
     echo "==> $label — FAILED"
     cat "$out"
@@ -42,8 +44,8 @@ run() {
 }
 
 run "Conventions" python3 ~/.claude/conventions/check.py .
-run "Lint (tsc --noEmit)" npm run lint
-run "Tests" npm test
-run "Build" npm run build
+run "Lint (tsc --noEmit)" npm run --silent lint
+run "Tests" npm run --silent test
+run "Build" npm run --silent build
 
 exit "$status"
