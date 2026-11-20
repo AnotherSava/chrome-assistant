@@ -15,3 +15,7 @@ heading_anchors: true
 exclude:
   - plans/
   - draft/
+  # The screenshot manifest is a developer file; Jekyll serves everything under docs/ not listed here.
+  - screenshots/screenshots.json
+  # Inputs to the frame step; Jekyll would otherwise publish each one beside its own frame.
+  - screenshots/raw/

@@ -1,0 +1,72 @@
+{
+  "screenshots": [
+    {
+      "id": "main",
+      "files": [
+        "main.png"
+      ],
+      "shows": "Gmail inbox beside the side panel, Search tab, scope 3 years ago, convention label selected with its sub-labels and co-label counts",
+      "policy": "confirm",
+      "verifiedAt": "6489925",
+      "capture": {
+        "steps": [
+          "Chrome window at 1280x800 CSS px with Gmail on the left and the side panel docked on the right",
+          "Subject: the user's own Gmail account, Search tab, Scope from set to 3 years ago, convention label selected so Gmail shows the convention/* search",
+          "Capture the browser content area, no window chrome",
+          "Frame with ~/.claude/skills/screenshot/scripts/hairline.py --require, keeping the unframed capture at raw/<file>"
+        ]
+      }
+    },
+    {
+      "id": "filter",
+      "files": [
+        "filter.png"
+      ],
+      "shows": "Gmail filtered to subject/board game beside the side panel, Search tab, scope 3 years ago, board game selected with co-label counts",
+      "policy": "confirm",
+      "verifiedAt": "6489925",
+      "capture": {
+        "steps": [
+          "Chrome window at 1280x800 CSS px with Gmail on the left and the side panel docked on the right",
+          "Subject: the user's own Gmail account, Search tab, Scope from set to 3 years ago, subject/board game selected",
+          "Capture the browser content area, no window chrome",
+          "Frame with ~/.claude/skills/screenshot/scripts/hairline.py --require, keeping the unframed capture at raw/<file>"
+        ]
+      }
+    },
+    {
+      "id": "co-labels",
+      "files": [
+        "co-labels.png"
+      ],
+      "shows": "Side panel alone, widened to three columns, Search tab, scope 3 years ago, board game selected with co-label counts",
+      "policy": "confirm",
+      "verifiedAt": "6489925",
+      "capture": {
+        "steps": [
+          "Side panel widened to 1280x800 CSS px",
+          "Subject: same state as filter.png (scope 3 years ago, subject/board game selected)",
+          "Capture the side panel including its title bar",
+          "Frame with ~/.claude/skills/screenshot/scripts/hairline.py --require, keeping the unframed capture at raw/<file>"
+        ]
+      }
+    },
+    {
+      "id": "2wk",
+      "files": [
+        "2wk.png"
+      ],
+      "shows": "Side panel alone, three columns, Search tab, scope 2 weeks ago, no label selected, Inbox and No user labels system entries visible",
+      "policy": "confirm",
+      "verifiedAt": "6489925",
+      "capture": {
+        "steps": [
+          "Side panel widened to 1280x800 CSS px",
+          "Subject: the user's own Gmail account, Search tab, Scope from set to 2 weeks ago, nothing selected",
+          "Capture the side panel including its title bar",
+          "Frame with ~/.claude/skills/screenshot/scripts/hairline.py --require, keeping the unframed capture at raw/<file>"
+        ]
+      }
+    }
+  ]
+}
