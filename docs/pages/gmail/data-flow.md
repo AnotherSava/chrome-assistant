@@ -13,7 +13,7 @@ nav_order: 1
 - **Service Worker** (`background.ts`) — Coordinator. Handles Gmail navigation and relays pushed results to the sidepanel.
 - **Cache Manager** (`cache-manager.ts`) — Data layer. Fetches and indexes Gmail messages, resolves label descendants, pushes results via callback when data is available.
 - **Gmail API** (`gmail-api.ts`) — Network layer. OAuth2 auth, label fetch, per-page message ID fetch with configurable concurrency, scope-based message search with parallel segments, search query building.
-- **Cache DB** (`cache-db.ts`) — IndexedDB persistence. Meta store for label indexes (`labelIdx:*`) and fetch state. No per-message store — co-labels computed via index intersection.
+- **Cache DB** (`cache-db.ts`) — IndexedDB persistence. Meta store for label indexes (`labelIdx:*`) and fetch state, plus the `summary-deals` and `summary-reminders` stores holding the Summary tab's extracted per-message records. No per-message label data — co-labels computed via index intersection.
 
 ## Message Types (sidepanel → service worker)
 
@@ -22,6 +22,8 @@ nav_order: 1
 | `initWindow` | Sidepanel opened — sends windowId so service worker can track which Gmail tab belongs to which panel. Always followed immediately by `selectionChanged`. |
 | `selectionChanged` | User selected/deselected a label or changed scope. Carries `{ labelId, scopeTimestamp }`. Service worker converts timestamp to date string for Gmail URLs, navigates Gmail, and calls `cacheManager.setFilterConfig()`. Also signals the search tab is active. `includeChildren` is read from `chrome.storage.local` by the SW. |
 | `filtersOff` | Navigate Gmail to inbox without changing label selection (used when switching away from Search tab with return-to-inbox enabled). Also signals the search tab is inactive. |
+| `summaryFilter` | A Summary sub-view is shown — navigates Gmail to a search for that sub-view's labels. Carries `{ query }`; a null query navigates to inbox. Also signals the search tab is inactive. |
+| `refreshGmailView` | After a Summary archive, delete or undo — the service worker clicks Gmail's own Refresh button through `chrome.scripting` so the list shows the change, reloading the tab if the button is not found. |
 | `resetCache` | Clear IndexedDB cache and restart the orchestrator from scratch |
 | `getLabelMessageIds` | Summary tab asks for a label's cached message IDs **by name**. Carries `{ labelName, requestId }`; the service worker resolves the name to an ID against the live label list and replies with `labelMessageIds`, queuing the request until that label's index is built (so Summary never depends on the label-list push). |
 | `openMessage` | Navigate the Gmail tab to a URL (single message or search). Carries `{ url }`. |
@@ -32,6 +34,7 @@ nav_order: 1
 |---------|---------|
 | `resultsReady` | Gmail tab detected — carries `accountPath` so sidepanel can initialize |
 | `notOnGmail` | Active tab is not Gmail |
+| `fetchError` | The cache orchestrator failed to start (sign-in or Gmail API error). Carries `{ errorText, hint }`, broadcast to every connected sidepanel; Search and Summary render it in place of their loading placeholder. |
 | `labelsReady` | Label list pushed proactively — carries `labels` array (includes synthetic NONE label). Sent on warm reconnect (from cache manager's in-memory list) and on cold start (when initial build begins). |
 | `filterResults` | Pushed results from cache manager — carries `labelId`, `count`, `coLabelCounts`, `counts`, `filterConfig`, `partial` |
 | `cacheState` | Cache build progress — carries `phase`, `labelsTotal`, `labelsDone`, optional `currentLabel`, and optional `errorText` when the current fetch is failing/backing off. Phases: `labels` (initial build — fetching all-time message IDs per label), `scope` (fetching scoped message ID set via paginated search), `complete` (all work done, cache idle). Consumed by Search (progress bar + ⚠) and Summary (a "retrying" note while a lookup waits on a stuck build). |

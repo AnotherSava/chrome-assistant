@@ -65,6 +65,7 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `vite.config.ts` — root Vite/vitest config (test environment, `@core` alias for tests, coverage settings)
 - `vite.config.base.ts` — shared Vite build config (output naming, `@core` alias, icon copy plugin)
 - `scripts/package.ts` — Chrome Web Store ZIP packaging script
+- `.claude/commit-checks.sh` — commit gate run by /yolo and /wrap-up before committing: conventions checker, `npm run lint`, `npm test`, `npm run build`
 - `packages/core/tests/` — unit tests for core modules (icons, settings)
 - `packages/core/src/settings.ts` — shared chrome.storage.local persistence (async loadSettings batch loader, saveSetting, onSettingChanged listener with typed defaults)
 - `packages/core/src/icons.ts` — shared SVG icon constants and escapeHtml utility

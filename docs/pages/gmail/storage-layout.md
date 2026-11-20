@@ -45,6 +45,7 @@ Written by the sidepanel on user action. Global storage, so two windows overwrit
 | `ca_active_label` | string \| null | `null` | Selected label ID |
 | `ca_active_label_name` | string \| null | `null` | Selected label display name |
 | `ca_scope_value` | string | `"any"` | Scope dropdown value (e.g. `"1m"`, `"1y"`, `"any"`) |
+| `ca_summary_subtab` | `"deals" \| "reminders"` | `"deals"` | Active Summary sub-tab |
 
 ## chrome.storage.session
 
@@ -64,6 +65,15 @@ Persistent across browser restarts. Shared between SW and extension pages (same 
 | `fetchState` | `{ phase: "complete", lastFetchTimestamp: number }` | Cache build state. `lastFetchTimestamp` is used to determine incremental refresh scope. |
 | `cacheDepth` | `{ timestamp: number \| null }` | How far back label indexes cover. `null` = full coverage (all time). |
 | `labelIdx:{labelId}` | `string[]` | Message IDs belonging to a label. One entry per label. Co-labels computed by intersecting these arrays. |
+
+## IndexedDB (summary stores)
+
+Written and read by the sidepanel's Summary sub-views, keyed by `messageId`. A record is extracted once, when a message first appears in the sub-view's label set, and reused on later renders; archive and delete remove the affected records and undo restores them. Cleared together with the rest of the database on cache reset and account switch.
+
+| Store | Record | Description |
+|-------|--------|-------------|
+| `summary-deals` | `{ messageId, threadId, fromName, subject, date, expiry, discount }` | Deals rows. `expiry` and `discount` are extracted from the message body, which is not stored; either is `null` when not found. |
+| `summary-reminders` | `{ messageId, threadId, subject, date }` | Reminders rows. `subject` is stored already cleaned (`Notification:` prefix and date-range tail removed), ready for grouping. |
 
 ## In-memory: Service Worker
 

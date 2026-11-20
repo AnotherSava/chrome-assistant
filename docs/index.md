@@ -4,6 +4,8 @@ title: Home
 nav_order: 1
 ---
 
+# Chrome Assistant
+
 *A family of Chrome extensions sharing a common side panel framework. Each site is built as an independent extension.* <br>Currently supports Gmail. [BGA Assistant](https://anothersava.github.io/bga-assistant/) (for [Board Game Arena](https://boardgamearena.com)) is a separate project for now, pending integration into this monorepo.
 
 [Install from Chrome Web Store](https://chromewebstore.google.com/detail/another-assistant-for-gma/hmkfblmfbeakcddfocbnochpmbaiaakl) (unlisted).
@@ -25,4 +27,4 @@ A side panel extension for Gmail that provides quick label-based filtering and n
    - **Scope from** — limit results to a time range
 4. Click the "?" icon in the side panel for a built-in help page
 
-**Requires:** Google account authorization (Gmail read-only access via OAuth2).
+**Requires:** Google account authorization (Gmail access via OAuth2; see the [privacy policy](pages/gmail/privacy) for what the extension reads and changes).
