@@ -1,10 +1,7 @@
 ---
 layout: default
-title: Chrome Assistant
----
-
-[Home](.) | [Gmail](pages/gmail) | [Development](pages/development)
-
+title: Home
+nav_order: 1
 ---
 
 *A family of Chrome extensions sharing a common side panel framework. Each site is built as an independent extension.* <br>Currently supports Gmail. [BGA Assistant](https://anothersava.github.io/bga-assistant/) (for [Board Game Arena](https://boardgamearena.com)) is a separate project for now, pending integration into this monorepo.

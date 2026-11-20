@@ -1,10 +1,8 @@
 ---
 layout: default
-title: Gmail — Privacy Policy
----
-
-[Home](../..) | [Gmail](.) | [Privacy](privacy) | [Development](../development)
-
+title: Privacy policy
+parent: Gmail
+nav_order: 1
 ---
 
 # Privacy Policy

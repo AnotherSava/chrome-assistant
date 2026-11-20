@@ -13,6 +13,8 @@ Install from [Chrome Web Store](https://chromewebstore.google.com/detail/another
 
 See full project documentation at **[anothersava.github.io/chrome-assistant](https://anothersava.github.io/chrome-assistant/)**:
 
-- [Installation and usage](https://anothersava.github.io/chrome-assistant/)
-  - [Gmail](https://anothersava.github.io/chrome-assistant/pages/gmail)
+- [Gmail](https://anothersava.github.io/chrome-assistant/pages/gmail)
+  - [Privacy policy](https://anothersava.github.io/chrome-assistant/pages/gmail/privacy)
 - [Developer guide](https://anothersava.github.io/chrome-assistant/pages/development)
+  - [Gmail data flow](https://anothersava.github.io/chrome-assistant/pages/gmail/data-flow)
+  - [Gmail storage layout](https://anothersava.github.io/chrome-assistant/pages/gmail/storage-layout)

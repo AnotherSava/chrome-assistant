@@ -1,10 +1,8 @@
 ---
 layout: default
 title: Gmail
----
-
-[Home](../..) | [Gmail](.) | [Privacy](privacy) | [Development](../development)
-
+nav_order: 2
+has_children: true
 ---
 
 A side panel extension for [Gmail](https://mail.google.com) that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by time scope, and jump to filtered views with one click.

@@ -1,17 +1,15 @@
 ---
 layout: default
 title: Development
----
-
-[Home](..) | [Gmail](gmail) | [Development](development)
-
+nav_order: 99
+has_children: true
 ---
 
 ## Setup
 
 ### Prerequisites
 
-- Node.js 20.19+, 22.12+ or 24+
+- Node.js 24 (pinned in `.nvmrc`; npm refuses other majors through `engine-strict`)
 - Chrome 134+
 
 ### Install

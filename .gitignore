@@ -3,10 +3,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# IDE and tools
-.claude/settings.json
-.claude/settings.local.json
-
 # Packaging
 *.zip
 

@@ -1,14 +1,8 @@
 ---
 layout: default
-title: Gmail — Storage Layout
----
-
-[Home](../..) | [Gmail](.) | [Privacy](privacy) | [Development](../development)
-
----
-
-[Data Flow](data-flow) | [Storage Layout](storage-layout)
-
+title: Gmail storage layout
+parent: Development
+nav_order: 2
 ---
 
 # Storage Layout

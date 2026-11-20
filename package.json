@@ -5,6 +5,10 @@
   "description": "Chrome extension — Another Assistant for Gmail",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "npm@11.18.0",
   "scripts": {
     "dev": "npm run dev:gmail",
     "dev:gmail": "vite build --watch --config packages/site-gmail/vite.config.ts",

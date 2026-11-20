@@ -1,14 +1,8 @@
 ---
 layout: default
-title: Gmail — Data Flow
----
-
-[Home](../..) | [Gmail](.) | [Privacy](privacy) | [Development](../development)
-
----
-
-[Data Flow](data-flow) | [Storage Layout](storage-layout)
-
+title: Gmail data flow
+parent: Development
+nav_order: 1
 ---
 
 # Gmail Extension Data Flow
