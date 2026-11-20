@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CacheManager, type CacheProgress, type FilterConfig, type OrchestratorAction, type ResultPush } from "../src/cache-manager.js";
+import { CacheManager, type CacheProgress, type FilterConfig, type ResultPush } from "../src/cache-manager.js";
 import type { CacheMessage, GmailLabel } from "@core/types.js";
 
 // Mock cache-db
