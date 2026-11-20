@@ -15,7 +15,7 @@ title: Chrome Assistant
 
 ## [Gmail](pages/gmail)
 
-A side panel extension for Gmail that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by location and time scope, and jump to filtered views with one click. Dynamic label filtering (only shows labels that appear on matching messages) is powered by a progressive background cache.
+A side panel extension for Gmail that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by time scope, and jump to filtered views with one click. Dynamic label filtering (only shows labels that appear on matching messages) is powered by a progressive background cache.
 
 ![Another Assistant for Gmail](screenshots/main.png)
 
@@ -25,7 +25,6 @@ A side panel extension for Gmail that provides quick label-based filtering and n
 2. Click the Another Assistant for Gmail icon in the toolbar to open the side panel
 3. Filter your Gmail view:
    - **Labels** — click to filter, click again to deselect
-   - **Location** — narrow to Inbox, Sent, or All Mail
    - **Scope from** — limit results to a time range
 4. Click the "?" icon in the side panel for a built-in help page
 

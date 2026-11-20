@@ -7,7 +7,7 @@ title: Gmail
 
 ---
 
-A side panel extension for [Gmail](https://mail.google.com) that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by location and time scope, and jump to filtered views with one click.
+A side panel extension for [Gmail](https://mail.google.com) that provides quick label-based filtering and navigation. Browse your labels in a multi-column layout, narrow by time scope, and jump to filtered views with one click.
 
 ### Label browser
 
@@ -37,7 +37,7 @@ When you select a parent label, its children are included by default — so sele
 
 - **Label grid**: user labels and system labels in a configurable multi-column layout
 - **Click-to-filter**: one click navigates the Gmail tab to the label view
-- **Time scope**: 1w / 2w / 1mo / 3mo / 6mo / 1y / 2y / 5y / any
+- **Time scope**: any / 1w / 2w / 1mo / 2mo / 6mo / 1y / 3y / 5y
 - **Include sub-labels**: parent-label selection includes descendants (configurable)
 - **System labels**: Inbox, Sent, Starred, Important shown alongside user labels (Starred/Important hidden by default, toggle in settings)
 - **Live counts**: message counts next to each label, updated as the cache builds (can be hidden)
@@ -46,7 +46,7 @@ When you select a parent label, its children are included by default — so sele
 - **Cache reset**: one-click refresh button rebuilds the cache from scratch
 - **Multi-account**: detects Gmail account path (`/mail/u/0/`, `/mail/u/1/`, …) and maintains a separate cache per account
 - **Return to inbox**: optionally navigates Gmail back to Inbox when the side panel closes
-- **Summary tab**: curated views of labelled messages — **Deals** (messages with the `ads/deal` label, with auto-extracted max discount and expiry date columns, sorted by expiry) and **Reminders** (messages with both `notifications/calendar` and `pending`, grouped by event title; single-message rows open that message, grouped rows open a Gmail search of the group)
+- **Summary tab**: curated views of labelled messages — **Deals** (messages with both `ads/deal` and `pending`, with auto-extracted max discount and expiry date columns, sorted by expiry) and **Reminders** (messages with the `remind` label, grouped by subject; single-message rows open that message, grouped rows open a Gmail search of the group)
 
 ### Standard features
 

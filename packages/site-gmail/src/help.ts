@@ -8,7 +8,7 @@ export function renderHelp(): string {
     <div class="help-hero-sub">A Chrome extension for <a href="https://mail.google.com" target="_blank">Gmail</a>, part of <a href="https://anothersava.github.io/chrome-assistant/" target="_blank">Another Chrome Assistant</a> project</div>
   </div>
 
-  <p>A side panel assistant for Gmail that provides quick label-based filtering and navigation. Browse your labels, narrow by location and time scope, and jump to filtered views with one click.</p>
+  <p>A side panel assistant for Gmail that provides quick label-based filtering and navigation. Browse your labels, narrow by time scope, and jump to filtered views with one click.</p>
 
   <div class="help-section" style="background:#2a2418;border:1px solid #5a4a1f;border-radius:4px;padding:10px">
     <div style="color:#ffd27a"><b>Private beta.</b> Gmail sign-in is gated to allowlisted test users while the app is unverified by Google. If sign-in fails with an "access blocked" error, email <a href="mailto:oleg.savelev@gmail.com" style="color:#ffd27a">oleg.savelev@gmail.com</a> or open a <a href="https://github.com/AnotherSava/chrome-assistant/issues" target="_blank" style="color:#ffd27a">GitHub issue</a> to be added.</div>
@@ -22,7 +22,6 @@ export function renderHelp(): string {
       <li>Filter your Gmail view:
         <ul class="help-sublist">
           <li><b>Labels</b> \u2014 click to filter, click again to deselect</li>
-          <li><b>Location</b> \u2014 narrow to Inbox, Sent, or All Mail</li>
           <li><b>Scope from</b> \u2014 limit results to a time range</li>
         </ul>
       </li>
@@ -32,8 +31,8 @@ export function renderHelp(): string {
   <div class="help-section">
     <div class="help-section-title">Tabs</div>
     <div class="help-sections-grid">
-      <div class="help-grid-item"><span class="help-grid-label">Search</span><span> Browse Gmail labels in a multi-column layout. Click a label to search the Gmail page. Combine with Location and Scope dropdowns for precise searching. Labels are dynamically filtered to show only those that appear on matching messages — a background cache builds progressively so subsequent searching is instant.</span></div>
-      <div class="help-grid-item"><span class="help-grid-label">Summary</span><span> Curated views of labelled messages, organised into sub-tabs: <b>Deals</b> (messages with the <code>ads/deal</code> label) and <b>Reminders</b> (messages with both <code>notifications/calendar</code> and <code>pending</code>, grouped by event title — click a row to open all matching messages in Gmail).</span></div>
+      <div class="help-grid-item"><span class="help-grid-label">Search</span><span> Browse Gmail labels in a multi-column layout. Click a label to search the Gmail page. Combine with the Scope dropdown for precise searching. Labels are dynamically filtered to show only those that appear on matching messages — a background cache builds progressively so subsequent searching is instant.</span></div>
+      <div class="help-grid-item"><span class="help-grid-label">Summary</span><span> Curated views of labelled messages, organised into sub-tabs: <b>Deals</b> (messages with both <code>ads/deal</code> and <code>pending</code>) and <b>Reminders</b> (messages with the <code>remind</code> label, grouped by subject — click a row to open all matching messages in Gmail).</span></div>
     </div>
   </div>
 

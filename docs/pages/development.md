@@ -62,6 +62,7 @@ packages/
     src/
       settings.ts                 chrome.storage.local persistence (loadSettings / saveSetting / onSettingChanged)
       icons.ts                    shared SVG icon constants, escapeHtml
+      error-display.ts            shared error UI helper (buildErrorHtml with optional hint link)
       types.ts                    shared TypeScript types (PinMode, GmailLabel, CacheMessage)
       sidepanel.css               shared side panel styles (dark theme, top bar, labels, help, zoom)
     tests/                        unit tests for core modules
@@ -73,8 +74,14 @@ packages/
       background.ts               Service worker: port-based messaging, cache orchestration, Gmail navigation, settings reactivity
       sidepanel.ts                Side panel shell: connection, tab switching, zoom, pin mode, display settings, cache reset, help
       search-tab.ts               Search tab: label tree, rendering, filtering, selection, scope, co-label counts
+      summary-tab.ts              Summary tab shell: Deals/Reminders sub-tab bar, per-sub-tab counts, Undo button
+      summary-deals.ts            Deals sub-view: ads/deal + pending messages with extracted discount and expiry, archive/delete
+      summary-reminders.ts        Reminders sub-view: remind-labelled messages grouped by subject, archive/delete
+      undo-stack.ts               Shared LIFO undo stack for Summary actions
+      expiry.ts                   Expiry-date extractor for deal messages
+      discount.ts                 Max-discount extractor for deal messages
       gmail-api.ts                Gmail API client: OAuth2, label fetch, message search, scope-based parallel fetch
-      cache-db.ts                 IndexedDB storage: label indexes, fetch state, label coverage tracking
+      cache-db.ts                 IndexedDB storage: label indexes, fetch state, label coverage tracking, Summary records
       cache-manager.ts            Cache orchestrator: single-loop with configurable concurrency, push-based results, all-time per-label fetch, co-label counts via index intersection
       help.ts                     Gmail-specific help page renderer
     tests/                        unit tests for Gmail modules
