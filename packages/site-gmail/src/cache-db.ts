@@ -1,24 +1,23 @@
-import type { CacheMessage } from "@core/types.js";
-
 const DB_NAME = "gmail-cache";
-const DB_VERSION = 2;
-const MESSAGES_STORE = "messages";
+const DB_VERSION = 3;
+// Created by versions 1-2 and never read; the upgrade to 3 drops it from existing databases.
+const RETIRED_MESSAGES_STORE = "messages";
 const META_STORE = "meta";
 export const SUMMARY_DEALS_STORE = "summary-deals";
 export const SUMMARY_REMINDERS_STORE = "summary-reminders";
 
-const ALL_STORES = [MESSAGES_STORE, META_STORE, SUMMARY_DEALS_STORE, SUMMARY_REMINDERS_STORE];
+const ALL_STORES = [META_STORE, SUMMARY_DEALS_STORE, SUMMARY_REMINDERS_STORE];
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
-export function openDatabase(indexedDB: IDBFactory = globalThis.indexedDB): Promise<IDBDatabase> {
+export function openDatabase(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
-      if (!db.objectStoreNames.contains(MESSAGES_STORE)) {
-        db.createObjectStore(MESSAGES_STORE, { keyPath: "id" });
+      if (db.objectStoreNames.contains(RETIRED_MESSAGES_STORE)) {
+        db.deleteObjectStore(RETIRED_MESSAGES_STORE);
       }
       if (!db.objectStoreNames.contains(META_STORE)) {
         db.createObjectStore(META_STORE, { keyPath: "key" });
@@ -55,46 +54,6 @@ function withTransaction<T>(db: IDBDatabase, storeName: string, mode: IDBTransac
     request.onerror = () => reject(request.error);
   });
 }
-
-export async function putMessages(messages: CacheMessage[]): Promise<void> {
-  const db = await openDatabase();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(MESSAGES_STORE, "readwrite");
-    const store = tx.objectStore(MESSAGES_STORE);
-    for (const msg of messages) {
-      store.put(msg);
-    }
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function getMessage(id: string): Promise<CacheMessage | undefined> {
-  const db = await openDatabase();
-  return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.get(id));
-}
-
-/** Batch-read multiple messages by ID in a single transaction. */
-export async function getMessagesBatch(ids: string[]): Promise<Map<string, CacheMessage>> {
-  if (ids.length === 0) return new Map();
-  const db = await openDatabase();
-  return new Promise<Map<string, CacheMessage>>((resolve, reject) => {
-    const tx = db.transaction(MESSAGES_STORE, "readonly");
-    const store = tx.objectStore(MESSAGES_STORE);
-    const results = new Map<string, CacheMessage>();
-    let completed = 0;
-    for (const id of ids) {
-      const request = store.get(id);
-      request.onsuccess = () => {
-        if (request.result) results.set(id, request.result as CacheMessage);
-        completed++;
-        if (completed === ids.length) resolve(results);
-      };
-      request.onerror = () => reject(request.error);
-    }
-  });
-}
-
 
 export async function getMeta<T = unknown>(key: string): Promise<T | undefined> {
   const db = await openDatabase();
@@ -178,9 +137,3 @@ export async function addToLabelIndex(labelId: string, idsToAdd: string[]): Prom
   for (const id of idsToAdd) if (!existingSet.has(id)) merged.push(id);
   await setMeta(`labelIdx:${labelId}`, merged);
 }
-
-export async function getMessageCount(): Promise<number> {
-  const db = await openDatabase();
-  return withTransaction(db, MESSAGES_STORE, "readonly", (store) => store.count());
-}
-

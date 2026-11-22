@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import "fake-indexeddb/auto";
-import { openDatabase, closeDatabase, putMessages, getMessage, getMeta, setMeta, clearAll, getMessageCount } from "../src/cache-db.js";
-import type { CacheMessage } from "@core/types.js";
+import { openDatabase, closeDatabase, getMeta, setMeta, clearAll, getSummaryRecords, putSummaryRecords, SUMMARY_DEALS_STORE } from "../src/cache-db.js";
 
 beforeEach(async () => {
   // Close any open connection, then reopen fresh and clear all data
@@ -10,10 +9,23 @@ beforeEach(async () => {
 });
 
 describe("openDatabase", () => {
-  it("creates messages and meta object stores", async () => {
+  it("creates the meta and summary object stores", async () => {
     const db = await openDatabase();
-    expect(db.objectStoreNames.contains("messages")).toBe(true);
-    expect(db.objectStoreNames.contains("meta")).toBe(true);
+    expect(Array.from(db.objectStoreNames).sort()).toEqual(["meta", "summary-deals", "summary-reminders"]);
+  });
+
+  it("drops the retired messages store when upgrading a version 2 database", async () => {
+    await closeDatabase();
+    await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase("gmail-cache"); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open("gmail-cache", 2);
+      request.onupgradeneeded = () => { request.result.createObjectStore("messages", { keyPath: "id" }); request.result.createObjectStore("meta", { keyPath: "key" }); };
+      request.onsuccess = () => { request.result.close(); resolve(); };
+      request.onerror = () => reject(request.error);
+    });
+    const db = await openDatabase();
+    expect(db.objectStoreNames.contains("messages")).toBe(false);
+    expect(db.objectStoreNames.contains("summary-deals")).toBe(true);
   });
 
   it("returns the same promise on subsequent calls", async () => {
@@ -25,41 +37,6 @@ describe("openDatabase", () => {
     expect(db1).toBe(db2);
   });
 });
-
-describe("putMessages", () => {
-  it("inserts messages into the store", async () => {
-    const msgs: CacheMessage[] = [
-      { id: "msg1", labelIds: ["INBOX", "Label_1"] },
-      { id: "msg2", labelIds: ["SENT"] },
-    ];
-    await putMessages(msgs);
-    const count = await getMessageCount();
-    expect(count).toBe(2);
-  });
-
-  it("upserts messages with the same id", async () => {
-    await putMessages([{ id: "msg1", labelIds: ["INBOX"] }]);
-    await putMessages([{ id: "msg1", labelIds: ["INBOX", "SENT"] }]);
-    const count = await getMessageCount();
-    expect(count).toBe(1);
-    const msg = await getMessage("msg1");
-    expect(msg?.labelIds).toEqual(["INBOX", "SENT"]);
-  });
-});
-
-describe("getMessage", () => {
-  it("returns undefined for missing id", async () => {
-    const msg = await getMessage("nonexistent");
-    expect(msg).toBeUndefined();
-  });
-
-  it("returns the stored message", async () => {
-    await putMessages([{ id: "msg1", labelIds: ["A"] }]);
-    const msg = await getMessage("msg1");
-    expect(msg).toEqual({ id: "msg1", labelIds: ["A"] });
-  });
-});
-
 
 describe("getMeta / setMeta", () => {
   it("returns undefined for missing key", async () => {
@@ -89,30 +66,13 @@ describe("getMeta / setMeta", () => {
 });
 
 describe("clearAll", () => {
-  it("removes all messages and meta", async () => {
-    await putMessages([{ id: "msg1", labelIds: ["INBOX"] }]);
+  it("removes meta and summary records", async () => {
+    await putSummaryRecords(SUMMARY_DEALS_STORE, [{ messageId: "msg1" }]);
     await setMeta("account", "/mail/u/0/");
     await clearAll();
-    const count = await getMessageCount();
-    expect(count).toBe(0);
+    const records = await getSummaryRecords(SUMMARY_DEALS_STORE, ["msg1"]);
+    expect(records.size).toBe(0);
     const val = await getMeta("account");
     expect(val).toBeUndefined();
-  });
-});
-
-describe("getMessageCount", () => {
-  it("returns 0 for empty store", async () => {
-    const count = await getMessageCount();
-    expect(count).toBe(0);
-  });
-
-  it("returns correct count after inserts", async () => {
-    await putMessages([
-      { id: "msg1", labelIds: ["INBOX"] },
-      { id: "msg2", labelIds: ["SENT"] },
-      { id: "msg3", labelIds: ["INBOX"] },
-    ]);
-    const count = await getMessageCount();
-    expect(count).toBe(3);
   });
 });

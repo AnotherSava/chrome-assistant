@@ -70,7 +70,7 @@ Run `npm run build` after each batch of changes so the extension can be reloaded
 - `packages/core/src/settings.ts` — shared chrome.storage.local persistence (async loadSettings batch loader, saveSetting, onSettingChanged listener with typed defaults)
 - `packages/core/src/icons.ts` — shared SVG icon constants and escapeHtml utility
 - `packages/core/src/error-display.ts` — shared error UI helper (ErrorHint type, buildErrorHtml(errorText, hint) for distinct error rendering with optional link)
-- `packages/core/src/types.ts` — shared TypeScript types (PinMode, GmailLabel, CacheMessage)
+- `packages/core/src/types.ts` — shared TypeScript types (PinMode, GmailLabel)
 - `packages/core/src/sidepanel.css` — shared side panel styles (dark theme, top bar, labels, help, zoom)
 - `packages/site-gmail/` — Gmail extension package
 - `packages/site-gmail/manifest.json` — Gmail extension manifest (includes top-level "key" pinning the unpacked extension ID to the CWS-published ID)

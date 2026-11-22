@@ -1,22 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { CacheManager, type CacheProgress, type FilterConfig, type ResultPush } from "../src/cache-manager.js";
-import type { CacheMessage, GmailLabel } from "@core/types.js";
+import type { GmailLabel } from "@core/types.js";
 
 // Mock cache-db
 vi.mock("../src/cache-db.js", () => {
-  const store = new Map<string, CacheMessage>();
   const meta = new Map<string, unknown>();
   return {
     openDatabase: vi.fn().mockResolvedValue({}),
     closeDatabase: vi.fn().mockResolvedValue(undefined),
-    putMessages: vi.fn(async (messages: CacheMessage[]) => { for (const m of messages) store.set(m.id, m); }),
-    getMessage: vi.fn(async (id: string) => store.get(id)),
-    getMessagesBatch: vi.fn(async (ids: string[]) => { const map = new Map<string, CacheMessage>(); for (const id of ids) { const m = store.get(id); if (m) map.set(id, m); } return map; }),
     getMeta: vi.fn(async (key: string) => meta.get(key)),
     setMeta: vi.fn(async (key: string, value: unknown) => { meta.set(key, value); }),
-    clearAll: vi.fn(async () => { store.clear(); meta.clear(); }),
-    getMessageCount: vi.fn(async () => store.size),
-    _store: store,
+    clearAll: vi.fn(async () => { meta.clear(); }),
     _meta: meta,
   };
 });
@@ -34,13 +28,9 @@ import * as dbMock from "../src/cache-db.js";
 import * as apiMock from "../src/gmail-api.js";
 
 const mockDb = dbMock as unknown as {
-  putMessages: ReturnType<typeof vi.fn>;
-  getMessage: ReturnType<typeof vi.fn>;
   getMeta: ReturnType<typeof vi.fn>;
   setMeta: ReturnType<typeof vi.fn>;
   clearAll: ReturnType<typeof vi.fn>;
-  getMessageCount: ReturnType<typeof vi.fn>;
-  _store: Map<string, CacheMessage>;
   _meta: Map<string, unknown>;
 };
 
@@ -68,16 +58,12 @@ describe("CacheManager", () => {
 
   beforeEach(() => {
     manager = new CacheManager();
-    mockDb._store.clear();
     mockDb._meta.clear();
     vi.clearAllMocks();
     // Re-setup the default mock implementations after clearAllMocks
-    mockDb.putMessages.mockImplementation(async (messages: CacheMessage[]) => { for (const m of messages) mockDb._store.set(m.id, m); });
-    mockDb.getMessage.mockImplementation(async (id: string) => mockDb._store.get(id));
     mockDb.getMeta.mockImplementation(async (key: string) => mockDb._meta.get(key));
     mockDb.setMeta.mockImplementation(async (key: string, value: unknown) => { mockDb._meta.set(key, value); });
-    mockDb.clearAll.mockImplementation(async () => { mockDb._store.clear(); mockDb._meta.clear(); });
-    mockDb.getMessageCount.mockImplementation(async () => mockDb._store.size);
+    mockDb.clearAll.mockImplementation(async () => { mockDb._meta.clear(); });
   });
 
   describe("queryLabel", () => {
@@ -136,9 +122,6 @@ describe("CacheManager", () => {
       mgr.setLabels(hierarchyLabels);
 
       // Populate cache: Work has m1, Work/Projects has m2, Work/Projects/Alpha has m3
-      mockDb._store.set("m1", { id: "m1", labelIds: ["Label_1"] });
-      mockDb._store.set("m2", { id: "m2", labelIds: ["Label_1", "Label_2"] });
-      mockDb._store.set("m3", { id: "m3", labelIds: ["Label_3"] });
       mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
       mockDb._meta.set("labelIdx:Label_2", ["m2"]);
       mockDb._meta.set("labelIdx:Label_3", ["m3"]);
@@ -162,9 +145,6 @@ describe("CacheManager", () => {
 
       const mgr = new CacheManager();
       mgr.setLabels(hierarchyLabels);
-
-      mockDb._store.set("m1", { id: "m1", labelIds: ["Label_1"] });
-      mockDb._store.set("m2", { id: "m2", labelIds: ["Label_2"] });
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
       mockDb._meta.set("labelIdx:Label_2", ["m2"]);
 
@@ -191,9 +171,6 @@ describe("CacheManager", () => {
     }
 
     it("returns correct own counts per label", async () => {
-      mockDb._store.set("m1", { id: "m1", labelIds: ["INBOX", "Label_1"] });
-      mockDb._store.set("m2", { id: "m2", labelIds: ["INBOX", "Label_1", "Label_2"] });
-      mockDb._store.set("m3", { id: "m3", labelIds: ["SENT", "Label_4"] });
       mockDb._meta.set("labelIdx:INBOX", ["m1", "m2"]);
       mockDb._meta.set("labelIdx:SENT", ["m3"]);
       mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
@@ -214,9 +191,6 @@ describe("CacheManager", () => {
 
     it("returns correct inclusive counts for parent labels (deduplicated)", async () => {
       // m1: Work only, m2: Work + Work/Projects, m3: Work/Projects/Alpha only
-      mockDb._store.set("m1", { id: "m1", labelIds: ["Label_1"] });
-      mockDb._store.set("m2", { id: "m2", labelIds: ["Label_1", "Label_2"] });
-      mockDb._store.set("m3", { id: "m3", labelIds: ["Label_3"] });
       mockDb._meta.set("labelIdx:INBOX", []);
       mockDb._meta.set("labelIdx:SENT", []);
       mockDb._meta.set("labelIdx:Label_1", ["m1", "m2"]);
@@ -299,7 +273,6 @@ describe("CacheManager", () => {
     });
 
     it("includes labels with own=0 when scope is null", async () => {
-      mockDb._store.set("m1", { id: "m1", labelIds: ["Label_1"] });
       mockDb._meta.set("labelIdx:INBOX", []);
       mockDb._meta.set("labelIdx:SENT", []);
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
@@ -1040,9 +1013,6 @@ describe("CacheManager", () => {
       mockDb._meta.set("labelIdx:SENT", ["m3"]);
       mockDb._meta.set("labelIdx:Label_1", ["m1"]);
       mockDb._meta.set("labelIdx:Label_2", ["m2"]);
-      // Pre-populate messages for co-label counting
-      mockDb._store.set("m1", { id: "m1", labelIds: ["INBOX", "Label_1"] });
-      mockDb._store.set("m2", { id: "m2", labelIds: ["INBOX", "Label_2"] });
 
       // Set labels on manager so queryLabel/getLabelCounts work
       (manager as unknown as { labels: GmailLabel[] }).labels = testLabels;
@@ -1068,7 +1038,6 @@ describe("CacheManager", () => {
 
     it("setFilterConfig with missing scope does not push until scope is fetched", async () => {
       mockDb._meta.set("labelIdx:INBOX", ["m1"]);
-      mockDb._store.set("m1", { id: "m1", labelIds: ["INBOX"] });
       (manager as unknown as { labels: GmailLabel[] }).labels = testLabels;
       (manager as unknown as { initialBuildComplete: boolean }).initialBuildComplete = true;
 

@@ -63,7 +63,7 @@ packages/
       settings.ts                 chrome.storage.local persistence (loadSettings / saveSetting / onSettingChanged)
       icons.ts                    shared SVG icon constants, escapeHtml
       error-display.ts            shared error UI helper (buildErrorHtml with optional hint link)
-      types.ts                    shared TypeScript types (PinMode, GmailLabel, CacheMessage)
+      types.ts                    shared TypeScript types (PinMode, GmailLabel)
       sidepanel.css               shared side panel styles (dark theme, top bar, labels, help, zoom)
     tests/                        unit tests for core modules
   site-gmail/
