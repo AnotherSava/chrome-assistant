@@ -6,8 +6,6 @@ import type { GmailLabel } from "@core/types.js";
 vi.mock("../src/cache-db.js", () => {
   const meta = new Map<string, unknown>();
   return {
-    openDatabase: vi.fn().mockResolvedValue({}),
-    closeDatabase: vi.fn().mockResolvedValue(undefined),
     getMeta: vi.fn(async (key: string) => meta.get(key)),
     setMeta: vi.fn(async (key: string, value: unknown) => { meta.set(key, value); }),
     clearAll: vi.fn(async () => { meta.clear(); }),
@@ -616,7 +614,7 @@ describe("CacheManager", () => {
 
       // Label should be marked as processed
       expect((manager as unknown as { processedLabels: Set<string> }).processedLabels.has("INBOX")).toBe(true);
-      // Messages should be stored
+      // Message IDs should be in the label index
       const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
       expect(idx).toEqual(["m1", "m2"]);
     });
@@ -850,7 +848,7 @@ describe("CacheManager", () => {
       const fetchState = mockDb._meta.get("fetchState") as { phase: string; lastFetchTimestamp: number };
       expect(fetchState.phase).toBe("complete");
       expect(fetchState.lastFetchTimestamp).toBeGreaterThan(oldTimestamp);
-      // Messages should be stored
+      // Message IDs should be in the label index
       const idx = mockDb._meta.get("labelIdx:INBOX") as string[];
       expect(idx).toContain("m30");
     });
